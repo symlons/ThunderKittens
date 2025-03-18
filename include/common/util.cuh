@@ -46,12 +46,12 @@ constexpr int WARPGROUP_WARPS{4};
  * @brief Get the warp ID of the current thread.
  * @return The warp ID.
  */
-__device__ __forceinline__ int warpid() { return threadIdx.x >> 5; } 
+__device__ __forceinline__ int warpid() { return threadIdx.x >> 5; } // equivalent to dividing by 32
 /**
  * @brief Get the warpgroup ID of the current thread.
  * @return The warpgroup ID.
  */
-__device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 7; } 
+__device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 7; } // equivalent to dividing by 128
 /**
  * @brief Get the lane ID of the current thread within its warp.
  * @return The lane ID.
@@ -186,7 +186,7 @@ struct KITTENS_DEFAULT_ALIGN alignment_dummy { int dummy; };
  * @brief Very simple allocator for dynamic shared memory. Advances pointer and tracks alignments.
  * @tparam default_alignment The default alignment this allocator will enforce. If <=0 (default -1) it will not align.
  */
-#ifdef KITTENS_HOPPER
+#ifdef KITTENS_HOPPER // TODO my@: check available alingments for each architecture
 template<int default_alignment=1024> 
 #else
 template<int default_alignment=16> 
