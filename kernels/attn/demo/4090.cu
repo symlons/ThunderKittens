@@ -36,7 +36,8 @@ __launch_bounds__(NUM_WORKERS *WARP_THREADS, 1) // WARP_THREADS is 32 and define
     // warpid: Gets the ID of the current warp (a group of 32 threads) within a block.
     // groupid: Gets the ID of the current warp group (a group of N warps) within a block.
     constexpr int LOAD_BLOCKS = NUM_WORKERS / load_group::GROUP_WARPS; // determines how many cooperative loading groups are formed.
-    // This value is then used in the kernel to control how the loading of key and value data is distributed among the warps.const int batch = blockIdx.z, head = blockIdx.y, q_seq = blockIdx.x * NUM_WORKERS + workerid;
+    // This value is then used in the kernel to control how the loading of key and value data is distributed among the warps.
+    const int batch = blockIdx.z, head = blockIdx.y, q_seq = blockIdx.x * NUM_WORKERS + workerid;
     // load_group::GROUP_WARPS: alias to number of warps in a group for abstraction, can be changed ...
 
     extern __shared__ alignment_dummy __shm[];  // extern __shared__ is used to allocate shared memory dynamically.
@@ -77,7 +78,7 @@ __launch_bounds__(NUM_WORKERS *WARP_THREADS, 1) // WARP_THREADS is 32 and define
     if (q_seq*ROWS<D> < g.Qg.depth()) { // bounds check
         load<1, false>(qo_smem[workerid], g.Qg, {batch, q_seq, head, 0});  // going through shared memory improves coalescing of dram reads.
         // TODO: find the definition of load<1, false> and what it does.
-        __syncwarp()
+        __syncwarp();
         load(q_reg, qo_smem[workerid]);
     }
     __syncthreads(); // finished loading of Q into shared memory
