@@ -3,7 +3,7 @@
 constexpr int ATTN_B = 16; // batch_size
 constexpr int ATTN_H = 16; // attention heads
 constexpr int ATTN_N = 1024; // sequence length 
-constexpr int ATTN_D = 64; // Q, K, V dimension
+constexpr int ATTN_D = 64; // Q, K, V dimension / gets passed as template parameter to the kernel (4090.impl)
 constexpr int ITER   = 10; // number of iterations (used in 4090_harness.impl)
 
 using namespace kittens;
@@ -19,7 +19,7 @@ template<int D> using shared_tile = st_bf<ROWS<D>, D>; // defines shared memory 
 template<int D> using global_layout = gl<bf16, -1, -1, -1, D>; // B, N, H, specified at runtime, D known at compile time for this kernel.
 template<int D> struct globals { global_layout<D> Qg, Kg, Vg, Og; };
 
-template <int D>
+template <int D> // here is the D defined as template parameter (defined in 4090.impl)
 __launch_bounds__(NUM_WORKERS *WARP_THREADS, 1) // WARP_THREADS is 32 and defined by CUDA, NUM_WORKERS * WARP_THREADS is the number of threads in a block
                                                 // 1 represents the minimum number of blocks per multiprocessor
     __global__ void attend_ker(const __grid_constant__ globals<D> g)
@@ -108,7 +108,7 @@ __launch_bounds__(NUM_WORKERS *WARP_THREADS, 1) // WARP_THREADS is 32 and define
         // This loop implements a pipelined loading strategy.
         // It calculates the indices of the next key/value blocks to be loaded,
         // initiates asynchronous loads for those blocks, and waits for the previous loads to complete.
-        // This allows the kernel to overlap memory transfers with computation, improving performance.
+        // This allows the kernel to overlap memory transfers with computation, improving performance. // TODO: i don't think that this is computation but rather it overlaps with laoding the next tiles.
         // The tic variable and the PIPE_STAGES shared memory buffers are used to manage the pipelined loading process.
         // the price of the first synchronize load before this load here is paid only once in the beginning
 

@@ -27,6 +27,7 @@ inline void __cudaCheckError( const char *file, const int line ) {
 // Compute FLOPs for forward attention
 constexpr uint64_t ATTN_FLOPS = 
     2llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N * ATTN_D + // Q * K^T: 2BHNND (multiply-add)
+    // ATTN_B * ATTN_H * ATTN_N * ATTN_N * (2llu * ATTN_D - 1) + 
     4llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N +          // Softmax: 2BHNN (exp and divide, plus flash-attn bookkeeping)
     2llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N * ATTN_D;      // (Q * K^T) * V: 2BHNND (multiply-add)
 
