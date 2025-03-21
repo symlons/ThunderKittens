@@ -1,3 +1,5 @@
+print('before imports')
+
 import torch
 from tqdm import trange
 import numpy as np
@@ -7,44 +9,48 @@ import math
 
 # only generate a single batch/head of data, which makes file loading much faster.
 # it does mean we'll have to check batch/head behavior separately later, but that should be much easier to debug.
-B = 1
-H = 1
-N = 2048 if len(sys.argv) <= 2 else int(sys.argv[2])
-D = 128 if len(sys.argv) <= 3 else int(sys.argv[3])
+B = 16
+H = 16
+# N = 2048 if len(sys.argv) <= 2 else int(sys.argv[2])
+N = 256
+# D = 128 if len(sys.argv) <= 3 else int(sys.argv[3])
+D = 128
 
 softmax_scale = 1 / math.sqrt(D)
+print("Starting")
 
 TESTNAME = sys.argv[1]
+device = 'mps'
 
 if TESTNAME == 'ones':
-    q           = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    k           = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    v           = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    grad_output = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')
+    q           = torch.ones((B, H, N, D), dtype=torch.bfloat16, device=device)
+    k           = torch.ones((B, H, N, D), dtype=torch.bfloat16, device=device)
+    v           = torch.ones((B, H, N, D), dtype=torch.bfloat16, device=device)
+    grad_output = torch.ones((B, H, N, D), dtype=torch.bfloat16, device=device)
 elif TESTNAME == 'randn':
     torch.random.manual_seed(42)
-    q           = torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    k           = torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    v           = torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    grad_output = torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')
+    q           = torch.randn((B, H, N, D), dtype=torch.bfloat16, device=device)
+    k           = torch.randn((B, H, N, D), dtype=torch.bfloat16, device=device)
+    v           = torch.randn((B, H, N, D), dtype=torch.bfloat16, device=device)
+    grad_output = torch.randn((B, H, N, D), dtype=torch.bfloat16, device=device)
 elif TESTNAME == 'qk_test':
     q = torch.eye(D).reshape((1,1,D,D)).repeat(B, H, N//D, 1)*10
-    q = q.to(dtype=torch.bfloat16, device='cuda')
+    q = q.to(dtype=torch.bfloat16, device=device)
     
     k = torch.eye(D).reshape((1,1,D,D)).repeat(B, H, N//D, 1)*10
-    k = k.to(dtype=torch.bfloat16, device='cuda')
+    k = k.to(dtype=torch.bfloat16, device=device)
     
     v = torch.eye(D).reshape((1,1,D,D)).repeat(B, H, N//D, 1)*10
-    v = v.to(dtype=torch.bfloat16, device='cuda')
+    v = v.to(dtype=torch.bfloat16, device=device)
     
     grad_output = torch.eye(D).reshape((1,1,D,D)).repeat(B, H, N//D, 1)*10
-    grad_output = grad_output.to(dtype=torch.bfloat16, device='cuda')
+    grad_output = grad_output.to(dtype=torch.bfloat16, device=device)
 elif TESTNAME == 'v_orientation':
-    q = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    k = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')
-    v = (torch.arange(D, dtype=torch.bfloat16, device='cuda')/D).reshape((1,1,1,-1)).repeat(B, H, N, 1)
+    q = torch.ones((B, H, N, D), dtype=torch.bfloat16, device=device)
+    k = torch.ones((B, H, N, D), dtype=torch.bfloat16, device=device)
+    v = (torch.arange(D, dtype=torch.bfloat16, device=device)/D).reshape((1,1,1,-1)).repeat(B, H, N, 1)
     
-    grad_output = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')
+    grad_output = torch.ones((B, H, N, D), dtype=torch.bfloat16, device=device)
 else:
     print('Invalid test name')
     sys.exit(0)
