@@ -13,6 +13,7 @@
 #ifdef KITTENS_HOPPER
 #include <cuda_fp8.h>
 #endif
+#include <cuda_fp4.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -21,9 +22,16 @@
 
 
 namespace kittens {
+/**
+ * @brief fp4 floating-point type.
+ */
+using nv_fp4 = __nv_fp4_e2m1;
+using nv_fp4_2 = __nv_fp4x2_e2m1;
+using nv_fp4_4 = __nv_fp4x4_e2m1;
+
 
 /**
- * @brief Bfloat16 floating-point type.
+ * @brief bfloat16 floating-point type.
  */
 using bf16 = __nv_bfloat16;
 /**
@@ -215,6 +223,18 @@ template<typename T> struct packing {
      */
     static __device__ inline constexpr T pack(const bf16 &i);
 };
+
+template<> struct packing<nv_fp4> {
+    static __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = nv_fp4;
+    using packed_type = nv_fp4_4;
+};
+template<> struct packing<nv_fp4_4> {
+    static __device__ inline constexpr int num() { return 4; }
+    using unpacked_type = nv_fp4;
+    using packed_type = nv_fp4_4;
+};
+
 template<> struct packing<bf16> {
     static __device__ inline constexpr int num() { return 1; }
     using unpacked_type = bf16;
@@ -419,6 +439,57 @@ template<> struct convertor<half_2, bf16_2> {
         return __float22half2_rn(__bfloat1622float2(u));
     }
 };
+
+// fp4e2m1
+template<> struct convertor<nv_fp4_4, float4> {
+    static __host__ __device__ inline nv_fp4_4 convert(const float4& u) {
+        return __nv_fp4x4_e2m1(u); 
+    }
+};
+template<> struct convertor<float4, nv_fp4_4> {
+    static __host__ __device__ inline float4 convert(const nv_fp4_4& u) {
+        __nv_fp4_e2m1 *vals = reinterpret_cast<__nv_fp4_e2m1*>(const_cast<__nv_fp4x4_e2m1*>(&u));
+        return make_float4(float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3]));
+    }
+};
+template<> struct convertor<nv_fp4_2, float2> {
+    static __host__ __device__ inline nv_fp4_2 convert(const float2& u) {
+        return __nv_fp4x2_e2m1(u); 
+    }
+};
+template<> struct convertor<float2, nv_fp4_2> {
+    static __host__ __device__ inline float2 convert(const nv_fp4_2& u) {
+        __nv_fp4_e2m1 *vals = reinterpret_cast<__nv_fp4_e2m1*>(const_cast<__nv_fp4x2_e2m1*>(&u));
+        return make_float2(float(vals[0]), float(vals[1]));
+    }
+};
+template<> struct convertor<nv_fp4, float> {
+    static __host__ __device__ inline nv_fp4 convert(const float & u) {
+        return __nv_fp4_e2m1(u);
+    }
+};
+template<> struct convertor<float, nv_fp4> {
+    static __host__ __device__ inline float convert(const nv_fp4 & u) {
+        return float(u);
+    }
+};
+template<> struct convertor<bf16_2, nv_fp4_4> {
+    static __host__ __device__ inline bf16_2 convert(const nv_fp4_4 & u) {
+        float4 f4 = convertor<float4, nv_fp4_4>::convert(u);
+        float2 f2 = make_float2(f4.x, f4.y);
+        return __float22bfloat162_rn(f2);
+    }
+};
+template<> struct convertor<nv_fp4_4, bf16_2> {
+    static __host__ __device__ inline nv_fp4_4 convert(const bf16_2 & u) {
+        float2 f2 = __bfloat1622float2(u);
+        float4 f4 = make_float4(f2.x, f2.y, 0.0f, 0.0f);
+        return __nv_fp4x4_e2m1(f4);
+    }
+};
+
+
+
 #ifdef KITTENS_HOPPER
 // fp8e4m3
 template<> struct convertor<fp8e4m3_4, float4> {

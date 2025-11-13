@@ -10,6 +10,7 @@
 
 /* ----------  MAIN TILE STRUCT  ---------- */
 
+
 // these are helper structs for type inference
 namespace kittens {
 namespace ducks {
@@ -282,6 +283,7 @@ st<_T, _rows, _cols>::subtile(int2 rowcol) // Qualified function name and parame
 
 /* ----------  WRAPPERS FOR PRETTINESS  ---------- */
 
+template<int _height, int _width> using st_4l = st<nv_fp4, _height, _width>;
 template<int _height, int _width> using st_bf = st<bf16,  _height, _width>;
 template<int _height, int _width> using st_hf = st<half,  _height, _width>;
 template<int _height, int _width> using st_fl = st<float, _height, _width>;
