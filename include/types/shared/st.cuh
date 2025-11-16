@@ -324,27 +324,27 @@ __device__ inline void print(const ST& tile) {
     printf("\n");
     
     // Print data rows
-    for (int r = 0; r < ST::rows; r++) {
-        printf("%3d |", r); // Row index
-        for (int c = 0; c < ST::cols; c++) {
-            if constexpr (std::is_same_v<typename ST::dtype, fp8e4m3>) {
-                printf("%8.3f ", static_cast<float>(tile[{r,c}]));
-#ifdef KITTENS_BLACKWELL
-            } else if constexpr (std::is_same_v<typename ST::dtype, fp8e8m0>) {
-                printf("%8.3f ", static_cast<float>(tile[{r,c}]));
-#endif
-            } else if constexpr (std::is_same_v<typename ST::dtype, float>) {
-                printf("%8.3f ", tile[{r,c}]);
-            } else if constexpr (std::is_same_v<typename ST::dtype, __nv_bfloat16>) {
-                printf("%8.3f ", __bfloat162float(tile[{r,c}]));
-            } else if constexpr (std::is_integral_v<typename ST::dtype>) {
-                printf("%8d ", (int)tile[{r,c}]);
-            } else {
-                printf("%8.3f ", (float)tile[{r,c}]);
-            }
-        }
-        printf("\n");
-    }
+//     for (int r = 0; r < ST::rows; r++) {
+//         printf("%3d |", r); // Row index
+//         for (int c = 0; c < ST::cols; c++) {
+//             if constexpr (std::is_same_v<typename ST::dtype, fp8e4m3>) {
+//                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
+// #ifdef KITTENS_BLACKWELL
+//             } else if constexpr (std::is_same_v<typename ST::dtype, fp8e8m0>) {
+//                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
+// #endif
+//             } else if constexpr (std::is_same_v<typename ST::dtype, float>) {
+//                 printf("%8.3f ", tile[{r,c}]);
+//             } else if constexpr (std::is_same_v<typename ST::dtype, __nv_bfloat16>) {
+//                 printf("%8.3f ", __bfloat162float(tile[{r,c}]));
+//             } else if constexpr (std::is_integral_v<typename ST::dtype>) {
+//                 printf("%8d ", (int)tile[{r,c}]);
+//             } else {
+//                 printf("%8.3f ", (float)tile[{r,c}]);
+//             }
+//         }
+//         printf("\n");
+//     }
     printf("\n");
 }
 

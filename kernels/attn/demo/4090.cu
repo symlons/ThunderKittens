@@ -36,9 +36,9 @@ __global__ void attend_ker(const __grid_constant__ globals<D> g) {
     typename attn_tile<D, float>::col_vec max_vec_last, max_vec, norm_vec; // these are column vectors for the in-place softmax.
     // each warp loads its own Q tile of 16x64
     if (q_seq*ROWS<D> < g.Qg.depth()) {
-        load<1, false>(qo_smem[workerid], g.Qg, {batch, q_seq, head, 0});  // going through shared memory improves coalescing of dram reads.
+        warp::load<1, false>(qo_smem[workerid], g.Qg, {batch, q_seq, head, 0});  // going through shared memory improves coalescing of dram reads.
         __syncwarp();
-        load(q_reg, qo_smem[workerid]);
+        warp::load(q_reg, qo_smem[workerid]);
     }
     __syncthreads();
 
@@ -66,31 +66,31 @@ __global__ void attend_ker(const __grid_constant__ globals<D> g) {
 
         #pragma unroll LOAD_BLOCKS
         for(int subtile = 0; subtile < LOAD_BLOCKS && (kv_idx*LOAD_BLOCKS + subtile)*ROWS<D> < g.Kg.depth(); subtile++) {
-            load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
+            warp::load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
             att_block = 0.f; // zero 16x16 attention tile
-            mma<transpose::N, transpose::T>(att_block, q_reg, k_reg, att_block); // Q@K.T
+            warp::mma<transpose::N, transpose::T>(att_block, q_reg, k_reg, att_block); // Q@K.T
             int first_index = (kv_idx*LOAD_BLOCKS + subtile)*ROWS<D>; // one past the last KV index of this tile
             int start_fill = g.Kg.depth()-first_index < ROWS<D> ? g.Kg.depth()-first_index : ROWS<D>;
-            right_fill(att_block, att_block, start_fill, base_types::constants<float>::neg_infty());
+            // warp::right_fill(att_block, att_block, start_fill, base_types::constants<float>::neg_infty());
             max_vec_last = max_vec;
-            max_vec = max<axis::COL>(att_block, max_vec); 
-            att_block = exp2(att_block - max_vec); 
-            max_vec_last = exp2(max_vec_last - max_vec); 
+            max_vec = warp::max<axis::COL>(att_block, max_vec); 
+            att_block = warp::exp2(att_block - max_vec); 
+            max_vec_last = warp::exp2(max_vec_last - max_vec); 
             norm_vec *= max_vec_last; 
-            norm_vec = sum<axis::COL>(att_block, norm_vec); 
+            norm_vec = warp::sum<axis::COL>(att_block, norm_vec); 
             att_block_mma = att_block; // copy to bf16 tile
-            load(v_reg, v_smem[subtile][tic]); 
+            warp::load(v_reg, v_smem[subtile][tic]); 
             o_reg *= max_vec_last; 
-            mma<transpose::N, transpose::N>(o_reg, att_block_mma, v_reg, o_reg);
+            warp::mma<transpose::N, transpose::N>(o_reg, att_block_mma, v_reg, o_reg);
         }
     }
 
     o_reg /= norm_vec;
     __syncthreads();
     if (q_seq*ROWS<D> < g.Og.depth()) { // write out o.
-        store(qo_smem[workerid], o_reg); // going through shared memory improves coalescing of dram writes.
+        warp::store(qo_smem[workerid], o_reg); // going through shared memory improves coalescing of dram writes.
         __syncwarp();
-        store<1, false>(g.Og, qo_smem[workerid], {batch, q_seq, head, 0});
+        warp::store<1, false>(g.Og, qo_smem[workerid], {batch, q_seq, head, 0});
     }
 }
 

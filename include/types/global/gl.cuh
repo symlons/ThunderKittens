@@ -65,8 +65,8 @@ template<typename _T, int _axis=-9999, bool _swizzle_flag=true> struct descripto
 namespace detail {
 template<typename... Args>
 struct descriptor_dict {
-    __host__ descriptor_dict() {}
-    template<typename T> __host__ descriptor_dict(T _, int b, int d, int r, int c) {}
+    __host__ __device__ descriptor_dict() {}
+    template<typename T> __host__ __device__ descriptor_dict(T _, int b, int d, int r, int c) {}
     __host__ __device__ descriptor_dict(const descriptor_dict &other) {}
 #ifdef KITTENS_HOPPER
     template<typename T, int U> __device__ const CUtensorMap* get() const {
@@ -85,8 +85,8 @@ struct descriptor_dict<_T, Args...> {
     using DESC = kittens::tma::descriptor<_T>; // copy or initialize with a default value
     CUtensorMap tma_desc;
     descriptor_dict<Args...> other_descs;
-    __host__ descriptor_dict() {}
-    __host__ descriptor_dict(typename DESC::T::dtype *data, int b, int d, int r, int c): other_descs(data, b, d, r, c) {
+    __host__ __device__ descriptor_dict() {}
+    __host__ __device__ descriptor_dict(typename DESC::T::dtype *data, int b, int d, int r, int c): other_descs(data, b, d, r, c) {
         kittens::detail::tma::create_tensor_map<typename DESC::T, DESC::axis, DESC::swizzle_flag>(&tma_desc, data, b, d, r, c);
     }
     __host__ __device__ inline descriptor_dict(const descriptor_dict &other) :
@@ -135,7 +135,7 @@ struct gl {
 
     detail::descriptor_dict<TMA_Types...> tma_descs;
 
-    __host__ inline gl(T *_data,
+    __host__ __device__ inline gl(T *_data,
                         ducks::gl::make_arg_t<b> _batch,
                         ducks::gl::make_arg_t<d> _depth,
                         ducks::gl::make_arg_t<r> _rows,
@@ -151,7 +151,7 @@ struct gl {
     }
 #endif
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const { // yes I am abusing the const qualifier here a bit.
-        return raw_ptr[(((size_t)idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
+        return raw_ptr[((idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
     }
     template<int axis> __device__ inline size_t shape() const {
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
@@ -162,9 +162,9 @@ struct gl {
     }
     template<int axis> __device__ inline size_t stride() const { 
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
-        if      constexpr (axis==0) { return (size_t)depth()*rows()*cols(); }
-        else if constexpr (axis==1) { return (size_t)rows()*cols(); }
-        else if constexpr (axis==2) { return (size_t)cols(); }
+        if      constexpr (axis==0) { return depth()*rows()*cols(); }
+        else if constexpr (axis==1) { return rows()*cols(); }
+        else if constexpr (axis==2) { return cols(); }
         else if constexpr (axis==3) { return 1; }
     }
 };
