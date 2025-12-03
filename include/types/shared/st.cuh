@@ -342,7 +342,7 @@ __device__ constexpr const char* get_tile_type_name() {
  */
 template<ducks::st::all ST>
 __device__ inline void print_fp4(const ST& tile) {
-    if (std::is_same_v<typename ST::dtype, fp4e2m1>) {
+    if (std::is_same_v<typename ST::dtype, fp4e2m1_2>) {
 
         constexpr int cols = ST::cols * 2;
         printf("Block %d: Shared Tile %dx%d (Type: %s<%d,%d>):\n", blockIdx.x, ST::rows, cols, get_tile_type_name<typename ST::dtype, ST::rows, cols>(), ST::rows, cols);
@@ -365,7 +365,8 @@ __device__ inline void print_fp4(const ST& tile) {
         for (int r = 0; r < ST::rows; r++) {
             printf("%3d |", r); // Row index
             for (int c = 0; c < cols; c += 2) {
-                uint8_t *vals = reinterpret_cast<uint8_t*>(const_cast<fp4e2m1*>(&tile[{r,c/2}]));
+                // uint8_t *vals = reinterpret_cast<uint8_t*>(const_cast<fp4e2m1*>(&tile[{r,c/2}]));
+                const uint8_t *vals = reinterpret_cast<const uint8_t*>(&tile[{r,c/2}]);
 
                 // Convert to fp4e2m1 and then to float
                 float f1 = static_cast<float>(fp4e2m1(vals[0] & 0xF));
