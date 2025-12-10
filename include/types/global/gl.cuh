@@ -72,6 +72,7 @@ struct descriptor_dict {
             std::is_same_v<T, std::true_type> && std::is_same_v<T, std::false_type>,
             "SKILL ISSUE: Requested a TMA descriptor for a type not initialized in the global layout."
         );
+        return nullptr;
     }
 #endif
 };
@@ -150,6 +151,10 @@ struct gl {
 #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
     template<typename U, int axis> __device__ inline const CUtensorMap* get_tma() const {
         return tma_descs.template get<U, axis>();
+    }
+    template<typename U, int axis=2> __device__ inline void prefetch_tma() const {
+        const CUtensorMap *tma_desc = tma_descs.template get<U, axis>();
+        asm volatile ("{prefetch.tensormap [%0];}" :: "l"(reinterpret_cast<uint64_t>(tma_desc)) : "memory"); // must be called by a single thread
     }
 #endif
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const { // yes I am abusing the const qualifier here a bit.

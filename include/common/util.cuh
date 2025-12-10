@@ -312,7 +312,7 @@ public:
 using tma_allocator = shared_allocator<1024>;
 using tma_swizzle_allocator = tma_allocator; // swizzled TMA modes require up to 1024 byte alignments :/
 
-/* Get CTA ID within a cluster */
+/* Get cluster ID */
 __device__ static inline int3 clusterIdx() {
     int3 cluster_idx;
     asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(cluster_idx.x));
@@ -320,6 +320,8 @@ __device__ static inline int3 clusterIdx() {
     asm volatile("mov.u32 %0, %clusterid.z;\n" : "=r"(cluster_idx.z));
     return cluster_idx;
 }
+
+/* Get CTA ID within a cluster */
 __device__ static inline int cluster_ctarank() {
     uint32_t ctarank;
     asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(ctarank));
@@ -327,14 +329,25 @@ __device__ static inline int cluster_ctarank() {
 }
 #endif
 
-template<int half> 
-__device__ static inline bool get_phasebit(uint32_t bitfield, int ring_id) {
-    return (bitfield & (1 << (half*16 + ring_id))) != 0;
+template<int half>
+__device__ static inline int get_phasebit(uint32_t bitfield, int ring_id) {
+    if constexpr (half == 0)
+        return (bitfield >> (ring_id)) & 0b1;
+    else if constexpr (half == 1)
+        return (bitfield >> (ring_id + 16)) & 0b1;
+    else
+        asm volatile ("brkpt;\n");
+    return -1;
 }
 
 template<int half> 
 __device__ static inline void update_phasebit(uint32_t &bitfield, int ring_id) {
-    bitfield ^= (1 << (half*16 + ring_id));
+    if constexpr (half == 0)
+        bitfield ^= (1 << (ring_id));
+    else if constexpr (half == 1)
+        bitfield ^= (1 << (ring_id + 16));
+    else
+        asm volatile ("brkpt;\n");
 }
 
 template<int N> __device__ static inline int ring_advance(int ring, int distance=1) { return (ring + distance) % N; }
