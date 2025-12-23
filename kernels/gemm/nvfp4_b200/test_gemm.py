@@ -2,6 +2,8 @@ import sys
 import torch
 torch.random.manual_seed(42)
 torch.set_printoptions(sci_mode=False)
+sys.path.insert(0, "/data")
+
 
 from _C import nvfp4_gemm, nvfp4_quantize
 
@@ -61,6 +63,8 @@ if __name__ == '__main__':
         # TEMPORARY
         A_fp4x2, A_sc_unswizzled, A_sc_global = torch_nvfp4_quantize(A)
         A_sc = scale_swizzle(A_sc_unswizzled, PACKED_PER_TILE)
+        print("unswizzled shape", A_sc_unswizzled.shape)
+        print("swizzle shape", A_sc.shape)
         B_fp4x2, B_sc_unswizzled, B_sc_global = torch_nvfp4_quantize(B)
         B_sc = scale_swizzle(B_sc_unswizzled, PACKED_PER_TILE)
 

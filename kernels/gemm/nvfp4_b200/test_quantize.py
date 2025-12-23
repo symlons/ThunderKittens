@@ -2,6 +2,8 @@ import sys
 import torch
 torch.random.manual_seed(42)
 torch.set_printoptions(sci_mode=False)
+sys.path.insert(0, "/data")
+
 
 from _C import nvfp4_quantize, fp32_to_fp4x2, fp4x2_to_fp32
 

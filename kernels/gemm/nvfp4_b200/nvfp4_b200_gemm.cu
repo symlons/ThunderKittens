@@ -216,7 +216,7 @@ __device__ inline void kernel(const globals &G) {
                 int row_block_idx = supergroup_idx * globals::SUPERGROUP_BLOCKS + row_within_supergroup;
                 int col_block_idx = idx_within_supergroup / rows_in_supergroup;
 
-                tma::cluster::wait(tensor_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
+                tma::warp::wait(tensor_finished, get_phasebit<1>(phasebits, globals::PIPELINE_STAGES));
                 update_phasebit<1>(phasebits, globals::PIPELINE_STAGES);
                 for (int i = 0; i < num_iters_per_block; i++) {
                     tma::cluster::wait(inputs_all_arrived[stage], get_phasebit<0>(phasebits, stage));
@@ -258,7 +258,7 @@ __device__ inline void kernel(const globals &G) {
             warpgroup::load_async(C_reg, out_tm);
             tensor_load_wait();
             warpgroup::sync(1);
-            warpgroup::tma::cluster::arrive(tensor_finished, 0, 1); // signal CTA 0
+            warpgroup::arrive(tensor_finished, 0, 1); // signal CTA 0
 
             // Decode with global scale
             #pragma unroll

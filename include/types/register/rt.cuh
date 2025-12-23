@@ -239,6 +239,8 @@ __device__ inline void print(const RT& tile) {
                             } else if constexpr (std::is_same_v<typename RT::T, bf16>) {
                                 // Handle packed bf16_2 type
                                 printf("[%.3f, %.3f] ", __bfloat162float(packed_val.x), __bfloat162float(packed_val.y));
+                            } else if constexpr (std::is_same_v<typename RT::dtype, half_2>) {
+                                printf("[%.3f, %.3f] ", __half2float(packed_val.x), __half2float(packed_val.y));
 #if defined(KITTENS_BLACKWELL)
                             } else if constexpr (std::is_same_v<typename RT::T, fp8e8m0>) {
                                 // Extract the 4 individual fp8e8m0 values from the packed fp8e8m0_4

@@ -396,8 +396,14 @@ __device__ inline void print_fp4(const ST& tile) {
                 const uint8_t *vals = reinterpret_cast<const uint8_t*>(&tile[{r,c/2}]);
 
                 // Convert to fp4e2m1 and then to float
-                float f1 = static_cast<float>(fp4e2m1(vals[0] & 0xF));
-                float f2 = static_cast<float>(fp4e2m1((vals[0] >> 4) & 0xF));
+                // float f1 = static_cast<float>(fp4e2m1(vals[0] & 0xF));
+                // float f2 = static_cast<float>(fp4e2m1((vals[0] >> 4) & 0xF));
+
+                fp4e2m1 low_fp4, high_fp4;
+                low_fp4.__x = vals[0] & 0xF;
+                high_fp4.__x = (vals[0] >> 4) & 0xF;
+                float f1 = static_cast<float>(low_fp4);
+                float f2 = static_cast<float>(high_fp4);
 
                 printf("%8.3f %8.3f ", f1, f2);
 
@@ -447,6 +453,8 @@ __device__ inline void print(const ST& tile) {
                 printf("%8.3f ", __bfloat162float(tile[{r,c}]));
             } else if constexpr (std::is_integral_v<typename ST::dtype>) {
                 printf("%8d ", (int)tile[{r,c}]);
+            } else if constexpr (std::is_same_v<typename ST::dtype, half>) {
+              printf("%8.3f ", __half2float(tile[{r, c}]));
 #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
             } else if constexpr (std::is_same_v<typename ST::dtype, fp8e4m3>) {
                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
@@ -504,10 +512,12 @@ __device__ inline void print(const st_subtile<ST, subtile_rows, subtile_cols>& s
                 printf("%8.3f ", subtile[{r,c}]);
             } else if constexpr (std::is_same_v<typename ST::dtype, __nv_bfloat16>) {
                 printf("%8.3f ", __bfloat162float(subtile[{r,c}]));
+            } else if constexpr (std::is_same_v<typename ST::dtype, half>) {
+              printf("%8.3f ", __half2float(subtile[{r, c}]));
             } else if constexpr (std::is_integral_v<typename ST::dtype>) {
-                printf("%8d ", (int)subtile[{r,c}]);
+              printf("%8d ", (int)subtile[{r, c}]);
             } else {
-                printf("%8.3f ", (float)subtile[{r,c}]);
+              printf("%8.3f ", (float)subtile[{r, c}]);
             }
         }
         printf("\n");
