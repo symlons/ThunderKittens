@@ -1,36 +1,45 @@
 #include "kittens.cuh"
+#include "../common.cuh"
 
 using namespace kittens;
 
-static constexpr int CLUSTER_SIZE = 2;
-static constexpr int NUM_CONSUMERS = 1;
-static constexpr int NUM_PRODUCERS = 1;
-static constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;
-static constexpr int NUM_THREADS = NUM_WORKERS * WARP_THREADS;
-static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
+template <int _Mb, int _Nb, int _Kb, int _SUPERGROUP_SIZE, bool _OVERLAP_MMA_EPI, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH>
+struct config {
+    static_assert(_Mb == 128 || _Mb == 256, "Mb must be 128 or 256");
+    static_assert(_Nb >= 16 && _Nb <= 256 && _Nb % 16 == 0, "Nb must be 16, 32, ..., 256");
+    static_assert(_Kb >= 16 && _Kb % 16 == 0, "Kb must be a multiple of 16");
+    static_assert(_SUPERGROUP_SIZE >= 1 && _SUPERGROUP_SIZE <= 16, "SUPERGROUP_SIZE must be 1-16");
+    static_assert(_LOAD_PIPE_DEPTH >= 1 && _LOAD_PIPE_DEPTH <= 16, "LOAD_PIPE_DEPTH must be 1-16");
+    static_assert(_EPI_PIPE_DEPTH >= 1 && _EPI_PIPE_DEPTH <= 16, "EPI_PIPE_DEPTH must be 1-16");
 
-template <int _SUPERGROUP_SIZE, int _Mb, int _Nb, int _Kb, int _SMEM_PIPE_DEPTH, int _MMA_PIPE_DEPTH, int _TMEM_PIPE_DEPTH>
-struct globals {
+    static constexpr int Mb = _Mb; // per MMA
+    static constexpr int Nb = _Nb; // per MMA
+    static constexpr int Kb = _Kb;
     static constexpr int SUPERGROUP_SIZE = _SUPERGROUP_SIZE;
 
-    static constexpr int Mb = _Mb;
-    static constexpr int Nb = _Nb;
-    static constexpr int Kb = _Kb;
-    
-    static constexpr int CLUSTER_M = 2*Mb;
-    static constexpr int CLUSTER_N = Nb;
+    static constexpr bool OVERLAP_MMA_EPI = _OVERLAP_MMA_EPI;
 
-    static constexpr int SMEM_PIPE_DEPTH = _SMEM_PIPE_DEPTH;
-    static constexpr int MMA_PIPE_DEPTH = _MMA_PIPE_DEPTH;
-    static constexpr int TMEM_PIPE_DEPTH = _TMEM_PIPE_DEPTH;
+    static constexpr int LOAD_PIPE_DEPTH = _LOAD_PIPE_DEPTH;
+    static constexpr int MMA_PIPE_DEPTH = OVERLAP_MMA_EPI ? 2 : 1;
+    static constexpr int EPI_PIPE_DEPTH = _EPI_PIPE_DEPTH;
     static constexpr int CLC_PIPE_DEPTH = 1;
 
-    static constexpr int NUM_D_TILES = TMEM_PIPE_DEPTH > 1 ? 2 : 1;
+    static constexpr int CLUSTER_SIZE = 2;
+    static constexpr int NUM_CONSUMERS = OVERLAP_MMA_EPI ? 1 : 2;
+    static constexpr int NUM_PRODUCERS = 1;
+    static constexpr int NUM_WARPS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;
+    static constexpr int NUM_THREADS = NUM_WARPS * WARP_THREADS;
+    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - 1024;
 
-    using a_tile = st_bf<Mb, Kb>;
-    using b_tile = st_bf<Nb/2, Kb>;
-    using d_tile = st_bf<Mb, Nb/TMEM_PIPE_DEPTH>;
-    
+    static constexpr int NUM_D_TILES = EPI_PIPE_DEPTH > 1 ? 2 : 1;
+};
+
+template <typename C>
+struct globals {
+    using a_tile = st_bf<C::Mb/2, C::Kb>;
+    using b_tile = st_bf<C::Nb/2, C::Kb>;
+    using d_tile = st_bf<C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>;
+
     using a_gl = gl<bf16, 1, 1, -1, -1, a_tile>;
     using b_gl = gl<bf16, 1, 1, -1, -1, b_tile>;
     using d_gl = gl<bf16, 1, 1, -1, -1, d_tile>;
@@ -39,14 +48,16 @@ struct globals {
     b_gl b;
     d_gl d;
 
-    __host__ __inline__ dim3 grid() { return dim3(d.rows()/Mb*d.cols()/Nb); }
-    __host__ __inline__ dim3 block() { return dim3(NUM_THREADS); }
-    __host__ __inline__ int dynamic_shared_memory() { return DYNAMIC_SHARED_MEMORY; }
+    __host__ __inline__ dim3 grid() { return dim3(d.rows()/(C::NUM_CONSUMERS*C::Mb/2) * d.cols()/C::Nb); }
+    __host__ __inline__ dim3 block() { return dim3(C::NUM_THREADS); }
+    __host__ __inline__ int dynamic_shared_memory() { return C::DYNAMIC_SHARED_MEMORY; }
 };
 
-template <typename G>
-__cluster_dims__(CLUSTER_SIZE, 1, 1) __launch_bounds__(NUM_THREADS, 1)
-__global__ void kernel(const __grid_constant__ G g) {
+template <typename C>
+__cluster_dims__(C::CLUSTER_SIZE, 1, 1) __launch_bounds__(C::NUM_THREADS, 1)
+__global__ void kernel(const __grid_constant__ globals<C> g) {
+    using G = globals<C>;
+
     if (threadIdx.x == 0) {
         g.a.template prefetch_tma<typename G::a_tile>();
         g.b.template prefetch_tma<typename G::b_tile>();
@@ -54,19 +65,19 @@ __global__ void kernel(const __grid_constant__ G g) {
     }
 
     const int cta_rank = cluster_ctarank();
-    const int iters_per_task = g.a.cols() / G::Kb;
+    const int iters_per_task = g.a.cols() / C::Kb;
 
     auto get_tile_idx = [&](int block_idx) -> int2 {
-        const int cluster_idx = block_idx / CLUSTER_SIZE;
-        const int rblks = g.d.rows() / G::CLUSTER_M;
-        const int cblks = g.d.cols() / G::CLUSTER_N;
-        const int supergroup_cblks = (cblks/G::SUPERGROUP_SIZE)*G::SUPERGROUP_SIZE;
+        const int cluster_idx = block_idx / C::CLUSTER_SIZE;
+        const int rblks = g.d.rows() / (C::Mb * C::NUM_CONSUMERS);
+        const int cblks = g.d.cols() / C::Nb;
+        const int supergroup_cblks = (cblks/C::SUPERGROUP_SIZE)*C::SUPERGROUP_SIZE;
         const int finalgroup_cblks = cblks-supergroup_cblks;
-        const int supergroup_numel = G::SUPERGROUP_SIZE*rblks;
+        const int supergroup_numel = C::SUPERGROUP_SIZE*rblks;
         if (cluster_idx < rblks*supergroup_cblks) {
             const int supergroup_idx = cluster_idx/supergroup_numel;
-            const int rblk_idx = (cluster_idx%supergroup_numel)/G::SUPERGROUP_SIZE;
-            return { (supergroup_idx&1) ? rblks-rblk_idx-1 : rblk_idx, G::SUPERGROUP_SIZE*supergroup_idx + cluster_idx%G::SUPERGROUP_SIZE };
+            const int rblk_idx = (cluster_idx%supergroup_numel)/C::SUPERGROUP_SIZE;
+            return { (supergroup_idx&1) ? rblks-rblk_idx-1 : rblk_idx, C::SUPERGROUP_SIZE*supergroup_idx + cluster_idx%C::SUPERGROUP_SIZE };
         } else {
             const int supergroup_idx = cluster_idx/supergroup_numel;
             const int remainder_task_id = cluster_idx - supergroup_cblks*cblks;
@@ -75,45 +86,52 @@ __global__ void kernel(const __grid_constant__ G g) {
         }
     };
 
-    extern __shared__ int __shm[]; 
+    extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
 
-    static_assert(sizeof(G::a_tile) * G::SMEM_PIPE_DEPTH +
-                  sizeof(G::b_tile) * G::SMEM_PIPE_DEPTH +
-                  sizeof(G::d_tile) * G::NUM_D_TILES <= DYNAMIC_SHARED_MEMORY);
-    typename G::a_tile (&a_smem)[G::SMEM_PIPE_DEPTH] = al.allocate<G::a_tile, G::SMEM_PIPE_DEPTH>();
-    typename G::b_tile (&b_smem)[G::SMEM_PIPE_DEPTH] = al.allocate<G::b_tile, G::SMEM_PIPE_DEPTH>();
-    typename G::d_tile (&d_smem)[G::NUM_D_TILES]     = al.allocate<G::d_tile, G::NUM_D_TILES>();
+    static_assert(sizeof(G::a_tile) * C::LOAD_PIPE_DEPTH * C::NUM_CONSUMERS +
+                  sizeof(G::b_tile) * C::LOAD_PIPE_DEPTH +
+                  sizeof(G::d_tile) * C::NUM_D_TILES * C::NUM_CONSUMERS <= C::DYNAMIC_SHARED_MEMORY);
+    typename G::a_tile (&a_smem)[C::LOAD_PIPE_DEPTH][C::NUM_CONSUMERS] = al.allocate<G::a_tile, C::LOAD_PIPE_DEPTH, C::NUM_CONSUMERS>();
+    typename G::b_tile (&b_smem)[C::LOAD_PIPE_DEPTH]                   = al.allocate<G::b_tile, C::LOAD_PIPE_DEPTH>();
+    typename G::d_tile (&d_smem)[C::NUM_CONSUMERS][C::NUM_D_TILES]     = al.allocate<G::d_tile, C::NUM_CONSUMERS, C::NUM_D_TILES>();
 
     tensor_allocator<1, 2> tm_alloc{};
-    using d_tt_t = tt<float, G::Mb, G::Nb>;
+    using d_tt_t = tt<float, C::Mb/2, C::Nb>;
 
-    __shared__ clc::handle clc_handle[G::CLC_PIPE_DEPTH];
-    __shared__ semaphore schedule_arrived[G::CLC_PIPE_DEPTH], schedule_finished[G::CLC_PIPE_DEPTH];
-    __shared__ semaphore inputs_arrived[G::SMEM_PIPE_DEPTH], inputs_finished[G::SMEM_PIPE_DEPTH], outputs_arrived, outputs_finished[G::MMA_PIPE_DEPTH];
+    __shared__ clc::handle clc_handle[C::CLC_PIPE_DEPTH];
+    __shared__ semaphore schedule_arrived[C::CLC_PIPE_DEPTH], schedule_finished[C::CLC_PIPE_DEPTH];
+    __shared__ semaphore inputs_arrived[C::LOAD_PIPE_DEPTH], inputs_finished[C::LOAD_PIPE_DEPTH], outputs_arrived[C::NUM_CONSUMERS], outputs_finished[C::MMA_PIPE_DEPTH];
     uint32_t bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
 
-    if (threadIdx.x == 0) { 
+    if (threadIdx.x == 0) {
         #pragma unroll
-        for (int i = 0; i < G::CLC_PIPE_DEPTH; i++) {
+        for (int i = 0; i < C::CLC_PIPE_DEPTH; i++) {
             init_semaphore(schedule_arrived[i], 0, 1);
-            init_semaphore(schedule_finished[i], 0, 3*CLUSTER_SIZE+1);
+            init_semaphore(schedule_finished[i], 0, (2+C::NUM_CONSUMERS)*C::CLUSTER_SIZE+C::NUM_CONSUMERS);
         }
         #pragma unroll
-        for (int i = 0; i < G::SMEM_PIPE_DEPTH; i++) {
-            init_semaphore(inputs_arrived[i], 0, 1);
-            init_semaphore(inputs_finished[i], 0, 1);
+        for (int i = 0; i < C::LOAD_PIPE_DEPTH; i++) {
+            init_semaphore(inputs_arrived[i], 0, C::NUM_CONSUMERS);
+            init_semaphore(inputs_finished[i], 0, C::NUM_CONSUMERS);
         }
-        init_semaphore(outputs_arrived, 0, 1);
         #pragma unroll
-        for (int i = 0; i < G::MMA_PIPE_DEPTH; i++) {
-            init_semaphore(outputs_finished[i], 0, CLUSTER_SIZE);
+        for (int i = 0; i < C::NUM_CONSUMERS; i++) {
+            init_semaphore(outputs_arrived[i], 0, 1);
+        }
+        #pragma unroll
+        for (int i = 0; i < C::MMA_PIPE_DEPTH; i++) {
+            init_semaphore(outputs_finished[i], 0, C::CLUSTER_SIZE*C::NUM_CONSUMERS);
         }
     }
     everyone::tma::cluster::sync();
 
-    if (warpgroup::groupid() == NUM_CONSUMERS) {
-        warpgroup::increase_registers<256>();
+    if (warpgroup::groupid() == C::NUM_CONSUMERS) {
+        if constexpr (C::NUM_CONSUMERS == 1)
+            warpgroup::increase_registers<256>();
+        else
+            warpgroup::decrease_registers<56>();
+
         if (warp::laneid() == 0 && warpgroup::warpid() == 3) {
             int input_ring = 0;
             int2 tile_coord = get_tile_idx(blockIdx.x);
@@ -121,175 +139,173 @@ __global__ void kernel(const __grid_constant__ G g) {
                 for (int idx = 0; idx < iters_per_task; idx++) {
                     tma::cluster::wait(inputs_finished[input_ring], get_phasebit<1>(bitfield, input_ring));
                     update_phasebit<1>(bitfield, input_ring);
-                    tma::cluster::load_async(a_smem[input_ring], g.a, {tile_coord.x*2+cta_rank, idx}, inputs_arrived[input_ring], (uint16_t)(1<<cta_rank), 0);
+                    #pragma unroll
+                    for (int i = 0; i < C::NUM_CONSUMERS; i++)
+                        tma::cluster::load_async(a_smem[input_ring][i], g.a, {(tile_coord.x*2+cta_rank)*C::NUM_CONSUMERS+i, idx}, inputs_arrived[input_ring], (uint16_t)(1<<cta_rank), 0);
                     tma::cluster::load_async(b_smem[input_ring], g.b, {tile_coord.y*2+cta_rank, idx}, inputs_arrived[input_ring], (uint16_t)(1<<cta_rank), 0);
-                    input_ring=ring_advance<G::SMEM_PIPE_DEPTH>(input_ring);
+                    input_ring=ring_advance<C::LOAD_PIPE_DEPTH>(input_ring);
                 }
-                tma::cluster::wait(schedule_arrived[task_iter%G::CLC_PIPE_DEPTH], (task_iter/G::CLC_PIPE_DEPTH)%2);
-                auto schedule = clc::query(clc_handle[task_iter%G::CLC_PIPE_DEPTH]);
-                tma::cluster::arrive(schedule_finished[task_iter%G::CLC_PIPE_DEPTH], 0);
+                tma::cluster::wait(schedule_arrived[task_iter%C::CLC_PIPE_DEPTH], (task_iter/C::CLC_PIPE_DEPTH)%2);
+                auto schedule = clc::query(clc_handle[task_iter%C::CLC_PIPE_DEPTH]);
+                tma::cluster::arrive(schedule_finished[task_iter%C::CLC_PIPE_DEPTH], 0);
                 if (schedule.success) tile_coord = get_tile_idx(schedule.x);
                 else break;
             }
         } else if (warp::laneid() == 0 && warpgroup::warpid() == 2) {
             for (int task_iter = 0; true; task_iter++) {
                 if (cta_rank == 0) {
-                    tma::cluster::wait(schedule_finished[task_iter%G::CLC_PIPE_DEPTH], ((task_iter+G::CLC_PIPE_DEPTH)/G::CLC_PIPE_DEPTH)%2);
-                    clc::schedule(clc_handle[task_iter%G::CLC_PIPE_DEPTH], schedule_arrived[task_iter%G::CLC_PIPE_DEPTH]);
+                    tma::cluster::wait(schedule_finished[task_iter%C::CLC_PIPE_DEPTH], ((task_iter+C::CLC_PIPE_DEPTH)/C::CLC_PIPE_DEPTH)%2);
+                    clc::schedule(clc_handle[task_iter%C::CLC_PIPE_DEPTH], schedule_arrived[task_iter%C::CLC_PIPE_DEPTH]);
                 }
-                tma::cluster::expect_bytes(schedule_arrived[task_iter%G::CLC_PIPE_DEPTH], sizeof(clc_handle[task_iter%G::CLC_PIPE_DEPTH]));
-                tma::cluster::wait(schedule_arrived[task_iter%G::CLC_PIPE_DEPTH], (task_iter/G::CLC_PIPE_DEPTH)%2);
-                auto schedule = clc::query(clc_handle[task_iter%G::CLC_PIPE_DEPTH]);
-                tma::cluster::arrive(schedule_finished[task_iter%G::CLC_PIPE_DEPTH], 0);
+                tma::cluster::expect_bytes(schedule_arrived[task_iter%C::CLC_PIPE_DEPTH], sizeof(clc_handle[task_iter%C::CLC_PIPE_DEPTH]));
+                tma::cluster::wait(schedule_arrived[task_iter%C::CLC_PIPE_DEPTH], (task_iter/C::CLC_PIPE_DEPTH)%2);
+                auto schedule = clc::query(clc_handle[task_iter%C::CLC_PIPE_DEPTH]);
+                tma::cluster::arrive(schedule_finished[task_iter%C::CLC_PIPE_DEPTH], 0);
                 if (!schedule.success) break;
             }
-        } else if (cta_rank == 0 && warp::laneid() == 0 && warpgroup::warpid() == 0) {
-            d_tt_t d_tt[G::MMA_PIPE_DEPTH];
+        } else if (cta_rank == 0 && warp::laneid() == 0 && warpgroup::warpid() < C::NUM_CONSUMERS) {
+            d_tt_t d_tt[C::MMA_PIPE_DEPTH];
             #pragma unroll
-            for (int i = 0; i < G::MMA_PIPE_DEPTH; i++) {
-                if constexpr(G::Mb == 128)
-                    d_tt[i] = tm_alloc.allocate<d_tt_t>(i*G::Nb);
-                else
-                    d_tt[i] = tm_alloc.allocate<d_tt_t>(0, i*G::Nb);
+            for (int i = 0; i < C::MMA_PIPE_DEPTH; i++) {
+                if constexpr(C::Mb == 256) d_tt[i] = tm_alloc.allocate<d_tt_t>(   (i+warpgroup::warpid())*C::Nb);
+                else                       d_tt[i] = tm_alloc.allocate<d_tt_t>(0, (i+warpgroup::warpid())*C::Nb);
             }
             int input_ring = 0;
             for (int task_iter = 0; true; task_iter++) {
-                tma::cluster::wait(schedule_arrived[task_iter%G::CLC_PIPE_DEPTH], (task_iter/G::CLC_PIPE_DEPTH)%2);
-                auto schedule = clc::query(clc_handle[task_iter%G::CLC_PIPE_DEPTH]);
-                tma::cluster::arrive(schedule_finished[task_iter%G::CLC_PIPE_DEPTH], 0);
-                tma::cluster::wait(outputs_finished[task_iter%G::MMA_PIPE_DEPTH], ((task_iter+G::MMA_PIPE_DEPTH)/G::MMA_PIPE_DEPTH)%2);
+                tma::cluster::wait(schedule_arrived[task_iter%C::CLC_PIPE_DEPTH], (task_iter/C::CLC_PIPE_DEPTH)%2);
+                auto schedule = clc::query(clc_handle[task_iter%C::CLC_PIPE_DEPTH]);
+                tma::cluster::arrive(schedule_finished[task_iter%C::CLC_PIPE_DEPTH], 0);
+                tma::cluster::wait(outputs_finished[task_iter%C::MMA_PIPE_DEPTH], ((task_iter+C::MMA_PIPE_DEPTH)/C::MMA_PIPE_DEPTH)%2);
                 for(int idx = 0; idx < iters_per_task; idx++) {
-                    tma::cluster::expect_bytes(inputs_arrived[input_ring], 2*sizeof(G::a_tile) + 2*sizeof(G::b_tile));
+                    tma::cluster::expect_bytes(inputs_arrived[input_ring], (C::CLUSTER_SIZE*C::NUM_CONSUMERS*sizeof(G::a_tile) + 2*sizeof(G::b_tile))/C::NUM_CONSUMERS);
                     tma::cluster::wait(inputs_arrived[input_ring], get_phasebit<0>(bitfield, input_ring));
                     update_phasebit<0>(bitfield, input_ring);
-                    if (idx == 0) mm2_ABt (d_tt[task_iter%G::MMA_PIPE_DEPTH], a_smem[input_ring], b_smem[input_ring], inputs_finished[input_ring]);
-                    else          mma2_ABt(d_tt[task_iter%G::MMA_PIPE_DEPTH], a_smem[input_ring], b_smem[input_ring], inputs_finished[input_ring]);
-                    input_ring=ring_advance<G::SMEM_PIPE_DEPTH>(input_ring);
+                    if (idx == 0) mm2_ABt (d_tt[task_iter%C::MMA_PIPE_DEPTH], a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
+                    else          mma2_ABt(d_tt[task_iter%C::MMA_PIPE_DEPTH], a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
+                    input_ring=ring_advance<C::LOAD_PIPE_DEPTH>(input_ring);
                 }
-                detail::tcgen05::commit<CLUSTER_SIZE>(outputs_arrived);
+                detail::tcgen05::commit<C::CLUSTER_SIZE>(outputs_arrived[warpgroup::warpid()]);
                 if (!schedule.success) break;
             }
         }
     }
     else {
-        warpgroup::increase_registers<256>();
-        d_tt_t d_tt[G::MMA_PIPE_DEPTH];
+        if constexpr (C::NUM_CONSUMERS == 1)
+            warpgroup::increase_registers<256>();
+        else
+            warpgroup::increase_registers<224>();
+
+        d_tt_t d_tt[C::MMA_PIPE_DEPTH];
         #pragma unroll
-        for (int i = 0; i < G::MMA_PIPE_DEPTH; i++) {
-            if constexpr(G::Mb == 128) d_tt[i] = tm_alloc.allocate<d_tt_t>(   i*G::Nb);
-            else                       d_tt[i] = tm_alloc.allocate<d_tt_t>(0, i*G::Nb);
+        for (int i = 0; i < C::MMA_PIPE_DEPTH; i++) {
+            if constexpr(C::Mb == 256) d_tt[i] = tm_alloc.allocate<d_tt_t>(   (i+warpgroup::groupid())*C::Nb);
+            else                       d_tt[i] = tm_alloc.allocate<d_tt_t>(0, (i+warpgroup::groupid())*C::Nb);
         }
         int2 tile_coord, next_tile_coord = get_tile_idx(blockIdx.x);
         for(int task_iter = 0; true; task_iter++) {
             tile_coord = next_tile_coord;
-            tma::cluster::wait(schedule_arrived[task_iter%G::CLC_PIPE_DEPTH], (task_iter/G::CLC_PIPE_DEPTH)%2);
-            auto schedule = clc::query(clc_handle[task_iter%G::CLC_PIPE_DEPTH]);
-            warpgroup::sync(1);
-            warpgroup::tma::cluster::arrive(schedule_finished[task_iter%G::CLC_PIPE_DEPTH], 0);
+            tma::cluster::wait(schedule_arrived[task_iter%C::CLC_PIPE_DEPTH], (task_iter/C::CLC_PIPE_DEPTH)%2);
+            auto schedule = clc::query(clc_handle[task_iter%C::CLC_PIPE_DEPTH]);
+            warpgroup::sync(warpgroup::groupid()+1);
+            warpgroup::tma::cluster::arrive(schedule_finished[task_iter%C::CLC_PIPE_DEPTH], 0);
             if (schedule.success) next_tile_coord = get_tile_idx(schedule.x);
-            wait(outputs_arrived, task_iter%2);
-            rt_bf<G::Mb/4, G::Nb/G::TMEM_PIPE_DEPTH> d_reg[G::TMEM_PIPE_DEPTH];
-            #pragma unroll
-            for(int i = 0; i < G::TMEM_PIPE_DEPTH; i++) {
-                warpgroup::load_async(d_reg[i], d_tt[task_iter%G::MMA_PIPE_DEPTH].template subtile<tt<float, G::Mb, G::Nb/G::TMEM_PIPE_DEPTH>>(0, G::Nb/G::TMEM_PIPE_DEPTH*i));
+            wait(outputs_arrived[warpgroup::groupid()], task_iter%2);
+            if constexpr (C::OVERLAP_MMA_EPI) {
+                rt_bf<C::Mb/8, C::Nb/C::EPI_PIPE_DEPTH> d_reg;
+                #pragma unroll
+                for(int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                    warpgroup::load_async(d_reg, d_tt[task_iter%C::MMA_PIPE_DEPTH].template subtile<tt<float, C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
+                    tensor_load_wait();
+                    if (i == C::EPI_PIPE_DEPTH - 1) {
+                        warpgroup::sync(warpgroup::groupid()+1);
+                        warpgroup::tma::cluster::arrive(outputs_finished[task_iter%C::MMA_PIPE_DEPTH], 0);
+                    }
+                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
+                    warpgroup::sync(warpgroup::groupid()+1);
+                    warpgroup::store(d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], d_reg);
+                    warpgroup::sync(warpgroup::groupid()+1);
+                    warpgroup::tma::store_async(g.d, d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], {(2*tile_coord.x+cta_rank)*C::NUM_CONSUMERS+warpgroup::groupid(), C::EPI_PIPE_DEPTH*tile_coord.y+i});
+                }
+            } else {
+                rt_bf<C::Mb/8, C::Nb/C::EPI_PIPE_DEPTH> d_reg[C::EPI_PIPE_DEPTH];
+                #pragma unroll
+                for(int i = 0; i < C::EPI_PIPE_DEPTH; i++)
+                    warpgroup::load_async(d_reg[i], d_tt[task_iter%C::MMA_PIPE_DEPTH].template subtile<tt<float, C::Mb/2, C::Nb/C::EPI_PIPE_DEPTH>>(0, C::Nb/C::EPI_PIPE_DEPTH*i));
                 tensor_load_wait();
-                warpgroup::tma::store_async_read_wait<1>();
-                warpgroup::sync(1);
-                warpgroup::store(d_smem[i%2], d_reg[i]);
-                warpgroup::sync(1);
-                warpgroup::tma::store_async(g.d, d_smem[i%2], {2*tile_coord.x+cta_rank, G::TMEM_PIPE_DEPTH*tile_coord.y+i});
+                warpgroup::sync(warpgroup::groupid()+1);
+                warpgroup::tma::cluster::arrive(outputs_finished[task_iter%C::MMA_PIPE_DEPTH], 0);
+                #pragma unroll
+                for(int i = 0; i < C::EPI_PIPE_DEPTH; i++) {
+                    warpgroup::tma::store_async_read_wait<C::NUM_D_TILES-1>();
+                    warpgroup::sync(warpgroup::groupid()+1);
+                    warpgroup::store(d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], d_reg[i]);
+                    warpgroup::sync(warpgroup::groupid()+1);
+                    warpgroup::tma::store_async(g.d, d_smem[warpgroup::groupid()][i%C::NUM_D_TILES], {(2*tile_coord.x+cta_rank)*C::NUM_CONSUMERS+warpgroup::groupid(), C::EPI_PIPE_DEPTH*tile_coord.y+i});
+                }
             }
-            warpgroup::tma::store_async_read_wait();
-            warpgroup::tma::cluster::arrive(outputs_finished[task_iter%G::MMA_PIPE_DEPTH], 0);
             if (!schedule.success) break;
         }
     }
 }
 
-#include <omp.h>
-#include <random>
-#include <vector>
-
-template <typename G>
-__host__ double run_benchmark(size_t M, size_t N, size_t K, bool check_correctness = false, bool ncu = false) {
+template <typename C>
+__host__ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
-    std::cout << "Template: SUPERGROUP_SIZE=" << G::SUPERGROUP_SIZE << " Mb=" << G::Mb << " Nb=" << G::Nb << " Kb=" << G::Kb << 
-                 " SMEM_PIPE_DEPTH=" << G::SMEM_PIPE_DEPTH << " MMA_PIPE_DEPTH=" << G::MMA_PIPE_DEPTH << " TMEM_PIPE_DEPTH=" << G::TMEM_PIPE_DEPTH << "\n";
-    std::cout << "Total number of tasks: " << (M / G::Mb * N / G::Nb) << "\n";
-    std::cout << "Number of iterations per task: " << (K / G::Kb) << "\n";
+    std::cout << "Template: Mb=" << C::Mb << " Nb=" << C::Nb << " Kb=" << C::Kb << " SUPERGROUP_SIZE=" << C::SUPERGROUP_SIZE
+              << " OVERLAP_MMA_EPI=" << C::OVERLAP_MMA_EPI << " LOAD_PIPE_DEPTH=" << C::LOAD_PIPE_DEPTH << " EPI_PIPE_DEPTH=" << C::EPI_PIPE_DEPTH << "\n";
+    std::cout << "Total number of tasks: " << (M / (C::Mb*C::NUM_CONSUMERS) * N / C::Nb) << "\n";
+    std::cout << "Number of iterations per task: " << (K / C::Kb) << "\n";
 
-    // Sleep for 50 ms to limit power consumption and thermals
-    usleep(50000);
+    // Cooldown between configurations
+    sleep_ms(500);
 
-    // Calculate arg_group_size
-    const int arg_size = 2 * (M * K + N * K + M * N);
-    const int l2_cache_size = 128 * 1024 * 1024;
-    const int ideal_arg_size = l2_cache_size * 3;
-    const int arg_group_count = arg_size > ideal_arg_size ? 1 : (ideal_arg_size / arg_size) + 1;
-
-    // Allocate host memory
-    std::vector<float> h_A(M * K * arg_group_count);
-    std::vector<float> h_B(K * N * arg_group_count);
-    std::vector<float> h_C_ref(M * N);
-    std::cout << "Allocated host memory" << std::endl;
-
-    // Initialize random number generator
-    std::random_device rd;
-    std::mt19937 gen(42);
-    std::uniform_real_distribution<> dis(-0.5, 0.5);
-
-    // Initialize matrices with random values
-    for (int i = 0; i < M * K * arg_group_count; ++i) h_A[i] = dis(gen);
-    for (int i = 0; i < K * N * arg_group_count; ++i) h_B[i] = dis(gen);
-    std::cout << "Initialized matrices" << std::endl;
-
-    // Perform CPU matrix multiplication for reference
-    if (check_correctness) {
-        #pragma omp parallel for collapse(2)
-        for (int i = 0; i < M; i++) {
-            for (int j = 0; j < N; j++) {
-                float sum = 0.0f;
-                for (int k = 0; k < K; k++)
-                    sum += h_A[i * K + k] * h_B[j * K + k];
-                h_C_ref[i * N + j] = sum;
-            }
-        }
-        std::cout << "Performed CPU matrix multiplication" << std::endl;
-    }
+    // L2 cache eviction - multiple buffer groups
+    int l2_cache_size;
+    cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, 0);
+    const size_t arg_size = 2 * (size_t(M) * K + size_t(N) * K + size_t(M) * N);
+    const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
+    const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
 
     // Allocate device memory
     std::vector<__nv_bfloat16*> d_A(arg_group_count);
     std::vector<__nv_bfloat16*> d_B(arg_group_count);
     std::vector<__nv_bfloat16*> d_C(arg_group_count);
+    __nv_bfloat16* d_C_ref;
     for (int i = 0; i < arg_group_count; i++) {
         CUDACHECK(cudaMalloc(&d_A[i], M*K*sizeof(__nv_bfloat16)));
         CUDACHECK(cudaMalloc(&d_B[i], K*N*sizeof(__nv_bfloat16)));
         CUDACHECK(cudaMalloc(&d_C[i], M*N*sizeof(__nv_bfloat16)));
     }
+    CUDACHECK(cudaMalloc(&d_C_ref, M*N*sizeof(__nv_bfloat16)));
     std::cout << "Allocated device memory" << std::endl;
 
-    // Convert to __nv_bfloat16 and copy to device
-    std::vector<__nv_bfloat16> h_A_bf16(M * K * arg_group_count);
-    std::vector<__nv_bfloat16> h_B_bf16(K * N * arg_group_count);
-    for (int i = 0; i < M * K * arg_group_count; ++i) h_A_bf16[i] = __float2bfloat16(h_A[i]);
-    for (int i = 0; i < K * N * arg_group_count; ++i) h_B_bf16[i] = __float2bfloat16(h_B[i]);
+    // Initialize matrices with random values on device
+    uint64_t seed = 2024;
     for (int i = 0; i < arg_group_count; i++) {
-        CUDACHECK(cudaMemcpy(d_A[i], &h_A_bf16[i*M*K], M*K*sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-        CUDACHECK(cudaMemcpy(d_B[i], &h_B_bf16[i*N*K], N*K*sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+        fill<__nv_bfloat16, FillMode::RANDOM>(d_A[i], M*K, seed + i*100, -1.0f, 1.0f);
+        fill<__nv_bfloat16, FillMode::RANDOM>(d_B[i], K*N, seed + i*100 + 1, -1.0f, 1.0f);
+        fill<__nv_bfloat16, FillMode::CONSTANT>(d_C[i], M*N, 0.0f);
     }
-    std::cout << "Copied matrices to device" << std::endl;
+    fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_ref, M*N, 0.0f);
+    CUDACHECK(cudaDeviceSynchronize());
+    std::cout << "Initialized matrices on device" << std::endl;
+
+    // Compute reference GEMM on device
+    reference_gemm<__nv_bfloat16, __nv_bfloat16>(d_C_ref, d_A[0], d_B[0], M, N, K);
+    CUDACHECK(cudaDeviceSynchronize());
+    std::cout << "Computed reference GEMM on device" << std::endl;
 
     // Prepare kernel inputs
-    std::vector<G> g;
+    std::vector<globals<C>> g;
     for (int i = 0; i < arg_group_count; i++) {
-        typename G::a_gl Ag{d_A[i], nullptr, nullptr, M, K};
-        typename G::b_gl Bg{d_B[i], nullptr, nullptr, N, K};
-        typename G::d_gl Dg{d_C[i], nullptr, nullptr, M, N};
-        g.push_back(G{Ag, Bg, Dg});
+        typename globals<C>::a_gl Ag{d_A[i], nullptr, nullptr, M, K};
+        typename globals<C>::b_gl Bg{d_B[i], nullptr, nullptr, N, K};
+        typename globals<C>::d_gl Dg{d_C[i], nullptr, nullptr, M, N};
+        g.push_back(globals<C>{Ag, Bg, Dg});
     }
 
     // Set kernel attributes
-    CUDACHECK(cudaFuncSetAttribute(kernel<G>, cudaFuncAttributeMaxDynamicSharedMemorySize, g[0].dynamic_shared_memory()));
+    CUDACHECK(cudaFuncSetAttribute(kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, g[0].dynamic_shared_memory()));
 
     // Number of iterations
     int num_warmups = ncu ? 0 : 500;
@@ -298,18 +314,17 @@ __host__ double run_benchmark(size_t M, size_t N, size_t K, bool check_correctne
     // Warmup
     for(int i = 0; i < num_warmups; i++) {
         int idx = i % arg_group_count;
-        kernel<G><<<g[idx].grid(), g[idx].block(), g[idx].dynamic_shared_memory()>>>(g[idx]);
+        kernel<C><<<g[idx].grid(), g[idx].block(), g[idx].dynamic_shared_memory()>>>(g[idx]);
     }
 
     // Benchmark
     cudaEvent_t start, stop;
     CUDACHECK(cudaEventCreate(&start));
     CUDACHECK(cudaEventCreate(&stop));
-    CUDACHECK(cudaDeviceSynchronize());
     CUDACHECK(cudaEventRecord(start));
     for(int i = 0; i < num_iters; i++) {
         int idx = i % arg_group_count;
-        kernel<G><<<g[idx].grid(), g[idx].block(), g[idx].dynamic_shared_memory()>>>(g[idx]);
+        kernel<C><<<g[idx].grid(), g[idx].block(), g[idx].dynamic_shared_memory()>>>(g[idx]);
     }
     CUDACHECK(cudaEventRecord(stop));
     CUDACHECK(cudaEventSynchronize(stop));
@@ -323,37 +338,8 @@ __host__ double run_benchmark(size_t M, size_t N, size_t K, bool check_correctne
     std::cout << "Average kernel execution time: " << microseconds << " us\n";
     std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
 
-    if (check_correctness) {
-        // Copy result back to host
-        std::vector<__nv_bfloat16> h_C_bf16(M * N);
-        CUDACHECK(cudaMemcpy(&h_C_bf16[0], d_C[0], M*N*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
-        std::cout << "Copied result back to host" << std::endl;
-
-        // Convert result back to float for comparison
-        std::vector<float> h_C(M * N);
-        for (int i = 0; i < M * N; ++i) h_C[i] = __bfloat162float(h_C_bf16[i]);
-        std::cout << "Converted result back to float" << std::endl;
-
-        // Check result
-        float max_error = 0.0f;
-        float average_error = 0.0f;
-        int error_count = 0;
-        for (int i = 0; i < M * N; ++i) {
-            float error = std::abs(h_C[i] - h_C_ref[i]);
-            if(error > .5f) { // large because of bf16 vs fp32 numerics
-                if(error_count < 20) std::cout << "Error at row " << i / N << " col " << i % N << ": " << h_C[i] << " != " << h_C_ref[i] << " (ref)" << std::endl;
-                else if(error_count == 21) std::cout << "Too many errors to show them all.\n";
-                error_count++;
-            }
-            max_error = std::max(max_error, error);
-            average_error += error;
-        }
-        average_error /= M*N;
-
-        std::cout << "Max error: " << max_error << std::endl;
-        std::cout << "Average error: " << average_error << std::endl;
-        std::cout << "Error count: " << error_count << std::endl;
-    }
+    // Verify results
+    check_correctness(d_C[0], d_C_ref, M * N);
 
     // Clean up
     for (int i = 0; i < arg_group_count; i++) {
@@ -361,6 +347,7 @@ __host__ double run_benchmark(size_t M, size_t N, size_t K, bool check_correctne
         cudaFree(d_B[i]);
         cudaFree(d_C[i]);
     }
+    cudaFree(d_C_ref);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
@@ -369,20 +356,19 @@ __host__ double run_benchmark(size_t M, size_t N, size_t K, bool check_correctne
 
 __host__ int main() {
     int N;
-    bool check_correctness = false;
     bool ncu = false;
 
-    // Template parameters: SUPERGROUP_SIZE, Mb, Nb, Kb, SMEM_PIPE_DEPTH, MMA_PIPE_DEPTH, TMEM_PIPE_DEPTH
+    // Template parameters: _Mb, _Nb, _Kb, _SUPERGROUP_SIZE, _OVERLAP_MMA_EPI, _LOAD_PIPE_DEPTH, _EPI_PIPE_DEPTH
     N = 1024;
-    run_benchmark<globals<4, 128, 128, 128, 4, 2, 2>>(N, N, N, check_correctness, ncu);
+    run_benchmark<config<128, 128, 128, 4, true, 6, 2>>(N, N, N, ncu);
     N = 2048;
-    run_benchmark<globals<4, 128, 256, 64, 4, 2, 8>>(N, N, N, check_correctness, ncu);
+    run_benchmark<config<256, 256, 64, 4, true, 5, 8>>(N, N, N, ncu);
     N = 4096;
-    run_benchmark<globals<4, 128, 256, 64, 5, 2, 2>>(N, N, N, check_correctness, ncu);
+    run_benchmark<config<256, 256,  64, 4, false, 4, 8>>(N, N, N, ncu);
     N = 8192;
-    run_benchmark<globals<8, 128, 256, 64, 6, 2, 8>>(N, N, N, check_correctness, ncu);
+    run_benchmark<config<256, 256,  64, 8, false, 4, 8>>(N, N, N, ncu);
     N = 16384;
-    run_benchmark<globals<8, 128, 256, 64, 4, 2, 8>>(N, N, N, check_correctness, ncu);
+    run_benchmark<config<256, 256,  64, 8, false, 4, 8>>(N, N, N, ncu);
 
     return 0;
 }

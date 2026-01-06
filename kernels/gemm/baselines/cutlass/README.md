@@ -47,6 +47,14 @@ Here, we describe how we benchmarked the [CUTLASS](https://github.com/NVIDIA/cut
         -DCUTLASS_ENABLE_TESTS=OFF \
         -DCUTLASS_ENABLE_EXAMPLES=OFF \
         -DCUTLASS_LIBRARY_KERNELS=cutlass3x_sm100_bstensorop_gemm_ue4m3xe2m1_ue4m3xe2m1_f32_void_f32*_tnt_* # as of now, CUTLASS does not provide BF16 output kernel
+    
+    # All at once
+    cmake .. \
+      -DCUTLASS_NVCC_ARCHS=100a \
+      -DCUTLASS_UNITY_BUILD_ENABLED=OFF \
+      -DCUTLASS_ENABLE_TESTS=OFF \
+      -DCUTLASS_ENABLE_EXAMPLES=OFF \
+      -DCUTLASS_LIBRARY_KERNELS="cutlass3x_sm100_tensorop_gemm_bf16_bf16_f32_void_bf16*_tnt_*,cutlass3x_sm100_bstensorop_gemm_ue8m0xe4m3_ue8m0xe4m3_f32_void_bf16*_tnt_*,cutlass3x_sm100_bstensorop_gemm_ue4m3xe2m1_ue4m3xe2m1_f32_void_f32*_tnt_*"
     ```
 
 5. Compile CUTLASS profiler. This will take a while.
@@ -68,7 +76,8 @@ Here, we describe how we benchmarked the [CUTLASS](https://github.com/NVIDIA/cut
         --warmup-iterations=500 \
         --profiling-iterations=100 \
         --verification-enabled=false \
-        --dist=uniform,min:-1,max:1
+        --enable-best-kernel-for-fixed-shape=true \
+        --dist="uniform,min:-1,max:1,scale:-1"
     done
 
     # MXFP8_MXFP8_FP32_void_BF16 GEMM
@@ -83,7 +92,8 @@ Here, we describe how we benchmarked the [CUTLASS](https://github.com/NVIDIA/cut
         --warmup-iterations=500 \
         --profiling-iterations=100 \
         --verification-enabled=false \
-        --dist=uniform,min:-1,max:1
+        --enable-best-kernel-for-fixed-shape=true \
+        --dist="uniform,min:-448,max:448,scale:-1"
     done
 
     # NVFP4_NVFP4_FP32_void_FP32 GEMM
@@ -98,9 +108,17 @@ Here, we describe how we benchmarked the [CUTLASS](https://github.com/NVIDIA/cut
         --warmup-iterations=500 \
         --profiling-iterations=100 \
         --verification-enabled=false \
-        --dist=uniform,min:-1,max:1
+        --enable-best-kernel-for-fixed-shape=true \
+        --dist="uniform,min:-6,max:6,scale:-1"
     done
     ```
+
+Some additional notes on the `cutlass_profiler` options:
+
+* Extremely important to set `scale:-1`. Otherwise inputs are quantized, which is useful for verification but horrible for accurate benchmarking. Input distribution affects power throttling and thus TFLOPs measured: https://www.thonking.ai/p/strangely-matrix-multiplications
+* For the same reason, it's very important to use consistent input distribution throughout benchmarks, ideally using the same exact inputs.
+* Quirks on MX/NV input generation: The `--dist` option you specify directly applies to the post-quantized FP4/FP8 values, not pre-quantized FP32 values, and the scales themselves. Unfortunately, CUTLASS profiler does not provide a way for users to specify different distributions for input operands and the scales (either one has to end up with skewed distribution). Thus, for MX/NV GEMMs, you should really only use CUTLASS profiler to find the best kernel configuration, and benchmark them separately on your own.
+* Also very important to set `--enable-best-kernel-for-fixed-shape=true`; otherwise the profiler does not experiment with different threadblock swizzling configurations.
 
 (Optional) Use the below command to quickly find best configuration / TFLOPs number per shape:
 
@@ -109,7 +127,7 @@ python3 <<EOF
 import glob
 import pandas as pd
 
-for f in glob.glob("*.csv"):
+for f in sorted(glob.glob("*.csv")):
     df = pd.read_csv(f)
     df = df[df["Status"].str.contains("success", na=False)]
     df = df[df["OperationKind"].str.contains("gemm", na=False)]

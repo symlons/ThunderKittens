@@ -1,15 +1,16 @@
 /***************************************************************************************************
- * cuBLASLt BF16 GEMM Benchmark
+ * cuBLASLt FP8 GEMM Benchmark
  *
  * D = A * B (no alpha/beta scaling, no C input)
  * A: RowMajor (M x K), B: ColMajor (N x K), D: RowMajor (M x N)
- * Accumulator: FP32, Output: BF16
+ * Input: FP8 E4M3, Accumulator: FP32, Output: BF16
  **************************************************************************************************/
 
 #include <iostream>
 #include <vector>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
+#include <cuda_fp8.h>
 #include <cuda_bf16.h>
 
 #include "../../common.cuh"
@@ -38,6 +39,7 @@ static constexpr int profiling_iters = 100;
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // cuBLASLt GEMM: D = A * B
 // A: RowMajor (M x K), B: ColMajor (N x K), D: RowMajor (M x N)
+// Input: FP8 E4M3, Accumulator: FP32, Output: BF16
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct CublasLtGemm {
@@ -65,9 +67,9 @@ struct CublasLtGemm {
     CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
 
     // Layout for B (cuBLAS "A"): RowMajor NxK = ColMajor KxN, ld=K
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, K, N, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_8F_E4M3, K, N, K));
     // Layout for A (cuBLAS "B"): RowMajor MxK = ColMajor KxM, ld=K
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, K, M, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_8F_E4M3, K, M, K));
     // Layout for D: RowMajor MxN = ColMajor NxM, ld=N
     CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutD, CUDA_R_16BF, N, M, N));
 
@@ -90,7 +92,7 @@ struct CublasLtGemm {
     }
   }
 
-  void run(__nv_bfloat16 const* A, __nv_bfloat16 const* B, __nv_bfloat16* D, cudaStream_t stream = nullptr) {
+  void run(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, __nv_bfloat16* D, cudaStream_t stream = nullptr) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
     // Note: B is first arg, A is second arg (for the transpose trick)
@@ -128,13 +130,14 @@ void benchmark(int M, int N, int K) {
   // L2 cache eviction - multiple buffer groups
   int l2_cache_size;
   cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, 0);
-  const size_t arg_size = 2 * (size_t(M) * K + size_t(N) * K + size_t(M) * N);
+  // FP8 inputs are 1 byte each, BF16 output is 2 bytes
+  const size_t arg_size = size_t(M) * K + size_t(N) * K + 2 * size_t(M) * N;
   const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
   const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
 
   // Allocate buffer groups
-  std::vector<__nv_bfloat16*> blocks_A(arg_group_count);
-  std::vector<__nv_bfloat16*> blocks_B(arg_group_count);
+  std::vector<__nv_fp8_e4m3*> blocks_A(arg_group_count);
+  std::vector<__nv_fp8_e4m3*> blocks_B(arg_group_count);
   std::vector<__nv_bfloat16*> blocks_D(arg_group_count);
   __nv_bfloat16* block_D_ref;
 
@@ -146,19 +149,19 @@ void benchmark(int M, int N, int K) {
 
   uint64_t seed = 2024;
   for (int i = 0; i < arg_group_count; ++i) {
-    CHECK_CUDA(cudaMalloc(&blocks_A[i], size_A * sizeof(__nv_bfloat16)));
-    CHECK_CUDA(cudaMalloc(&blocks_B[i], size_B * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&blocks_A[i], size_A * sizeof(__nv_fp8_e4m3)));
+    CHECK_CUDA(cudaMalloc(&blocks_B[i], size_B * sizeof(__nv_fp8_e4m3)));
     CHECK_CUDA(cudaMalloc(&blocks_D[i], size_D * sizeof(__nv_bfloat16)));
 
-    fill<__nv_bfloat16, FillMode::RANDOM>(blocks_A[i], size_A, seed + i * 100, -1.0f, 1.0f);
-    fill<__nv_bfloat16, FillMode::RANDOM>(blocks_B[i], size_B, seed + i * 100 + 1, -1.0f, 1.0f);
+    fill<__nv_fp8_e4m3, FillMode::RANDOM>(blocks_A[i], size_A, seed + i * 100, -448.0f, 448.0f);
+    fill<__nv_fp8_e4m3, FillMode::RANDOM>(blocks_B[i], size_B, seed + i * 100 + 1, -448.0f, 448.0f);
     fill<__nv_bfloat16, FillMode::CONSTANT>(blocks_D[i], size_D, 0.0f);
   }
   fill<__nv_bfloat16, FillMode::CONSTANT>(block_D_ref, size_D, 0.0f);
   CHECK_CUDA(cudaDeviceSynchronize());
 
   // Compute reference GEMM
-  reference_gemm<__nv_bfloat16, __nv_bfloat16>(block_D_ref, blocks_A[0], blocks_B[0], M, N, K);
+  reference_gemm<__nv_fp8_e4m3, __nv_bfloat16>(block_D_ref, blocks_A[0], blocks_B[0], M, N, K);
   CHECK_CUDA(cudaDeviceSynchronize());
 
   // Initialize cuBLASLt
@@ -221,9 +224,9 @@ void benchmark(int M, int N, int K) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int main() {
-  std::cout << "cuBLASLt BF16 GEMM Profiler" << std::endl;
+  std::cout << "cuBLASLt FP8 GEMM Profiler" << std::endl;
   std::cout << "D = A * B, A: RowMajor (MxK), B: ColMajor (NxK), D: RowMajor (MxN)" << std::endl;
-  std::cout << "Accumulator: FP32, Output: BF16" << std::endl;
+  std::cout << "Input: FP8 E4M3, Accumulator: FP32, Output: BF16" << std::endl;
   std::cout << "Warmup: " << warmup_iters << ", Profiling: " << profiling_iters << std::endl;
 
   benchmark(1024, 1024, 1024);

@@ -1,8 +1,10 @@
 /***************************************************************************************************
- * cuBLASLt BF16 GEMM Benchmark
+ * cuBLASLt MXFP8 GEMM Benchmark
  *
  * D = A * B (no alpha/beta scaling, no C input)
  * A: RowMajor (M x K), B: ColMajor (N x K), D: RowMajor (M x N)
+ * D[m,n] = sum_k A[m,k] * B[n,k]
+ * Input: FP8 E4M3 with block-wise E8M0 scaling (32-element blocks along K)
  * Accumulator: FP32, Output: BF16
  **************************************************************************************************/
 
@@ -10,6 +12,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include <cublasLt.h>
+#include <cuda_fp8.h>
 #include <cuda_bf16.h>
 
 #include "../../common.cuh"
@@ -34,16 +37,18 @@
 
 static constexpr int warmup_iters = 500;
 static constexpr int profiling_iters = 100;
+static constexpr int mxfp8_block_size = 32;  // MXFP8 uses 32-element blocks
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// cuBLASLt GEMM: D = A * B
+// cuBLASLt MXFP8 GEMM: D = A * B
 // A: RowMajor (M x K), B: ColMajor (N x K), D: RowMajor (M x N)
+// Block-wise scaling with 32-element blocks
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct CublasLtGemm {
+struct CublasLtMxfp8Gemm {
   cublasLtHandle_t handle;
   cublasLtMatmulDesc_t matmulDesc;
-  cublasLtMatrixLayout_t layoutA, layoutB, layoutD;
+  cublasLtMatrixLayout_t layoutA, layoutB, layoutC, layoutD;
   cublasLtMatmulPreference_t preference;
   cublasLtMatmulHeuristicResult_t heuristic;
   void* workspace;
@@ -52,7 +57,7 @@ struct CublasLtGemm {
   void init(int M, int N, int K) {
     CHECK_CUBLAS(cublasLtCreate(&handle));
 
-    // Create matmul descriptor
+    // Create matmul descriptor with FP32 compute
     CHECK_CUBLAS(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
 
     // D[m,n] = sum_k A[m,k] * B[n,k]
@@ -64,15 +69,21 @@ struct CublasLtGemm {
     CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
     CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
 
+    // Set MXFP8 block scaling mode (VEC32_UE8M0 = 32-element blocks with UE8M0 scales)
+    cublasLtMatmulMatrixScale_t scaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+
     // Layout for B (cuBLAS "A"): RowMajor NxK = ColMajor KxN, ld=K
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_16BF, K, N, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutA, CUDA_R_8F_E4M3, K, N, K));
     // Layout for A (cuBLAS "B"): RowMajor MxK = ColMajor KxM, ld=K
-    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_16BF, K, M, K));
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutB, CUDA_R_8F_E4M3, K, M, K));
     // Layout for D: RowMajor MxN = ColMajor NxM, ld=N
+    CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutC, CUDA_R_16BF, N, M, N));
     CHECK_CUBLAS(cublasLtMatrixLayoutCreate(&layoutD, CUDA_R_16BF, N, M, N));
 
     // Workspace
-    workspaceSize = 32 * 1024 * 1024;
+    workspaceSize = 128 * 1024 * 1024;
     CHECK_CUDA(cudaMalloc(&workspace, workspaceSize));
 
     // Preference
@@ -80,25 +91,39 @@ struct CublasLtGemm {
     CHECK_CUBLAS(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                        &workspaceSize, sizeof(workspaceSize)));
 
-    // Get best algorithm
+    // Set dummy scale pointers for heuristic selection (actual values don't affect algorithm choice)
+    void* dummyScalePtr = workspace;  // Just need a valid pointer
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &dummyScalePtr, sizeof(dummyScalePtr)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &dummyScalePtr, sizeof(dummyScalePtr)));
+
+    // Get best algorithm once during init (heuristic doesn't depend on scale pointer values)
     int returnedResults = 0;
-    CHECK_CUBLAS(cublasLtMatmulAlgoGetHeuristic(handle, matmulDesc, layoutA, layoutB, layoutD, layoutD,
-                                                 preference, 1, &heuristic, &returnedResults));
-    if (returnedResults == 0) {
-      std::cerr << "No algorithm found!" << std::endl;
+    cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(handle, matmulDesc, layoutA, layoutB, layoutC, layoutD,
+                                                           preference, 1, &heuristic, &returnedResults);
+    if (status != CUBLAS_STATUS_SUCCESS || returnedResults == 0) {
+      std::cerr << "No algorithm found! Status: " << status << ", results: " << returnedResults << std::endl;
       exit(EXIT_FAILURE);
     }
   }
 
-  void run(__nv_bfloat16 const* A, __nv_bfloat16 const* B, __nv_bfloat16* D, cudaStream_t stream = nullptr) {
+  void run(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B,
+           __nv_fp8_e8m0 const* A_scale, __nv_fp8_e8m0 const* B_scale,
+           __nv_bfloat16* D, cudaStream_t stream = nullptr) {
+
+    // Set scale pointers for this run
+    // cuBLAS "A" = our B (passed first), cuBLAS "B" = our A (passed second)
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &B_scale, sizeof(B_scale)));
+    CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &A_scale, sizeof(A_scale)));
+
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    // Note: B is first arg, A is second arg (for the transpose trick)
+
+    // cuBLAS "A" = our B, cuBLAS "B" = our A
     CHECK_CUBLAS(cublasLtMatmul(handle, matmulDesc, &alpha,
-                                 B, layoutA,   // "A" in cublasLt = our B
-                                 A, layoutB,   // "B" in cublasLt = our A
+                                 B, layoutA,
+                                 A, layoutB,
                                  &beta,
-                                 D, layoutD,
+                                 D, layoutC,
                                  D, layoutD,
                                  &heuristic.algo, workspace, workspaceSize, stream));
   }
@@ -108,6 +133,7 @@ struct CublasLtGemm {
     CHECK_CUBLAS(cublasLtMatmulPreferenceDestroy(preference));
     CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(layoutA));
     CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(layoutB));
+    CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(layoutC));
     CHECK_CUBLAS(cublasLtMatrixLayoutDestroy(layoutD));
     CHECK_CUBLAS(cublasLtMatmulDescDestroy(matmulDesc));
     CHECK_CUBLAS(cublasLtDestroy(handle));
@@ -128,41 +154,59 @@ void benchmark(int M, int N, int K) {
   // L2 cache eviction - multiple buffer groups
   int l2_cache_size;
   cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, 0);
-  const size_t arg_size = 2 * (size_t(M) * K + size_t(N) * K + size_t(M) * N);
+  // FP8 data + scales + BF16 output
+  size_t a_elements = size_t(M) * K;
+  size_t b_elements = size_t(N) * K;
+  const size_t arg_size = a_elements + b_elements +
+                          (a_elements + 31) / 32 + (b_elements + 31) / 32 +
+                          2 * size_t(M) * N;
   const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
   const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
 
   // Allocate buffer groups
-  std::vector<__nv_bfloat16*> blocks_A(arg_group_count);
-  std::vector<__nv_bfloat16*> blocks_B(arg_group_count);
+  std::vector<__nv_fp8_e4m3*> blocks_A(arg_group_count);
+  std::vector<__nv_fp8_e4m3*> blocks_B(arg_group_count);
+  std::vector<__nv_fp8_e8m0*> blocks_A_scale(arg_group_count);
+  std::vector<__nv_fp8_e8m0*> blocks_B_scale(arg_group_count);
   std::vector<__nv_bfloat16*> blocks_D(arg_group_count);
   __nv_bfloat16* block_D_ref;
 
+  int K_blocks = K / mxfp8_block_size;
+
   size_t size_A = size_t(M) * K;
-  size_t size_B = size_t(K) * N;
+  size_t size_B = size_t(N) * K;
+  size_t size_A_scale = size_t(M) * K_blocks;
+  size_t size_B_scale = size_t(N) * K_blocks;
   size_t size_D = size_t(M) * N;
 
   CHECK_CUDA(cudaMalloc(&block_D_ref, size_D * sizeof(__nv_bfloat16)));
 
   uint64_t seed = 2024;
   for (int i = 0; i < arg_group_count; ++i) {
-    CHECK_CUDA(cudaMalloc(&blocks_A[i], size_A * sizeof(__nv_bfloat16)));
-    CHECK_CUDA(cudaMalloc(&blocks_B[i], size_B * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&blocks_A[i], size_A * sizeof(__nv_fp8_e4m3)));
+    CHECK_CUDA(cudaMalloc(&blocks_B[i], size_B * sizeof(__nv_fp8_e4m3)));
+    CHECK_CUDA(cudaMalloc(&blocks_A_scale[i], size_A_scale * sizeof(__nv_fp8_e8m0)));
+    CHECK_CUDA(cudaMalloc(&blocks_B_scale[i], size_B_scale * sizeof(__nv_fp8_e8m0)));
     CHECK_CUDA(cudaMalloc(&blocks_D[i], size_D * sizeof(__nv_bfloat16)));
 
-    fill<__nv_bfloat16, FillMode::RANDOM>(blocks_A[i], size_A, seed + i * 100, -1.0f, 1.0f);
-    fill<__nv_bfloat16, FillMode::RANDOM>(blocks_B[i], size_B, seed + i * 100 + 1, -1.0f, 1.0f);
+    // FP8 E4M3 data: full dynamic range [-448, 448]
+    fill<__nv_fp8_e4m3, FillMode::RANDOM>(blocks_A[i], size_A, seed + i * 100, -448.0f, 448.0f);
+    fill<__nv_fp8_e4m3, FillMode::RANDOM>(blocks_B[i], size_B, seed + i * 100 + 1, -448.0f, 448.0f);
+    // E8M0 scales: values in [0.1, 10.0] (will be quantized to powers of 2)
+    fill<__nv_fp8_e8m0, FillMode::RANDOM>(blocks_A_scale[i], size_A_scale, seed + i * 100 + 2, 0.1f, 10.0f);
+    fill<__nv_fp8_e8m0, FillMode::RANDOM>(blocks_B_scale[i], size_B_scale, seed + i * 100 + 3, 0.1f, 10.0f);
     fill<__nv_bfloat16, FillMode::CONSTANT>(blocks_D[i], size_D, 0.0f);
   }
   fill<__nv_bfloat16, FillMode::CONSTANT>(block_D_ref, size_D, 0.0f);
   CHECK_CUDA(cudaDeviceSynchronize());
 
   // Compute reference GEMM
-  reference_gemm<__nv_bfloat16, __nv_bfloat16>(block_D_ref, blocks_A[0], blocks_B[0], M, N, K);
+  reference_blockscaled_gemm<__nv_fp8_e4m3, __nv_fp8_e8m0, __nv_bfloat16, mxfp8_block_size>(
+      block_D_ref, blocks_A[0], blocks_B[0], blocks_A_scale[0], blocks_B_scale[0], M, N, K);
   CHECK_CUDA(cudaDeviceSynchronize());
 
   // Initialize cuBLASLt
-  CublasLtGemm gemm;
+  CublasLtMxfp8Gemm gemm;
   gemm.init(M, N, K);
 
   cudaStream_t stream;
@@ -171,7 +215,7 @@ void benchmark(int M, int N, int K) {
   // Warmup
   for (int i = 0; i < warmup_iters; ++i) {
     int idx = i % arg_group_count;
-    gemm.run(blocks_A[idx], blocks_B[idx], blocks_D[idx], stream);
+    gemm.run(blocks_A[idx], blocks_B[idx], blocks_A_scale[idx], blocks_B_scale[idx], blocks_D[idx], stream);
   }
   CHECK_CUDA(cudaStreamSynchronize(stream));
 
@@ -182,7 +226,7 @@ void benchmark(int M, int N, int K) {
   CHECK_CUDA(cudaEventRecord(start, stream));
   for (int i = 0; i < profiling_iters; ++i) {
     int idx = i % arg_group_count;
-    gemm.run(blocks_A[idx], blocks_B[idx], blocks_D[idx], stream);
+    gemm.run(blocks_A[idx], blocks_B[idx], blocks_A_scale[idx], blocks_B_scale[idx], blocks_D[idx], stream);
   }
   CHECK_CUDA(cudaEventRecord(stop, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -200,7 +244,7 @@ void benchmark(int M, int N, int K) {
 
   // Verify correctness
   fill<__nv_bfloat16, FillMode::CONSTANT>(blocks_D[0], size_D, 0.0f);
-  gemm.run(blocks_A[0], blocks_B[0], blocks_D[0], stream);
+  gemm.run(blocks_A[0], blocks_B[0], blocks_A_scale[0], blocks_B_scale[0], blocks_D[0], stream);
   CHECK_CUDA(cudaStreamSynchronize(stream));
   check_correctness(blocks_D[0], block_D_ref, size_D);
 
@@ -213,6 +257,8 @@ void benchmark(int M, int N, int K) {
   for (int i = 0; i < arg_group_count; ++i) {
     CHECK_CUDA(cudaFree(blocks_A[i]));
     CHECK_CUDA(cudaFree(blocks_B[i]));
+    CHECK_CUDA(cudaFree(blocks_A_scale[i]));
+    CHECK_CUDA(cudaFree(blocks_B_scale[i]));
     CHECK_CUDA(cudaFree(blocks_D[i]));
   }
   CHECK_CUDA(cudaFree(block_D_ref));
@@ -221,8 +267,10 @@ void benchmark(int M, int N, int K) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int main() {
-  std::cout << "cuBLASLt BF16 GEMM Profiler" << std::endl;
+  std::cout << "cuBLASLt MXFP8 GEMM Profiler" << std::endl;
   std::cout << "D = A * B, A: RowMajor (MxK), B: ColMajor (NxK), D: RowMajor (MxN)" << std::endl;
+  std::cout << "D[m,n] = sum_k A[m,k] * B[n,k]" << std::endl;
+  std::cout << "Input: FP8 E4M3 + E8M0 block scales (32-element blocks along K)" << std::endl;
   std::cout << "Accumulator: FP32, Output: BF16" << std::endl;
   std::cout << "Warmup: " << warmup_iters << ", Profiling: " << profiling_iters << std::endl;
 
