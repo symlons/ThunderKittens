@@ -114,7 +114,7 @@ static inline GL tensor_to_gl(const at::Tensor &t) {
     int td = static_cast<int>(ds.size());
     for (int i = 0; i < td; ++i) shape[4 - td + i] = static_cast<int>(ds[i]);
 
-    printf("tensor_to_gl shape: [%d, %d, %d, %d]\n", shape[0], shape[1], shape[2], shape[3]);
+    // printf("tensor_to_gl shape: [%d, %d, %d, %d]\n", shape[0], shape[1], shape[2], shape[3]);
 
     return ::kittens::make_gl<GL>(data_ptr, shape[0], shape[1], shape[2], shape[3]);
 }
