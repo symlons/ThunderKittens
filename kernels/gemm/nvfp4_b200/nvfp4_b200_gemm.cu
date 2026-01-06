@@ -146,7 +146,7 @@ __device__ inline void kernel(const globals &G) {
                     update_phasebit<1>(phasebits, stage);
 
                     if (stage == last_stage) {
-                        arrive(outputs_arrived);
+                        arrive(outputs_arrived); // todo: trigger in mma warp instead
                         last_stage = globals::PIPELINE_STAGES;
                     }
 

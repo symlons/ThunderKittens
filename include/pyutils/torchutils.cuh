@@ -93,15 +93,33 @@ static inline void parallel_tensor_check(const TKParallelTensor& t) {
 template <kittens::ducks::gl::all GL>
 static inline GL tensor_to_gl(const at::Tensor &t) {
     tensor_check<GL>(t);
-
-    std::array<int, 4> shape = {1, 1, 1, 1};
-    for (int i = 0; i < static_cast<int>(t.dim()); ++i)
-        shape[4 - t.dim() + i] = static_cast<int>(t.size(i));
-
     uint64_t data_ptr = reinterpret_cast<uint64_t>(t.data_ptr());
+
+    std::vector<int64_t> ds;
+    ds.reserve(t.dim());
+    for (int i = 0; i < t.dim(); ++i) ds.push_back(t.size(i));
+    while (!ds.empty() && ds.back() == 1) ds.pop_back();
+    if (ds.empty()) ds.push_back(1);
+    if (ds.size() > 4) {
+        int k = static_cast<int>(ds.size()) - 4;
+        int64_t comb = 1;
+        for (int i = 0; i <= k; ++i) comb *= ds[i];
+        std::vector<int64_t> nd;
+        nd.reserve(4);
+        nd.push_back(comb);
+        for (size_t i = k + 1; i < ds.size(); ++i) nd.push_back(ds[i]);
+        ds.swap(nd);
+    }
+    std::array<int,4> shape = {1,1,1,1};
+    int td = static_cast<int>(ds.size());
+    for (int i = 0; i < td; ++i) shape[4 - td + i] = static_cast<int>(ds[i]);
+
+    printf("tensor_to_gl shape: [%d, %d, %d, %d]\n", shape[0], shape[1], shape[2], shape[3]);
 
     return ::kittens::make_gl<GL>(data_ptr, shape[0], shape[1], shape[2], shape[3]);
 }
+
+
 
 template <kittens::ducks::pgl::all PGL>
 static inline PGL parallel_tensor_to_pgl(TKParallelTensor &t) {
