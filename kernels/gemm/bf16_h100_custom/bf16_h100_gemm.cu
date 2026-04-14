@@ -2,6 +2,15 @@
 #include "prototype.cuh"
 #include "../common.cuh"
 
+#include <math.h>
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+
+__device__ static inline float fast_tanh(float x) {
+    float y;
+    asm volatile ( "tanh.approx.f32 %0, %1; " : "=f"(y) : "f"(x));
+    return y;
+}
+
 using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
@@ -9,7 +18,7 @@ template<int M_BLOCK, int N_BLOCK>
 struct matmul_layout {
     using  base_tile      = st_bf<64, 64>;
     using  global_layout  = gl<bf16, 1, 1, -1, -1, base_tile>;
-    struct globals        { global_layout A, B, C; };
+    struct globals        { global_layout A, B, C, bias; };
     struct input_block    { base_tile a[M_BLOCK], b[N_BLOCK]; };
     struct finish_block   { base_tile c[M_BLOCK][N_BLOCK]; };
     struct common_state   { int2 coord; };
@@ -78,7 +87,24 @@ struct matmul_template {
             if (warp::laneid() == 0) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
-            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
+           
+           //int base_col = args.common.coord.y * 64;
+           //#pragma unroll
+           //for(int i = 0; i < args.state.accum.width; i++){
+           //   #pragma unroll
+           //   for(int j = 0; j < 4; j++){
+           //     int col = base_col + i * 4 + j;
+           //     if (col >= args.globals.C.cols()) continue;
+           //     float bias_val = __bfloat162float(args.globals.bias[{0, col}]);
+
+           //     float f = args.state.accum.tiles[0][i].data[j].x + bias_val;
+           //     float g = args.state.accum.tiles[0][i].data[j].y + bias_val;
+           //     args.state.accum.tiles[0][i].data[j].x = f * 0.5f * (1.0f + tanhf(f * 0.79788456f * (1.f + f * f *0.044715f)));
+           //     args.state.accum.tiles[0][i].data[j].y = g * 0.5f * (1.0f + tanhf(g * 0.79788456f * (1.f + g * g *0.044715f)));
+           //   }
+           //}
+
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum); // rmem -> smem
             warpgroup::sync(warpgroup::groupid()+4);
             if (warpgroup::laneid() == 0) for(int i = 0; i < N_BLOCK; i++) {
                 tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i],
@@ -95,13 +121,15 @@ struct matmul_template {
 #include <cuda_bf16.h>
 
 template<typename mmt>
-void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
+void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, bf16 *d_bias, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
     using global_layout = typename mmt::layout::global_layout;
     using globals  = typename mmt::layout::globals;
     global_layout Ag{d_A, nullptr, nullptr, M, K};
     global_layout Bg{d_B, nullptr, nullptr, K, N};
     global_layout Cg{d_C, nullptr, nullptr, M, N};
-    globals G{Ag, Bg, Cg};
+    global_layout gbias{d_bias, nullptr, nullptr, 1, N};
+
+    globals G{Ag, Bg, Cg, gbias};
     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
 
@@ -124,11 +152,13 @@ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
     std::vector<__nv_bfloat16*> d_A(arg_group_count);
     std::vector<__nv_bfloat16*> d_B(arg_group_count);
     std::vector<__nv_bfloat16*> d_C(arg_group_count);
+    std::vector<__nv_bfloat16*> d_bias(arg_group_count);
     __nv_bfloat16* d_C_ref;
     for (int i = 0; i < arg_group_count; i++) {
         CUDACHECK(cudaMalloc(&d_A[i], M*K*sizeof(__nv_bfloat16)));
         CUDACHECK(cudaMalloc(&d_B[i], K*N*sizeof(__nv_bfloat16)));
         CUDACHECK(cudaMalloc(&d_C[i], M*N*sizeof(__nv_bfloat16)));
+        CUDACHECK(cudaMalloc(&d_bias[i], N*sizeof(__nv_bfloat16)));
     }
     CUDACHECK(cudaMalloc(&d_C_ref, M*N*sizeof(__nv_bfloat16)));
     std::cout << "Allocated device memory" << std::endl;
@@ -139,6 +169,7 @@ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
         fill<__nv_bfloat16, FillMode::RANDOM>(d_A[i], M*K, seed + i*100, -1.0f, 1.0f);
         fill<__nv_bfloat16, FillMode::RANDOM>(d_B[i], K*N, seed + i*100 + 1, -1.0f, 1.0f);
         fill<__nv_bfloat16, FillMode::CONSTANT>(d_C[i], M*N, 0.0f);
+        fill<__nv_bfloat16, FillMode::CONSTANT>(d_bias[i], N, 0.0f);
     }
     fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_ref, M*N, 0.0f);
     CUDACHECK(cudaDeviceSynchronize());
@@ -164,7 +195,7 @@ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
     // Warmup
     for(int i = 0; i < num_warmups; i++) {
         int idx = i % arg_group_count;
-        inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], M, N, K, grid, block);
+        inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], d_bias[idx], M, N, K, grid, block);
     }
 
     // Benchmark
@@ -174,7 +205,7 @@ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
     CUDACHECK(cudaEventRecord(start));
     for(int i = 0; i < num_iters; i++) {
         int idx = i % arg_group_count;
-        inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], M, N, K, grid, block);
+        inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], d_bias[idx], M, N, K, grid, block);
     }
     CUDACHECK(cudaEventRecord(stop));
     CUDACHECK(cudaEventSynchronize(stop));
@@ -196,6 +227,7 @@ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
         cudaFree(d_A[i]);
         cudaFree(d_B[i]);
         cudaFree(d_C[i]);
+        cudaFree(d_bias[i]);
     }
     cudaFree(d_C_ref);
     cudaEventDestroy(start);
@@ -212,23 +244,25 @@ int main() {
     // run_benchmark<matmul_template<12>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
     int N;
     N = 4096;
-    run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    run_benchmark<matmul_template<2,2,4>>(N, N, N);
+    //run_benchmark<matmul_template<2,4,8>>(N, N, N);
+    //run_benchmark<matmul_template<2,2,4>>(N, N, N);
     // N = 3072;
     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
     // run_benchmark<matmul_template<3,3,8>>(N, N, N);
     // N = 4096;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
+    run_benchmark<matmul_template<2,4,8>>(N, N, N);
     // N = 6144;
     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
     // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    N = 8192;
-    run_benchmark<matmul_template<2,4,8>>(N, N, N);
+    //N = 8192;
+    //run_benchmark<matmul_template<2,4,8>>(N, N, N);
     // N = 12288;
     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
     // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    N = 16384;
-    run_benchmark<matmul_template<2,4,8>>(N, N, N);
+    //N = 16384;
+    //run_benchmark<matmul_template<2,4,8>>(N, N, N);
+    //run_benchmark<matmul_template<2,4,8>>(8192, 1024*4, 1024);
+    //run_benchmark<matmul_template<2,4,8>>(1024, 1024, 1024);
     // run_benchmark<matmul_template<2,4,12>>(N, N, N);
     // run_benchmark<matmul_template<3,3,12>>(192*12, 192*11, 8192);
     // run_benchmark<matmul_template<2,4,11>>(128*22, 256* 6, 8192);
@@ -244,4 +278,53 @@ int main() {
     // run_benchmark<matmul_template<3,3,12>>(192*12*2, 192*11*2, 8192*2);
     // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192*2);
     return 0;
+}
+
+
+
+#include <ATen/cuda/CUDAContext.h>
+#include <torch/extension.h>
+#include "pyutils/torchutils.cuh"
+
+void gemm_custom_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias
+) {
+    using mmt = matmul_template<2,4,8>;
+    using globals = typename mmt::layout::globals;
+    using global_layout = typename mmt::layout::global_layout;
+
+    kittens::py::device_check(A, B, C, bias);
+
+    globals G{
+        kittens::py::tensor_to_gl<global_layout>(A),
+        kittens::py::tensor_to_gl<global_layout>(B),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<global_layout>(bias)
+    };
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+
+    dim3 grid = mmt::grid(M, N, K);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cudaFuncSetAttribute(
+        prototype::lcf::kernel<mmt>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem
+    );
+
+    prototype::lcf::kernel<mmt>
+        <<<grid, block, smem, stream>>>(G);
+}
+
+PYBIND11_MODULE(_C, m) {
+    m.def("gemm_custom", &gemm_custom_entrypoint);
 }
