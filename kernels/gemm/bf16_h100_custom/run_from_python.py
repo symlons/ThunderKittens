@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 import _C
 
-M, K, N = 8129, 1056, 4424
+M, K, N = 4096, 4096, 4096
 
 A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
 B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
@@ -16,9 +16,10 @@ def run_custom(A, B, C, bias):
     return C
 
 act = nn.GELU(approximate="tanh")
+# act = nn.Identity()
 
 def run_torch(A, B, bias):
-    out = A @ B# + bias
+    out = A @ B + bias
     out = act(out)
     return out
 

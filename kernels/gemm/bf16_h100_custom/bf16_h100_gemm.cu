@@ -1,15 +1,9 @@
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "../common.cuh"
-
 #include <math.h>
-#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 
-__device__ static inline float fast_tanh(float x) {
-    float y;
-    asm volatile ( "tanh.approx.f32 %0, %1; " : "=f"(y) : "f"(x));
-    return y;
-}
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 
 using namespace kittens;
 using namespace kittens::prototype;
@@ -87,24 +81,23 @@ struct matmul_template {
             if (warp::laneid() == 0) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
-           
-           //int base_col = args.common.coord.y * 64;
-           //#pragma unroll
-           //for(int i = 0; i < args.state.accum.width; i++){
-           //   #pragma unroll
-           //   for(int j = 0; j < 4; j++){
-           //     int col = base_col + i * 4 + j;
-           //     if (col >= args.globals.C.cols()) continue;
-           //     float bias_val = __bfloat162float(args.globals.bias[{0, col}]);
+           int base_col = args.common.coord.y * 64;
+           #pragma unroll
+           for(int i = 0; i < args.state.accum.width; i++){
+              #pragma unroll
+              for(int j = 0; j < 4; j++){
+                 int col = base_col + i * 4 + j;
+                 if (col >= args.globals.C.cols()) continue;
+                 float bias_val = __bfloat162float(args.globals.bias[{0, col}]);
+                 //float bias_val = 0.0f;
+                 float f = args.state.accum.tiles[0][i].data[j].x + bias_val;
+                 float g = args.state.accum.tiles[0][i].data[j].y + bias_val;
+                 args.state.accum.tiles[0][i].data[j].x = f * 0.5f * (1.0f + tanhf(f * 0.79788456f * (1.f + f * f *0.044715f)));
+                 args.state.accum.tiles[0][i].data[j].y = g * 0.5f * (1.0f + tanhf(g * 0.79788456f * (1.f + g * g *0.044715f)));
+            }
+           }
 
-           //     float f = args.state.accum.tiles[0][i].data[j].x + bias_val;
-           //     float g = args.state.accum.tiles[0][i].data[j].y + bias_val;
-           //     args.state.accum.tiles[0][i].data[j].x = f * 0.5f * (1.0f + tanhf(f * 0.79788456f * (1.f + f * f *0.044715f)));
-           //     args.state.accum.tiles[0][i].data[j].y = g * 0.5f * (1.0f + tanhf(g * 0.79788456f * (1.f + g * g *0.044715f)));
-           //   }
-           //}
-
-            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum); // rmem -> smem
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
             warpgroup::sync(warpgroup::groupid()+4);
             if (warpgroup::laneid() == 0) for(int i = 0; i < N_BLOCK; i++) {
                 tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i],
@@ -120,166 +113,156 @@ struct matmul_template {
 #include <iostream>
 #include <cuda_bf16.h>
 
-template<typename mmt>
-void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, bf16 *d_bias, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
-    using global_layout = typename mmt::layout::global_layout;
-    using globals  = typename mmt::layout::globals;
-    global_layout Ag{d_A, nullptr, nullptr, M, K};
-    global_layout Bg{d_B, nullptr, nullptr, K, N};
-    global_layout Cg{d_C, nullptr, nullptr, M, N};
-    global_layout gbias{d_bias, nullptr, nullptr, 1, N};
+// template<typename mmt>
+// void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
+//     using global_layout = typename mmt::layout::global_layout;
+//     using globals  = typename mmt::layout::globals;
+//     global_layout Ag{d_A, nullptr, nullptr, M, K};
+//     global_layout Bg{d_B, nullptr, nullptr, K, N};
+//     global_layout Cg{d_C, nullptr, nullptr, M, N};
+//     globals G{Ag, Bg, Cg};
+//     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
+// }
 
-    globals G{Ag, Bg, Cg, gbias};
-    prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
-}
+// template<typename mmt>
+// double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
+//     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
+//     std::cout << "Block size: " << mmt::M_BLOCK*64 << "x" << mmt::N_BLOCK*64 << "\n";
 
-template<typename mmt>
-double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
-    std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
-    std::cout << "Block size: " << mmt::M_BLOCK*64 << "x" << mmt::N_BLOCK*64 << "\n";
+//     // Cooldown between configurations
+//     sleep_ms(500);
 
-    // Cooldown between configurations
-    sleep_ms(500);
+//     // L2 cache eviction - multiple buffer groups
+//     int l2_cache_size;
+//     cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, 0);
+//     const size_t arg_size = 2 * (size_t(M) * K + size_t(N) * K + size_t(M) * N);
+//     const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
+//     const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
 
-    // L2 cache eviction - multiple buffer groups
-    int l2_cache_size;
-    cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, 0);
-    const size_t arg_size = 2 * (size_t(M) * K + size_t(N) * K + size_t(M) * N);
-    const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
-    const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
+//     // Allocate device memory
+//     std::vector<__nv_bfloat16*> d_A(arg_group_count);
+//     std::vector<__nv_bfloat16*> d_B(arg_group_count);
+//     std::vector<__nv_bfloat16*> d_C(arg_group_count);
+//     __nv_bfloat16* d_C_ref;
+//     for (int i = 0; i < arg_group_count; i++) {
+//         CUDACHECK(cudaMalloc(&d_A[i], M*K*sizeof(__nv_bfloat16)));
+//         CUDACHECK(cudaMalloc(&d_B[i], K*N*sizeof(__nv_bfloat16)));
+//         CUDACHECK(cudaMalloc(&d_C[i], M*N*sizeof(__nv_bfloat16)));
+//     }
+//     CUDACHECK(cudaMalloc(&d_C_ref, M*N*sizeof(__nv_bfloat16)));
+//     std::cout << "Allocated device memory" << std::endl;
 
-    // Allocate device memory
-    std::vector<__nv_bfloat16*> d_A(arg_group_count);
-    std::vector<__nv_bfloat16*> d_B(arg_group_count);
-    std::vector<__nv_bfloat16*> d_C(arg_group_count);
-    std::vector<__nv_bfloat16*> d_bias(arg_group_count);
-    __nv_bfloat16* d_C_ref;
-    for (int i = 0; i < arg_group_count; i++) {
-        CUDACHECK(cudaMalloc(&d_A[i], M*K*sizeof(__nv_bfloat16)));
-        CUDACHECK(cudaMalloc(&d_B[i], K*N*sizeof(__nv_bfloat16)));
-        CUDACHECK(cudaMalloc(&d_C[i], M*N*sizeof(__nv_bfloat16)));
-        CUDACHECK(cudaMalloc(&d_bias[i], N*sizeof(__nv_bfloat16)));
-    }
-    CUDACHECK(cudaMalloc(&d_C_ref, M*N*sizeof(__nv_bfloat16)));
-    std::cout << "Allocated device memory" << std::endl;
+//     // Initialize matrices with random values on device
+//     uint64_t seed = 42;
+//     for (int i = 0; i < arg_group_count; i++) {
+//         fill<__nv_bfloat16, FillMode::RANDOM>(d_A[i], M*K, seed + i*100, -1.0f, 1.0f);
+//         fill<__nv_bfloat16, FillMode::RANDOM>(d_B[i], K*N, seed + i*100 + 1, -1.0f, 1.0f);
+//         fill<__nv_bfloat16, FillMode::CONSTANT>(d_C[i], M*N, 0.0f);
+//     }
+//     fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_ref, M*N, 0.0f);
+//     CUDACHECK(cudaDeviceSynchronize());
+//     std::cout << "Initialized matrices on device" << std::endl;
 
-    // Initialize matrices with random values on device
-    uint64_t seed = 42;
-    for (int i = 0; i < arg_group_count; i++) {
-        fill<__nv_bfloat16, FillMode::RANDOM>(d_A[i], M*K, seed + i*100, -1.0f, 1.0f);
-        fill<__nv_bfloat16, FillMode::RANDOM>(d_B[i], K*N, seed + i*100 + 1, -1.0f, 1.0f);
-        fill<__nv_bfloat16, FillMode::CONSTANT>(d_C[i], M*N, 0.0f);
-        fill<__nv_bfloat16, FillMode::CONSTANT>(d_bias[i], N, 0.0f);
-    }
-    fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_ref, M*N, 0.0f);
-    CUDACHECK(cudaDeviceSynchronize());
-    std::cout << "Initialized matrices on device" << std::endl;
+//     // Compute reference GEMM on device (transpose_b=false for RowMajor K×N B layout)
+//     reference_gemm<__nv_bfloat16, __nv_bfloat16, false>(d_C_ref, d_A[0], d_B[0], M, N, K);
+//     CUDACHECK(cudaDeviceSynchronize());
+//     std::cout << "Computed reference GEMM on device" << std::endl;
 
-    // Compute reference GEMM on device (transpose_b=false for RowMajor K×N B layout)
-    reference_gemm<__nv_bfloat16, __nv_bfloat16, false>(d_C_ref, d_A[0], d_B[0], M, N, K);
-    CUDACHECK(cudaDeviceSynchronize());
-    std::cout << "Computed reference GEMM on device" << std::endl;
+//     // Set kernel attributes
+//     unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
+//     CUDACHECK(cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size));
 
-    // Set kernel attributes
-    unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
-    CUDACHECK(cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size));
+//     // Launch kernel
+//     dim3 grid(mmt::grid(M, N, K));
+//     dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
 
-    // Launch kernel
-    dim3 grid(mmt::grid(M, N, K));
-    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+//     // Number of iterations
+//     int num_warmups = ncu ? 0 : 5;
+//     int num_iters = ncu ? 1 : 10;
 
-    // Number of iterations
-    int num_warmups = ncu ? 0 : 500;
-    int num_iters = ncu ? 1 : 100;
+//     // Warmup
+//     for(int i = 0; i < num_warmups; i++) {
+//         int idx = i % arg_group_count;
+//         inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], M, N, K, grid, block);
+//     }
 
-    // Warmup
-    for(int i = 0; i < num_warmups; i++) {
-        int idx = i % arg_group_count;
-        inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], d_bias[idx], M, N, K, grid, block);
-    }
+//     // Benchmark
+//     cudaEvent_t start, stop;
+//     CUDACHECK(cudaEventCreate(&start));
+//     CUDACHECK(cudaEventCreate(&stop));
+//     CUDACHECK(cudaEventRecord(start));
+//     for(int i = 0; i < num_iters; i++) {
+//         int idx = i % arg_group_count;
+//         inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], M, N, K, grid, block);
+//     }
+//     CUDACHECK(cudaEventRecord(stop));
+//     CUDACHECK(cudaEventSynchronize(stop));
 
-    // Benchmark
-    cudaEvent_t start, stop;
-    CUDACHECK(cudaEventCreate(&start));
-    CUDACHECK(cudaEventCreate(&stop));
-    CUDACHECK(cudaEventRecord(start));
-    for(int i = 0; i < num_iters; i++) {
-        int idx = i % arg_group_count;
-        inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], d_bias[idx], M, N, K, grid, block);
-    }
-    CUDACHECK(cudaEventRecord(stop));
-    CUDACHECK(cudaEventSynchronize(stop));
+//     // Calculate duration and TFLOPs
+//     float milliseconds;
+//     cudaEventElapsedTime(&milliseconds, start, stop);
+//     double microseconds = milliseconds * 1000.0 / num_iters;
+//     double flops = double(2.0) * M * N * K;
+//     double tflops = (flops / microseconds) / 1e6;
+//     std::cout << "Average kernel execution time: " << microseconds << " us\n";
+//     std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
 
-    // Calculate duration and TFLOPs
-    float milliseconds;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    double microseconds = milliseconds * 1000.0 / num_iters;
-    double flops = double(2.0) * M * N * K;
-    double tflops = (flops / microseconds) / 1e6;
-    std::cout << "Average kernel execution time: " << microseconds << " us\n";
-    std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
+//     // Verify results
+//     check_correctness(d_C[0], d_C_ref, M * N);
 
-    // Verify results
-    check_correctness(d_C[0], d_C_ref, M * N);
+//     // Clean up
+//     for (int i = 0; i < arg_group_count; i++) {
+//         cudaFree(d_A[i]);
+//         cudaFree(d_B[i]);
+//         cudaFree(d_C[i]);
+//     }
+//     cudaFree(d_C_ref);
+//     cudaEventDestroy(start);
+//     cudaEventDestroy(stop);
 
-    // Clean up
-    for (int i = 0; i < arg_group_count; i++) {
-        cudaFree(d_A[i]);
-        cudaFree(d_B[i]);
-        cudaFree(d_C[i]);
-        cudaFree(d_bias[i]);
-    }
-    cudaFree(d_C_ref);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+//     return tflops;
+// }
 
-    return tflops;
-}
-
-int main() {
-    // int Cblocks = 22, Rblocks = 24;
-    // int Cblocks192 = 20, Rblocks192 = 16;
-    // run_benchmark<matmul_template<4>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
-    // run_benchmark<matmul_template<8>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
-    // run_benchmark<matmul_template<12>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
-    int N;
-    N = 4096;
-    //run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    //run_benchmark<matmul_template<2,2,4>>(N, N, N);
-    // N = 3072;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    // N = 4096;
-    run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // N = 6144;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    //N = 8192;
-    //run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // N = 12288;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    //N = 16384;
-    //run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    //run_benchmark<matmul_template<2,4,8>>(8192, 1024*4, 1024);
-    //run_benchmark<matmul_template<2,4,8>>(1024, 1024, 1024);
-    // run_benchmark<matmul_template<2,4,12>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,12>>(192*12, 192*11, 8192);
-    // run_benchmark<matmul_template<2,4,11>>(128*22, 256* 6, 8192);
-    // run_benchmark<matmul_template<2,4,1>>(128 * 132, 256, 256);
-    // run_benchmark<matmul_template<2,4,1>>(128 * 133, 256, 256);
-    // run_benchmark<matmul_template<2,4,1>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,8>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,12>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,128>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 8192);
-    // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 16384);
-    // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192);
-    // run_benchmark<matmul_template<3,3,12>>(192*12*2, 192*11*2, 8192*2);
-    // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192*2);
-    return 0;
-}
-
+// int main() {
+//     // int Cblocks = 22, Rblocks = 24;
+//     // int Cblocks192 = 20, Rblocks192 = 16;
+//     // run_benchmark<matmul_template<4>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
+//     // run_benchmark<matmul_template<8>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
+//     // run_benchmark<matmul_template<12>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
+//     int N;
+//     N = 4096;
+//     run_benchmark<matmul_template<2,4,8>>(N, N, N);
+//     // N = 3072;
+//     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
+//     // run_benchmark<matmul_template<3,3,8>>(N, N, N);
+//     // N = 4096;
+//     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
+//     // N = 6144;
+//     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
+//     // run_benchmark<matmul_template<3,3,8>>(N, N, N);
+//     // N = 8192;
+//     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
+//     // N = 12288;
+//     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
+//     // run_benchmark<matmul_template<3,3,8>>(N, N, N);
+//     // N = 16384;
+//     // run_benchmark<matmul_template<2,4,8>>(N, N, N);
+//     // run_benchmark<matmul_template<2,4,12>>(N, N, N);
+//     // run_benchmark<matmul_template<3,3,12>>(192*12, 192*11, 8192);
+//     // run_benchmark<matmul_template<2,4,11>>(128*22, 256* 6, 8192);
+//     // run_benchmark<matmul_template<2,4,1>>(128 * 132, 256, 256);
+//     // run_benchmark<matmul_template<2,4,1>>(128 * 133, 256, 256);
+//     // run_benchmark<matmul_template<2,4,1>>(16384, 16384, 16384);
+//     // run_benchmark<matmul_template<2,4,8>>(16384, 16384, 16384);
+//     // run_benchmark<matmul_template<2,4,12>>(16384, 16384, 16384);
+//     // run_benchmark<matmul_template<2,4,128>>(16384, 16384, 16384);
+//     // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 8192);
+//     // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 16384);
+//     // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192);
+//     // run_benchmark<matmul_template<3,3,12>>(192*12*2, 192*11*2, 8192*2);
+//     // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192*2);
+//     return 0;
+// }
 
 
 #include <ATen/cuda/CUDAContext.h>
