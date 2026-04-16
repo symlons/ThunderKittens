@@ -83,6 +83,8 @@ profile(run_torch_gelu, "torch_eager_gelu")
 profile(compiled_gelu, "torch_compile_gelu")
 
 g = groups[0]
+g["C"].zero_()
+g["preact"].zero_()
 
 _C.gemm_custom(g["A"], g["B"], g["C"], g["bias"], g["preact"])
 torch_out = run_torch_gelu(g["A"], g["B"], g["bias"])
@@ -92,3 +94,9 @@ diff = (g["C"] - torch_out).abs().float()
 print("match:", torch.allclose(g["C"], torch_out, rtol=5e-2, atol=5e-2))
 print("max diff:", diff.max().item())
 print("mean diff:", diff.mean().item())
+
+torch_preact = torch.matmul(g["A"], g["B"]) + g["bias"]
+preact_diff = (g["preact"] - torch_preact).abs().float()
+print("preact match:", (preact_diff > 1.0).sum().item() <= 10)
+print("preact max diff:", preact_diff.max().item())
+print("preact mean diff:", preact_diff.mean().item())

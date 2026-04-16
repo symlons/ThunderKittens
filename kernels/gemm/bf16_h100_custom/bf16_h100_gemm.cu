@@ -123,18 +123,28 @@ struct matmul_template {
             if (warp::laneid() == 0) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
-            // Apply GELU activation
-            apply_gelu(args.state.accum);
-            
+            // Store pre-activation (before GELU) for backward pass
             warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
             warpgroup::sync(warpgroup::groupid() + 4);
             if (warpgroup::laneid() == 0) {
-                for (int i = 0; i < N_BLOCK; i++) {
-                    tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
-                    tma::store_async_read_wait();
-                }
+                for (int i = 0; i < N_BLOCK; i++)
+                    tma::store_async(args.globals.preact, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
             }
+            // Apply GELU in registers while TMA reads preact from smem
+            apply_gelu(args.state.accum);
+            if (warpgroup::laneid() == 0)
+                tma::store_async_read_wait();
+            // Store post-activation
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
+            warpgroup::sync(warpgroup::groupid() + 4);
+            if (warpgroup::laneid() == 0) {
+                for (int i = 0; i < N_BLOCK; i++)
+                    tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
+            }
+            // Overlap: reinit accum while TMA reads C from smem
             init_bias(args.state.accum, args.scratch.bias);
+            if (warpgroup::laneid() == 0)
+                tma::store_async_read_wait();
             if (warp::laneid() == 0) arrive(args.finish_finished);
         }
     };
@@ -198,7 +208,6 @@ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
         fill<__nv_bfloat16, FillMode::RANDOM>(d_B[i], K*N, seed + i*100 + 1, -1.0f, 1.0f);
         fill<__nv_bfloat16, FillMode::CONSTANT>(d_C[i], M*N, 0.0f);
         fill<__nv_bfloat16, FillMode::RANDOM>(d_bias[i], 1*N, seed + i*100 + 1, -1.0f, 1.0f);
-        fill<__nv_bfloat16, FillMode::CONSTANT>(d_preact[i], M*N, 0.0f);
     }
 
     cudaDeviceSynchronize();
