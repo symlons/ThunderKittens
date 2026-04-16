@@ -97,6 +97,52 @@ static inline void reference_gemm(OutputT* D, InputT const* A, InputT const* B, 
     reference_gemm_kernel<InputT, OutputT, transpose_b><<<grid, block>>>(D, A, B, M, N, K);
 }
 
+template <typename InputT, typename OutputT, bool transpose_b>
+__global__ void reference_linear_kernel(
+    OutputT* D,
+    InputT const* A,
+    InputT const* B,
+    InputT const* bias,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float a = kittens::base_types::convertor<float, InputT>::convert(A[row * K + k] );
+            float b;
+            if constexpr (transpose_b) {
+                b = kittens::base_types::convertor<float, InputT>::convert(B[col * K + k] );
+            } else {
+                b = kittens::base_types::convertor<float, InputT>::convert(B[k * N + col] );
+            }
+            acc += a * b;
+        }
+
+        float bias_val = kittens::base_types::convertor<float, InputT>::convert(bias[col] );
+        float x = acc + bias_val;
+        float gelu = 0.5f * x * (1.0f + tanhf(0.79788456f * x * (1.0f + 0.044715f * x * x)));
+        D[row * N + col] = kittens::base_types::convertor<OutputT, float>::convert(gelu);
+    }
+}
+template <typename InputT, typename OutputT, bool transpose_b = true>
+static inline void reference_linear(
+    OutputT* D,
+    InputT const* A,
+    InputT const* B,
+    InputT const* bias,
+    int M, int N, int K
+) {
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (M + 15) / 16);
+
+    reference_linear_kernel<InputT, OutputT, transpose_b>
+        <<<grid, block>>>(D, A, B, bias, M, N, K);
+    cudaDeviceSynchronize();
+}
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Block-Scaled Reference GEMM: D = A * B with block scaling
 // A: RowMajor (M x K), B: ColMajor (N x K), D: RowMajor (M x N)

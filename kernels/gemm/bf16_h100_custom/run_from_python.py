@@ -1,99 +1,94 @@
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
+
+torch._inductor.config.max_autotune = True
+torch._inductor.config.max_autotune_gemm_backends = "CUTLASS,TRITON"
 
 import _C
 
 M, K, N = 4096, 4096, 4096
 
-A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-B = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-C = torch.zeros(M, N, device="cuda", dtype=torch.bfloat16)
-bias = torch.zeros(1, N, device="cuda", dtype=torch.bfloat16)
+l2_cache_size = 50 * 1024 * 1024
 
-def run_custom(A, B, C, bias):
-    _C.gemm_custom(A, B, C, bias)
+def make_group(seed):
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed)
+
+    gen2 = torch.Generator(device="cuda")
+    gen2.manual_seed(seed + 1)
+
+    g = {}
+    g["A"] = (2 * torch.rand(M, K, device="cuda", dtype=torch.float32, generator=gen) - 1).to(torch.bfloat16)
+    g["B"] = (2 * torch.rand(K, N, device="cuda", dtype=torch.float32, generator=gen2) - 1).to(torch.bfloat16)
+    g["C"] = torch.zeros(M, N, device="cuda", dtype=torch.bfloat16)
+    g["bias"] = torch.zeros(1, N, device="cuda", dtype=torch.bfloat16)
+    g["preact"] = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    return g
+
+arg_size = 2 * (M * K + N * K + M * N) * 2
+ideal_arg_size = l2_cache_size * 3
+arg_group_count = (ideal_arg_size // arg_size) + 1
+arg_group_count = max(1, int(arg_group_count))
+
+groups = [make_group(42 + i * 100) for i in range(arg_group_count)]
+
+act = nn.GELU(approximate="tanh").cuda()
+
+def run_custom(A, B, C, bias, preact):
+    _C.gemm_custom(A, B, C, bias, preact)
     return C
 
-act = nn.GELU(approximate="tanh")
-# act = nn.Identity()
+def run_torch_gelu(A, B, bias):
+    return act(torch.matmul(A, B) + bias)
 
-def run_torch(A, B, bias):
-    out = A @ B + bias
-    out = act(out)
-    return out
+compiled_gelu = torch.compile(run_torch_gelu, mode="max-autotune")
 
-def profile(fn, name, iters=500):
-    for _ in range(100):
-        fn(A, B, C, bias) if name == "custom" else fn(A, B, bias)
+def profile(fn, name, iters=100, warmup=500):
+    is_custom = name == "custom"
+
+    for i in range(warmup):
+        g = groups[i % arg_group_count]
+        if is_custom:
+            fn(g["A"], g["B"], g["C"], g["bias"], g["preact"])
+        else:
+            fn(g["A"], g["B"], g["bias"])
+
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
     start.record()
-    for _ in range(iters):
-        if name == "custom":
-            fn(A, B, C, bias)
-        else:
-            fn(A, B, bias)
-    end.record()
 
+    for i in range(iters):
+        g = groups[i % arg_group_count]
+        if is_custom:
+            fn(g["A"], g["B"], g["C"], g["bias"], g["preact"])
+        else:
+            fn(g["A"], g["B"], g["bias"])
+
+    end.record()
     torch.cuda.synchronize()
 
-    ms = start.elapsed_time(end)
-    us_per_iter = (ms / iters) * 1000.0
+    us_per_iter = (start.elapsed_time(end) * 1000.0) / iters
+    tflops = (2 * M * N * K / us_per_iter) / 1e6
 
-    flops = 2 * M * N * K
-    tflops = (flops / us_per_iter) / 1e6
-
-    print(f"{name}:")
-    print(f"  time per iter: {us_per_iter:.2f} us")
-    print(f"  tflops: {tflops:.2f}")
+    print(name)
+    print("time per iter (us):", us_per_iter)
+    print("tflops:", tflops)
     print()
 
 profile(run_custom, "custom")
-profile(run_torch, "torch")
+profile(run_torch_gelu, "torch_eager_gelu")
+profile(compiled_gelu, "torch_compile_gelu")
 
-# correctness check
-_C.gemm_custom(A, B, C, bias)
+g = groups[0]
 
-torch_out = run_torch(A, B, bias)
+_C.gemm_custom(g["A"], g["B"], g["C"], g["bias"], g["preact"])
+torch_out = run_torch_gelu(g["A"], g["B"], g["bias"])
 
-diff = (C - torch_out).abs()
-diff_f = diff.float()
+diff = (g["C"] - torch_out).abs().float()
 
-max_diff = diff_f.max().item()
-min_diff = diff_f.min().item()
-mean_diff = diff_f.mean().item()
-
-rtol = 5e-2
-atol = 5e-2
-
-matches = torch.allclose(C, torch_out, rtol=rtol, atol=atol)
-
-print(f"match: {matches}")
-print(f"max diff: {max_diff}")
-print(f"min diff: {min_diff}")
-print(f"mean diff: {mean_diff}")
-
-bad = diff_f > (atol + rtol * torch_out.abs().float())
-print(f"num mismatches: {bad.sum().item()}")
-
-diff_img = diff_f.cpu()
-
-plt.figure(figsize=(6, 6))
-plt.imshow(diff_img)
-plt.colorbar()
-plt.title("Absolute Difference (bf16)")
-plt.axis('off')
-plt.savefig("diff_map.png", dpi=200, bbox_inches='tight')
-plt.close()
-
-plt.figure(figsize=(6, 6))
-plt.imshow(torch.log1p(diff_img))
-plt.colorbar()
-plt.title("Log Diff")
-plt.axis('off')
-plt.savefig("diff_map_log.png", dpi=200, bbox_inches='tight')
-plt.close()
+print("match:", torch.allclose(g["C"], torch_out, rtol=5e-2, atol=5e-2))
+print("max diff:", diff.max().item())
+print("mean diff:", diff.mean().item())
