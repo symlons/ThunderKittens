@@ -74,6 +74,12 @@ struct matmul_template {
         return dim3(PERISISTENT_GRID ? 132 : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
+        if (threadIdx.x == 0) {
+            args.globals.A.template prefetch_tma<typename layout::base_tile>();
+            args.globals.B.template prefetch_tma<typename layout::base_tile>();
+            args.globals.C.template prefetch_tma<typename layout::base_tile>();
+            args.globals.preact.template prefetch_tma<typename layout::base_tile>();
+        }
         int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
         int super_rows = (Rblocks/SUPER_M)*SUPER_M,
             final_rows = Rblocks - super_rows,
@@ -99,7 +105,7 @@ struct matmul_template {
             warpgroup::decrease_registers<40>();
         }
         __device__ static void load(producer_load_args<layout> args) {
-            if (warpgroup::laneid() == 0) {
+            if (warpgroup::elect_leader()) {
                 tma::expect(args.inputs_arrived, args.input);
                 for(int i = 0; i < M_BLOCK; i++)
                     tma::load_async(args.input.a[i], args.globals.A,
@@ -120,32 +126,32 @@ struct matmul_template {
         __device__ static void compute(consumer_compute_args<layout> args) {
             warpgroup::mma_AB(args.state.accum, args.input.a[warpgroup::groupid()], reinterpret_cast<wide_tile&>(args.input.b) );
             warpgroup::mma_async_wait();
-            if (warp::laneid() == 0) arrive(args.inputs_finished);
+            if (warp::elect_leader()) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
             // Store pre-activation (before GELU) for backward pass
             warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
             warpgroup::sync(warpgroup::groupid() + 4);
-            if (warpgroup::laneid() == 0) {
+            if (warpgroup::elect_leader()) {
                 for (int i = 0; i < N_BLOCK; i++)
                     tma::store_async(args.globals.preact, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
             }
             // Apply GELU in registers while TMA reads preact from smem
             apply_gelu(args.state.accum);
-            if (warpgroup::laneid() == 0)
+            if (warpgroup::elect_leader())
                 tma::store_async_read_wait();
             // Store post-activation
             warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
             warpgroup::sync(warpgroup::groupid() + 4);
-            if (warpgroup::laneid() == 0) {
+            if (warpgroup::elect_leader()) {
                 for (int i = 0; i < N_BLOCK; i++)
                     tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
             }
             // Overlap: reinit accum while TMA reads C from smem
             init_bias(args.state.accum, args.scratch.bias);
-            if (warpgroup::laneid() == 0)
+            if (warpgroup::elect_leader())
                 tma::store_async_read_wait();
-            if (warp::laneid() == 0) arrive(args.finish_finished);
+            if (warp::elect_leader()) arrive(args.finish_finished);
         }
     };
 };
