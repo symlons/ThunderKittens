@@ -1,0 +1,19 @@
+BUILD_MODE ?= cuda
+
+GPU := H100
+SRC := gelu_bwd.cu
+
+ifeq ($(BUILD_MODE),torch)
+	OUT := _gelu_bwd$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+	CMD :=
+	CONFIG := pytorch
+	NVCCFLAGS := -DTORCH_COMPILE -UTORCH_EXTENSION_NAME -DTORCH_EXTENSION_NAME=_gelu_bwd
+else ifeq ($(BUILD_MODE),cuda)
+	OUT := gelu_bwd.out
+	CMD := ./gelu_bwd.out
+	CONFIG := standalone
+else
+	$(error Invalid BUILD_MODE. Use 'torch' or 'cuda')
+endif
+
+include ../../common.mk

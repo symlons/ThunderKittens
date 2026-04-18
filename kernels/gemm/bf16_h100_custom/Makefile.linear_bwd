@@ -1,0 +1,19 @@
+BUILD_MODE ?= cuda
+
+GPU := H100
+SRC := linear_bwd.cu
+
+ifeq ($(BUILD_MODE),torch)
+	OUT := _linear_bwd$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+	CMD :=
+	CONFIG := pytorch
+	NVCCFLAGS := -DTORCH_COMPILE
+else ifeq ($(BUILD_MODE),cuda)
+	OUT := linear_bwd.out
+	CMD := ./linear_bwd.out
+	CONFIG := standalone
+else
+	$(error Invalid BUILD_MODE. Use 'torch' or 'cuda')
+endif
+
+include ../../common.mk

@@ -71,15 +71,14 @@ void cublas_gemm(
 // Benchmark function
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-void benchmark(int M, int N, int K) {
+double benchmark(int M, int N, int K) {
+  std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
+
   // Cooldown between configurations
   sleep_ms(500);
 
   cublasHandle_t handle;
   CHECK_CUBLAS(cublasCreate(&handle));
-
-  std::cout << "\n----------------------------------------" << std::endl;
-  std::cout << "Problem size: M=" << M << ", N=" << N << ", K=" << K << std::endl;
 
   // L2 cache eviction - multiple buffer groups
   int l2_cache_size;
@@ -100,7 +99,7 @@ void benchmark(int M, int N, int K) {
 
   CHECK_CUDA(cudaMalloc(&block_D_ref, size_D * sizeof(__nv_bfloat16)));
 
-  uint64_t seed = 2024;
+  uint64_t seed = 42;
   for (int i = 0; i < arg_group_count; ++i) {
     CHECK_CUDA(cudaMalloc(&blocks_A[i], size_A * sizeof(__nv_bfloat16)));
     CHECK_CUDA(cudaMalloc(&blocks_B[i], size_B * sizeof(__nv_bfloat16)));
@@ -118,51 +117,41 @@ void benchmark(int M, int N, int K) {
   reference_gemm<__nv_bfloat16, __nv_bfloat16>(block_D_ref, blocks_A[0], blocks_B[0], M, N, K);
   CHECK_CUDA(cudaDeviceSynchronize());
 
-  // cuBLAS Benchmark
-  cudaStream_t stream;
-  CHECK_CUDA(cudaStreamCreate(&stream));
-  CHECK_CUBLAS(cublasSetStream(handle, stream));
-
   // Warmup
   for (int i = 0; i < warmup_iters; ++i) {
     int idx = i % arg_group_count;
     cublas_gemm(handle, blocks_A[idx], blocks_B[idx], blocks_D[idx], M, N, K);
   }
-  CHECK_CUDA(cudaStreamSynchronize(stream));
+  CHECK_CUDA(cudaDeviceSynchronize());
 
+  // Benchmark
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));
 
-  CHECK_CUDA(cudaEventRecord(start, stream));
+  CHECK_CUDA(cudaEventRecord(start));
   for (int i = 0; i < profiling_iters; ++i) {
     int idx = i % arg_group_count;
     cublas_gemm(handle, blocks_A[idx], blocks_B[idx], blocks_D[idx], M, N, K);
   }
-  CHECK_CUDA(cudaEventRecord(stop, stream));
-  CHECK_CUDA(cudaStreamSynchronize(stream));
+  CHECK_CUDA(cudaEventRecord(stop));
+  CHECK_CUDA(cudaEventSynchronize(stop));
 
-  float milliseconds = 0;
+  float milliseconds;
   CHECK_CUDA(cudaEventElapsedTime(&milliseconds, start, stop));
 
-  double runtime_ms = static_cast<double>(milliseconds) / profiling_iters;
-  double runtime_s = runtime_ms / 1000.0;
-  int64_t flops = int64_t(2) * M * N * K;
-  double tflops = (double(flops) / 1e12) / runtime_s;
-
-  std::cout << "Average runtime: " << runtime_ms << " ms" << std::endl;
-  std::cout << "Performance: " << tflops << " TFLOP/s" << std::endl;
+  double microseconds = milliseconds * 1000.0 / profiling_iters;
+  double flops = double(2.0) * M * N * K;
+  double tflops = (flops / microseconds) / 1e6;
+  std::cout << "Average kernel execution time: " << microseconds << " us\n";
+  std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
 
   // Verify correctness
-  fill<__nv_bfloat16, FillMode::CONSTANT>(blocks_D[0], size_D, 0.0f);
-  cublas_gemm(handle, blocks_A[0], blocks_B[0], blocks_D[0], M, N, K);
-  CHECK_CUDA(cudaDeviceSynchronize());
   check_correctness(blocks_D[0], block_D_ref, size_D);
 
   // Cleanup
   CHECK_CUDA(cudaEventDestroy(start));
   CHECK_CUDA(cudaEventDestroy(stop));
-  CHECK_CUDA(cudaStreamDestroy(stream));
 
   for (int i = 0; i < arg_group_count; ++i) {
     CHECK_CUDA(cudaFree(blocks_A[i]));
@@ -172,6 +161,8 @@ void benchmark(int M, int N, int K) {
   CHECK_CUDA(cudaFree(block_D_ref));
 
   CHECK_CUBLAS(cublasDestroy(handle));
+
+  return tflops;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
