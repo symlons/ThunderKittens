@@ -162,15 +162,50 @@ void kernel(const __grid_constant__ typename lcft::layout::globals globals) {
             if(num_iters < 0) break; // no work to do
             int input_ring = 0; // tracking which input block is being loaded
             lcft::consumer::setup({c_state, unif});
+            constexpr int WGMMA_DEPTH = detail::CONSUMER_WGMMA_DEPTH_v<lcft>;
+            if constexpr (WGMMA_DEPTH > 0) {
+                // WGMMA pipelined consumer loop: the kernel's compute() issues mma_AB
+                // but does NOT call mma_async_wait or arrive(inputs_finished).
+                // The framework handles wait_group and barrier release.
+                //
+                // The kernel's compute() handles its own fence.
+                int release_ring = 0;
+                // Prologue: issue first WGMMA_DEPTH iterations without releasing
+                for(int it = 0; it < WGMMA_DEPTH && it < num_iters; it++) {
+                    wait(inputs_arrived[input_ring], get_phasebit<0>(semaphore_bitfield, input_ring));
+                    update_phasebit<0>(semaphore_bitfield, input_ring);
+                    lcft::consumer::compute({c_state, *input_smem[input_ring], inputs_finished[input_ring], it, unif});
+                    input_ring=ring_advance<INPUT_PIPE_STAGES>(input_ring);
+                }
+                // Steady state: issue new MMA, then wait+release oldest
+                for(int it = WGMMA_DEPTH; it < num_iters; it++) {
+                    wait(inputs_arrived[input_ring], get_phasebit<0>(semaphore_bitfield, input_ring));
+                    update_phasebit<0>(semaphore_bitfield, input_ring);
+                    lcft::consumer::compute({c_state, *input_smem[input_ring], inputs_finished[input_ring], it, unif});
+                    warpgroup::mma_async_wait<WGMMA_DEPTH>();
+                    if (warp::laneid() == 0) arrive(inputs_finished[release_ring]);
+                    release_ring=ring_advance<INPUT_PIPE_STAGES>(release_ring);
+                    input_ring=ring_advance<INPUT_PIPE_STAGES>(input_ring);
+                }
+                // Drain: wait for all remaining and release
+                warpgroup::mma_async_wait();
+                for(int it = 0; it < WGMMA_DEPTH && it < num_iters; it++) {
+                    if (warp::laneid() == 0) arrive(inputs_finished[release_ring]);
+                    release_ring=ring_advance<INPUT_PIPE_STAGES>(release_ring);
+                }
+            }
+            else {
+                // Original consumer loop
 #ifdef CONSUMER_UNROLL
-            #pragma unroll CONSUMER_UNROLL_VALUE
+                #pragma unroll CONSUMER_UNROLL_VALUE
 #endif
-            for(int it = 0; it < num_iters; it++) {
-                wait(inputs_arrived[input_ring], get_phasebit<0>(semaphore_bitfield, input_ring)); // wait for memory to arrive, phase changes at half the rate of the ring
-                update_phasebit<0>(semaphore_bitfield, input_ring);
-                lcft::consumer::compute({c_state, *input_smem[input_ring], inputs_finished[input_ring], it, unif});
-                input_ring=ring_advance<INPUT_PIPE_STAGES>(input_ring);
-            } // work loop
+                for(int it = 0; it < num_iters; it++) {
+                    wait(inputs_arrived[input_ring], get_phasebit<0>(semaphore_bitfield, input_ring));
+                    update_phasebit<0>(semaphore_bitfield, input_ring);
+                    lcft::consumer::compute({c_state, *input_smem[input_ring], inputs_finished[input_ring], it, unif});
+                    input_ring=ring_advance<INPUT_PIPE_STAGES>(input_ring);
+                }
+            } // WGMMA_DEPTH
             consumers::sync(14); // cannot overwrite finish block until all consumer warps are done.
             lcft::consumer::finish({c_state, *finish_smem, finish_finished, unif});
             consumers::sync(14); // cannot overwrite finish block until all consumer warps are done.

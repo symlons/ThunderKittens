@@ -56,6 +56,14 @@ FLAG_GETTER(CONSUMER_BARRIER_ARRIVALS, NUM_CONSUMER_WARPS_v<T>)
 FLAG_GETTER(PRODUCER_BARRIER_ARRIVALS, NUM_PRODUCER_WARPS_v<T>)
 // How many threadblocks to launch, per cluster.
 FLAG_GETTER(CLUSTER_BLOCKS, 1)
+// WGMMA pipeline depth for consumer (0=disabled, 1=1-deep pipelining).
+// When >0, the consumer loop uses a prologue/steady-state/drain pattern:
+// - Prologue: issue first WGMMA group without releasing any input stage.
+// - Steady state: issue new WGMMA, wait_group<depth>, release oldest input stage.
+// - Drain: wait_group<0>, release remaining stages.
+// The kernel's compute() should call mma_AB but NOT mma_async_wait or arrive(inputs_finished).
+// The framework handles waiting and releasing.
+FLAG_GETTER(CONSUMER_WGMMA_DEPTH, 0)
 // Some handy constants
 template<typename T> constexpr int NUM_WARPS_v = NUM_CONSUMER_WARPS_v<T> + NUM_PRODUCER_WARPS_v<T>;
 template<typename T> constexpr int NUM_THREADS_v = NUM_WARPS_v<T> * 32;

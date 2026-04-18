@@ -19,8 +19,10 @@ template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
 struct matmul_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
     using layout    = matmul_layout<M_BLOCK, N_BLOCK>;
+    using base_tile = typename layout::base_tile;
     using wide_tile = st_bf<64, 64*N_BLOCK>;
-    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1,
+                         CONSUMER_WGMMA_DEPTH=1;
     // Helper functions
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
         return dim3(PERISISTENT_GRID ? 132 : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
@@ -50,6 +52,11 @@ struct matmul_template {
     struct producer {
         __device__ static void setup(producer_setup_args<layout> args) {
             warpgroup::decrease_registers<40>(); // decrease registers for producers
+            if (warpgroup::laneid() == 0) {
+                args.globals.A.template prefetch_tma<base_tile>();
+                args.globals.B.template prefetch_tma<base_tile>();
+                args.globals.C.template prefetch_tma<base_tile>();
+            }
         }
         __device__ static void load(producer_load_args<layout> args) {
             if (warpgroup::laneid() == 0) {
@@ -69,13 +76,146 @@ struct matmul_template {
             kittens::warp::zero(args.state.accum);
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
-            warpgroup::mma_AB(
-                args.state.accum, // dest registers
-                args.input.a[warpgroup::groupid()], // A matrix
-                reinterpret_cast<wide_tile&>(args.input.b) // B matrix
+            // Build base descriptors for A and B tiles
+            auto &dst = args.state.accum;
+            kittens::st_descriptor<base_tile, 0> a_desc(args.input.a[warpgroup::groupid()]);
+            kittens::st_descriptor<wide_tile, 1> b_desc(reinterpret_cast<wide_tile&>(args.input.b));
+            uint64_t a_base = a_desc.base_desc;
+            uint64_t b_base = b_desc.base_desc;
+
+            // Fused inline asm: fence + 4x wgmma.mma_async + commit
+            // A chunk offsets (K-major, 128B swizzle): +0, +2, +4, +6
+            // B chunk offsets (MN-major, 128B swizzle): +0, +128, +256, +384
+            // Only 2 "l" inputs -> only 2 R2UR instructions
+            asm volatile(
+                "{\n"
+                // Descriptor temporaries
+                ".reg .b64 a1, a2, a3, b1, b2, b3;\n"
+                // Fence
+                "wgmma.fence.sync.aligned;\n"
+                // k=0: use base descriptors directly
+                ".reg .pred p;\n"
+                "setp.ne.b32 p, %130, 0;\n"
+                "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+                "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+                "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+                "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+                "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, "
+                "%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79, "
+                "%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95, "
+                "%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111, "
+                "%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, "
+                "%128, %129, p, 1, 1, 0, 1;\n"
+                // k=1: A += 2, B += 128
+                "add.u64 a1, %128, 2;\n"
+                "add.u64 b1, %129, 128;\n"
+                "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+                "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+                "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+                "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+                "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, "
+                "%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79, "
+                "%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95, "
+                "%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111, "
+                "%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, "
+                "a1, b1, 1, 1, 1, 0, 1;\n"
+                // k=2: A += 4, B += 256
+                "add.u64 a2, %128, 4;\n"
+                "add.u64 b2, %129, 256;\n"
+                "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+                "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+                "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+                "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+                "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, "
+                "%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79, "
+                "%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95, "
+                "%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111, "
+                "%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, "
+                "a2, b2, 1, 1, 1, 0, 1;\n"
+                // k=3: A += 6, B += 384
+                "add.u64 a3, %128, 6;\n"
+                "add.u64 b3, %129, 384;\n"
+                "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+                "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, "
+                "%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, "
+                "%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, "
+                "%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, "
+                "%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79, "
+                "%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95, "
+                "%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111, "
+                "%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, "
+                "a3, b3, 1, 1, 1, 0, 1;\n"
+                // Commit
+                "wgmma.commit_group.sync.aligned;\n"
+                "}\n"
+                // 128 accumulator registers
+                : "+f"(dst.tiles[0][ 0].data[0].x), "+f"(dst.tiles[0][ 0].data[0].y),
+                  "+f"(dst.tiles[0][ 0].data[1].x), "+f"(dst.tiles[0][ 0].data[1].y),
+                  "+f"(dst.tiles[0][ 0].data[2].x), "+f"(dst.tiles[0][ 0].data[2].y),
+                  "+f"(dst.tiles[0][ 0].data[3].x), "+f"(dst.tiles[0][ 0].data[3].y),
+                  "+f"(dst.tiles[0][ 1].data[0].x), "+f"(dst.tiles[0][ 1].data[0].y),
+                  "+f"(dst.tiles[0][ 1].data[1].x), "+f"(dst.tiles[0][ 1].data[1].y),
+                  "+f"(dst.tiles[0][ 1].data[2].x), "+f"(dst.tiles[0][ 1].data[2].y),
+                  "+f"(dst.tiles[0][ 1].data[3].x), "+f"(dst.tiles[0][ 1].data[3].y),
+                  "+f"(dst.tiles[0][ 2].data[0].x), "+f"(dst.tiles[0][ 2].data[0].y),
+                  "+f"(dst.tiles[0][ 2].data[1].x), "+f"(dst.tiles[0][ 2].data[1].y),
+                  "+f"(dst.tiles[0][ 2].data[2].x), "+f"(dst.tiles[0][ 2].data[2].y),
+                  "+f"(dst.tiles[0][ 2].data[3].x), "+f"(dst.tiles[0][ 2].data[3].y),
+                  "+f"(dst.tiles[0][ 3].data[0].x), "+f"(dst.tiles[0][ 3].data[0].y),
+                  "+f"(dst.tiles[0][ 3].data[1].x), "+f"(dst.tiles[0][ 3].data[1].y),
+                  "+f"(dst.tiles[0][ 3].data[2].x), "+f"(dst.tiles[0][ 3].data[2].y),
+                  "+f"(dst.tiles[0][ 3].data[3].x), "+f"(dst.tiles[0][ 3].data[3].y),
+                  "+f"(dst.tiles[0][ 4].data[0].x), "+f"(dst.tiles[0][ 4].data[0].y),
+                  "+f"(dst.tiles[0][ 4].data[1].x), "+f"(dst.tiles[0][ 4].data[1].y),
+                  "+f"(dst.tiles[0][ 4].data[2].x), "+f"(dst.tiles[0][ 4].data[2].y),
+                  "+f"(dst.tiles[0][ 4].data[3].x), "+f"(dst.tiles[0][ 4].data[3].y),
+                  "+f"(dst.tiles[0][ 5].data[0].x), "+f"(dst.tiles[0][ 5].data[0].y),
+                  "+f"(dst.tiles[0][ 5].data[1].x), "+f"(dst.tiles[0][ 5].data[1].y),
+                  "+f"(dst.tiles[0][ 5].data[2].x), "+f"(dst.tiles[0][ 5].data[2].y),
+                  "+f"(dst.tiles[0][ 5].data[3].x), "+f"(dst.tiles[0][ 5].data[3].y),
+                  "+f"(dst.tiles[0][ 6].data[0].x), "+f"(dst.tiles[0][ 6].data[0].y),
+                  "+f"(dst.tiles[0][ 6].data[1].x), "+f"(dst.tiles[0][ 6].data[1].y),
+                  "+f"(dst.tiles[0][ 6].data[2].x), "+f"(dst.tiles[0][ 6].data[2].y),
+                  "+f"(dst.tiles[0][ 6].data[3].x), "+f"(dst.tiles[0][ 6].data[3].y),
+                  "+f"(dst.tiles[0][ 7].data[0].x), "+f"(dst.tiles[0][ 7].data[0].y),
+                  "+f"(dst.tiles[0][ 7].data[1].x), "+f"(dst.tiles[0][ 7].data[1].y),
+                  "+f"(dst.tiles[0][ 7].data[2].x), "+f"(dst.tiles[0][ 7].data[2].y),
+                  "+f"(dst.tiles[0][ 7].data[3].x), "+f"(dst.tiles[0][ 7].data[3].y),
+                  "+f"(dst.tiles[0][ 8].data[0].x), "+f"(dst.tiles[0][ 8].data[0].y),
+                  "+f"(dst.tiles[0][ 8].data[1].x), "+f"(dst.tiles[0][ 8].data[1].y),
+                  "+f"(dst.tiles[0][ 8].data[2].x), "+f"(dst.tiles[0][ 8].data[2].y),
+                  "+f"(dst.tiles[0][ 8].data[3].x), "+f"(dst.tiles[0][ 8].data[3].y),
+                  "+f"(dst.tiles[0][ 9].data[0].x), "+f"(dst.tiles[0][ 9].data[0].y),
+                  "+f"(dst.tiles[0][ 9].data[1].x), "+f"(dst.tiles[0][ 9].data[1].y),
+                  "+f"(dst.tiles[0][ 9].data[2].x), "+f"(dst.tiles[0][ 9].data[2].y),
+                  "+f"(dst.tiles[0][ 9].data[3].x), "+f"(dst.tiles[0][ 9].data[3].y),
+                  "+f"(dst.tiles[0][10].data[0].x), "+f"(dst.tiles[0][10].data[0].y),
+                  "+f"(dst.tiles[0][10].data[1].x), "+f"(dst.tiles[0][10].data[1].y),
+                  "+f"(dst.tiles[0][10].data[2].x), "+f"(dst.tiles[0][10].data[2].y),
+                  "+f"(dst.tiles[0][10].data[3].x), "+f"(dst.tiles[0][10].data[3].y),
+                  "+f"(dst.tiles[0][11].data[0].x), "+f"(dst.tiles[0][11].data[0].y),
+                  "+f"(dst.tiles[0][11].data[1].x), "+f"(dst.tiles[0][11].data[1].y),
+                  "+f"(dst.tiles[0][11].data[2].x), "+f"(dst.tiles[0][11].data[2].y),
+                  "+f"(dst.tiles[0][11].data[3].x), "+f"(dst.tiles[0][11].data[3].y),
+                  "+f"(dst.tiles[0][12].data[0].x), "+f"(dst.tiles[0][12].data[0].y),
+                  "+f"(dst.tiles[0][12].data[1].x), "+f"(dst.tiles[0][12].data[1].y),
+                  "+f"(dst.tiles[0][12].data[2].x), "+f"(dst.tiles[0][12].data[2].y),
+                  "+f"(dst.tiles[0][12].data[3].x), "+f"(dst.tiles[0][12].data[3].y),
+                  "+f"(dst.tiles[0][13].data[0].x), "+f"(dst.tiles[0][13].data[0].y),
+                  "+f"(dst.tiles[0][13].data[1].x), "+f"(dst.tiles[0][13].data[1].y),
+                  "+f"(dst.tiles[0][13].data[2].x), "+f"(dst.tiles[0][13].data[2].y),
+                  "+f"(dst.tiles[0][13].data[3].x), "+f"(dst.tiles[0][13].data[3].y),
+                  "+f"(dst.tiles[0][14].data[0].x), "+f"(dst.tiles[0][14].data[0].y),
+                  "+f"(dst.tiles[0][14].data[1].x), "+f"(dst.tiles[0][14].data[1].y),
+                  "+f"(dst.tiles[0][14].data[2].x), "+f"(dst.tiles[0][14].data[2].y),
+                  "+f"(dst.tiles[0][14].data[3].x), "+f"(dst.tiles[0][14].data[3].y),
+                  "+f"(dst.tiles[0][15].data[0].x), "+f"(dst.tiles[0][15].data[0].y),
+                  "+f"(dst.tiles[0][15].data[1].x), "+f"(dst.tiles[0][15].data[1].y),
+                  "+f"(dst.tiles[0][15].data[2].x), "+f"(dst.tiles[0][15].data[2].y),
+                  "+f"(dst.tiles[0][15].data[3].x), "+f"(dst.tiles[0][15].data[3].y)
+                : "l"(a_base), "l"(b_base), "r"(1) // %128=a_base, %129=b_base, %130=scale_d (always accumulate)
+                : "memory"
             );
-            warpgroup::mma_async_wait();
-            if (warp::laneid() == 0) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
             warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
@@ -83,8 +223,8 @@ struct matmul_template {
             if (warpgroup::laneid() == 0) for(int i = 0; i < N_BLOCK; i++) {
                 tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i],
                                              {args.common.coord.x, args.common.coord.y+i});
-                tma::store_async_read_wait(); // wait that store is finished before reusing finish memory
             }
+            tma::store_async_read_wait();
             kittens::warp::zero(args.state.accum);
             if (warp::laneid() == 0) arrive(args.finish_finished);
         }
@@ -212,36 +352,8 @@ int main() {
     // run_benchmark<matmul_template<12>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
     int N;
     N = 4096;
-    run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    run_benchmark<matmul_template<2,2,4>>(N, N, N);
-    // N = 3072;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    // N = 4096;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // N = 6144;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
+    run_benchmark<matmul_template<2,4,4>>(N, N, N);
     N = 8192;
-    run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // N = 12288;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    N = 16384;
-    run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<2,4,12>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,12>>(192*12, 192*11, 8192);
-    // run_benchmark<matmul_template<2,4,11>>(128*22, 256* 6, 8192);
-    // run_benchmark<matmul_template<2,4,1>>(128 * 132, 256, 256);
-    // run_benchmark<matmul_template<2,4,1>>(128 * 133, 256, 256);
-    // run_benchmark<matmul_template<2,4,1>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,8>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,12>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,128>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 8192);
-    // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 16384);
-    // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192);
-    // run_benchmark<matmul_template<3,3,12>>(192*12*2, 192*11*2, 8192*2);
-    // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192*2);
+    run_benchmark<matmul_template<2,4,12>>(N, N, N);
     return 0;
 }

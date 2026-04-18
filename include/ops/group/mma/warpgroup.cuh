@@ -38,7 +38,6 @@ __device__ static inline void mma_fence(D &dst) {
         }
     }
     asm volatile ("wgmma.fence.sync.aligned;\n" ::: "memory");
-    asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 template<ducks::crt::row_layout D>
 __device__ static inline void mma_fence(D &dst) {
@@ -62,13 +61,11 @@ __device__ static inline void mma_fence(D &dst) {
         }
     }
     asm volatile ("wgmma.fence.sync.aligned;\n" ::: "memory");
-    asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 template<typename T=kittens::ducks::default_type> // prevents static assert being instantiated unless called.
 __device__ static inline void mma_fence() {
     KITTENS_CHECK_WARPGROUP
     asm volatile ("wgmma.fence.sync.aligned;\n" ::: "memory");
-    asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 
 /**
