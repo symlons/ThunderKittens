@@ -1,6 +1,6 @@
 """
 End-to-end training step benchmark: forward + backward for Linear+GELU.
-Also prints which CUDA kernels PyTorch uses (eager vs torch.compile).
+Compares: unfused custom, fused custom (bias into dx GEMM), PyTorch eager/compiled.
 """
 
 import torch
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.profiler as prof
 import _C
 import _linear_bwd
+import _linear_bwd_fused
 
 torch.manual_seed(42)
 
@@ -27,13 +28,19 @@ W  = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
 b  = torch.randn(1, N, device="cuda", dtype=torch.bfloat16)
 dy = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
 
-# Custom buffers
+# Buffers for unfused
 y_custom     = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 preact       = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 dz           = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
 dbias        = torch.empty(N, device="cuda", dtype=torch.float32)
 dW           = torch.empty(K, N, device="cuda", dtype=torch.bfloat16)
 dx           = torch.empty(M, K, device="cuda", dtype=torch.bfloat16)
+
+# Buffers for fused
+dz_f         = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+dbias_f      = torch.empty(N, device="cuda", dtype=torch.float32)
+dW_f         = torch.empty(K, N, device="cuda", dtype=torch.bfloat16)
+dx_f         = torch.empty(M, K, device="cuda", dtype=torch.bfloat16)
 
 def profile_batch(fn, warmup=WARMUP, iters=ITERS):
     for _ in range(warmup):
@@ -49,7 +56,7 @@ def profile_batch(fn, warmup=WARMUP, iters=ITERS):
     return s.elapsed_time(e) * 1000.0 / iters
 
 # ============================================================
-# Custom kernels
+# Custom kernels — unfused (3 bwd kernels)
 # ============================================================
 def custom_fwd_bwd():
     _C.gemm_custom(x, W, y_custom, b, preact)
@@ -64,6 +71,20 @@ def custom_bwd():
     _linear_bwd.gelu_bwd_bias(dy, preact, dz, dbias)
     _linear_bwd.dw_gemm(x, dz, dW)
     _linear_bwd.dx_gemm(dz, W, dx)
+
+# ============================================================
+# Custom kernels — fused (gelu+bias combined, same GEMM kernels)
+# ============================================================
+def fused_bwd():
+    _linear_bwd_fused.gelu_bwd_bias(dy, preact, dz_f, dbias_f)
+    _linear_bwd_fused.dw_gemm(x, dz_f, dW_f)
+    _linear_bwd_fused.dx_gemm(dz_f, W, dx_f)
+
+def fused_fwd_bwd():
+    _C.gemm_custom(x, W, y_custom, b, preact)
+    _linear_bwd_fused.gelu_bwd_bias(dy, preact, dz_f, dbias_f)
+    _linear_bwd_fused.dw_gemm(x, dz_f, dW_f)
+    _linear_bwd_fused.dx_gemm(dz_f, W, dx_f)
 
 # ============================================================
 # PyTorch model
@@ -105,11 +126,40 @@ def torch_bwd_only():
     loss.backward()
 
 # ============================================================
+# Correctness check: fused vs unfused
+# ============================================================
+_C.gemm_custom(x, W, y_custom, b, preact)
+_linear_bwd.gelu_bwd_bias(dy, preact, dz, dbias)
+_linear_bwd.dw_gemm(x, dz, dW)
+_linear_bwd.dx_gemm(dz, W, dx)
+
+_linear_bwd_fused.gelu_bwd_bias(dy, preact, dz_f, dbias_f)
+_linear_bwd_fused.dw_gemm(x, dz_f, dW_f)
+_linear_bwd_fused.dx_gemm(dz_f, W, dx_f)
+torch.cuda.synchronize()
+
+def check(name, a, b, atol=8.0):
+    d = (a.float() - b.float()).abs()
+    ok = d.max().item() < atol
+    print(f"  {name}: max_diff={d.max().item():.4f} {'PASS' if ok else 'FAIL'}")
+    return ok
+
+print("\nFused vs Unfused correctness:")
+ok_dz = check("dz",    dz_f, dz)
+ok_dw = check("dW",    dW_f, dW)
+ok_dx = check("dx",    dx_f, dx)
+ok_db = check("dbias", dbias_f, dbias, 2.0)
+print(f"  {'ALL PASS' if ok_dz and ok_dw and ok_dx and ok_db else 'SOME FAILED'}")
+
+# ============================================================
 # Benchmark
 # ============================================================
 t_custom_fwdbwd = profile_batch(custom_fwd_bwd)
 t_custom_fwd    = profile_batch(custom_fwd)
 t_custom_bwd    = profile_batch(custom_bwd)
+
+t_fused_bwd     = profile_batch(fused_bwd)
+t_fused_fwdbwd  = profile_batch(fused_fwd_bwd)
 
 t_torch_fwdbwd  = profile_batch(torch_fwd_bwd)
 t_torch_fwd     = profile_batch(torch_fwd_only)
@@ -129,10 +179,14 @@ print(f"\n{'='*70}")
 print(f"Performance")
 print(f"{'='*70}")
 
-print(f"\nCustom:")
+print(f"\nCustom (unfused — gelu+bias, dW, dx):")
 print(f"  Forward:   {t_custom_fwd:7.1f} us  ({tflops(t_custom_fwd):.0f} TFLOPS)")
 print(f"  Backward:  {t_custom_bwd:7.1f} us")
 print(f"  Fwd+Bwd:   {t_custom_fwdbwd:7.1f} us")
+
+print(f"\nCustom (fused gelu+bias, same GEMMs):")
+print(f"  Backward:  {t_fused_bwd:7.1f} us")
+print(f"  Fwd+Bwd:   {t_fused_fwdbwd:7.1f} us")
 
 print(f"\nPyTorch eager:")
 print(f"  Forward:   {t_torch_fwd:7.1f} us  ({tflops(t_torch_fwd):.0f} TFLOPS)")
@@ -145,15 +199,19 @@ print(f"  Fwd+Bwd:   {t_torch_fwdbwd_comp:7.1f} us")
 # ============================================================
 # Speedups
 # ============================================================
-speedup_eager = (t_torch_fwdbwd - t_custom_fwdbwd) / t_torch_fwdbwd * 100.0
-speedup_comp  = (t_torch_fwdbwd_comp - t_custom_fwdbwd) / t_torch_fwdbwd_comp * 100.0
+fused_vs_unfused = (t_custom_bwd - t_fused_bwd) / t_custom_bwd * 100.0
+speedup_eager_unfused = (t_torch_fwdbwd - t_custom_fwdbwd) / t_torch_fwdbwd * 100.0
+speedup_eager = (t_torch_fwdbwd - t_fused_fwdbwd) / t_torch_fwdbwd * 100.0
+speedup_comp  = (t_torch_fwdbwd_comp - t_fused_fwdbwd) / t_torch_fwdbwd_comp * 100.0
 
 print(f"\n{'='*70}")
 print(f"Speedup")
 print(f"{'='*70}")
 
-print(f"vs PyTorch eager:     {speedup_eager:+.2f}%")
-print(f"vs torch.compile:     {speedup_comp:+.2f}%")
+print(f"Fused vs unfused bwd:     {fused_vs_unfused:+.2f}%  ({t_fused_bwd:.1f} vs {t_custom_bwd:.1f} us)")
+print(f"Unfused vs PyTorch eager:  {speedup_eager_unfused:+.2f}%")
+print(f"Fused vs PyTorch eager:    {speedup_eager:+.2f}%")
+print(f"Fused vs torch.compile:    {speedup_comp:+.2f}%")
 
 # ============================================================
 # Kernel inspection
