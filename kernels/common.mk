@@ -37,7 +37,7 @@ COMMON_DIR := $(dir $(THIS_MAKEFILE))
 THUNDERKITTENS_ROOT := $(abspath $(COMMON_DIR)/..)
 
 # Common flags
-NVCCFLAGS += -std=c++20 -O3 --use_fast_math # VERY important to include this flag
+NVCCFLAGS += -std=c++20 -O3 --use_fast_math
 NVCCFLAGS += -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static
 NVCCFLAGS += --expt-extended-lambda --expt-relaxed-constexpr 
 NVCCFLAGS += -forward-unknown-to-host-compiler 
