@@ -5,15 +5,14 @@ Run: python3 trace_torch_compile_bwd.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-torch.manual_seed(42)
+from tk_bench import uniform_bf16
 
 M, K, N = 4096, 4096, 4096
 
 # Setup
 linear = nn.Linear(K, N, bias=True, device="cuda", dtype=torch.bfloat16)
-x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-dy = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+x = uniform_bf16((M, K), 42).requires_grad_(True)
+dy = uniform_bf16((M, N), 43)
 
 # ============================================================
 # Compiled forward+backward

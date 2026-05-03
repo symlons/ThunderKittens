@@ -20,6 +20,7 @@ __device__ static inline float fast_tanh(float x) {
 
 using namespace kittens;
 
+// todo: visualze and ablate speed difference
 template<kittens::ducks::sv::all SV> __device__ static inline void init_bias(rt_fl<16,SV::length> &acc, const SV &bias) {
     #pragma unroll
     for(int i = 0; i < SV::tiles; i++) {
@@ -86,8 +87,7 @@ struct matmul_template {
             super_repeat = SUPER_M*Cblocks;
         int task_id = args.task_iter*gridDim.x + blockIdx.x;
         if (task_id < super_rows * Cblocks)
-            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M,
-                           (task_id%super_repeat)/SUPER_M };
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
         else if (task_id < Rblocks*Cblocks) {
             int remainder_id = task_id - super_rows*Cblocks;
             args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
@@ -140,6 +140,7 @@ struct matmul_template {
             apply_gelu(args.state.accum);
             if (warpgroup::elect_leader())
                 tma::store_async_read_wait();
+            warpgroup::sync(warpgroup::groupid() + 4);
             // Store post-activation
             warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
             warpgroup::sync(warpgroup::groupid() + 4);
@@ -279,43 +280,9 @@ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
 }
 
 int main() {
-    // int Cblocks = 22, Rblocks = 24;
-    // int Cblocks192 = 20, Rblocks192 = 16;
-    // run_benchmark<matmul_template<4>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
-    // run_benchmark<matmul_template<8>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
-    // run_benchmark<matmul_template<12>>(4096, 4096, 4096, Rblocks, Cblocks, Rblocks192, Cblocks192);
     int N;
     N = 4096;
     run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // N = 3072;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    // N = 4096;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // N = 6144;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    // N = 8192;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // N = 12288;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,8>>(N, N, N);
-    // N = 16384;
-    // run_benchmark<matmul_template<2,4,8>>(N, N, N);
-    // run_benchmark<matmul_template<2,4,12>>(N, N, N);
-    // run_benchmark<matmul_template<3,3,12>>(192*12, 192*11, 8192);
-    // run_benchmark<matmul_template<2,4,11>>(128*22, 256* 6, 8192);
-    // run_benchmark<matmul_template<2,4,1>>(128 * 132, 256, 256);
-    // run_benchmark<matmul_template<2,4,1>>(128 * 133, 256, 256);
-    // run_benchmark<matmul_template<2,4,1>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,8>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,12>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<2,4,128>>(16384, 16384, 16384);
-    // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 8192);
-    // run_benchmark<matmul_template<3,3,12>>(192*22, 192*6*2, 16384);
-    // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192);
-    // run_benchmark<matmul_template<3,3,12>>(192*12*2, 192*11*2, 8192*2);
-    // run_benchmark<matmul_template<2,4,11>>(128*22*2, 256* 6*2, 8192*2);
     return 0;
 }
 
@@ -356,14 +323,9 @@ void gemm_custom_entrypoint(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    cudaFuncSetAttribute(
-        prototype::lcf::kernel<mmt>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem
-    );
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
-    prototype::lcf::kernel<mmt>
-        <<<grid, block, smem, stream>>>(G);
+    prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
 }
 
 PYBIND11_MODULE(_C, m) {
