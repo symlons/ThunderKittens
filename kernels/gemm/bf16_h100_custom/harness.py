@@ -417,6 +417,53 @@ def bench_torch_compile_fwdbwd(ctx: Context):
     r = profile_groups("torch_compile_fwdbwd", ctx.torch_groups, fn, flops=ctx.flops_fwdbwd)
     ctx.add_result(r)
 
+
+@Registry.bench("mlp_e2e_eager", "End-to-end Mlp eager fwd+bwd training step")
+def bench_mlp_e2e_eager(ctx: Context):
+    H = ctx.K
+    hidden = H * 4
+    mlp = nn.Sequential(
+        nn.Linear(H, hidden, bias=True, device="cuda", dtype=torch.bfloat16),
+        nn.GELU(approximate="tanh"),
+        nn.Linear(hidden, H, bias=True, device="cuda", dtype=torch.bfloat16),
+    )
+    def fn(g):
+        mlp.zero_grad(set_to_none=True)
+        if g["x"].grad is not None:
+            g["x"].grad = None
+        y = mlp(g["x"])
+        loss = (y * g["dy"]).sum()
+        loss.backward()
+    mlp_flops = 48.0 * ctx.M * H * H
+    r = profile_groups("mlp_e2e_eager", ctx.torch_groups, fn, flops=mlp_flops)
+    ctx.add_result(r)
+
+
+@Registry.bench("mlp_e2e_compile", "End-to-end Mlp compiled fwd+bwd training step")
+def bench_mlp_e2e_compile(ctx: Context):
+    H = ctx.K
+    hidden = H * 4
+    mlp = nn.Sequential(
+        nn.Linear(H, hidden, bias=True, device="cuda", dtype=torch.bfloat16),
+        nn.GELU(approximate="tanh"),
+        nn.Linear(hidden, H, bias=True, device="cuda", dtype=torch.bfloat16),
+    )
+    mlp = torch.compile(mlp, mode="max-autotune")
+    def fn(g):
+        mlp.zero_grad(set_to_none=True)
+        if g["x"].grad is not None:
+            g["x"].grad = None
+        y = mlp(g["x"])
+        loss = (y * g["dy"]).sum()
+        loss.backward()
+    fn(ctx.torch_groups[0])
+    torch.cuda.synchronize()
+    fn(ctx.torch_groups[0])
+    torch.cuda.synchronize()
+    mlp_flops = 48.0 * ctx.M * H * H
+    r = profile_groups("mlp_e2e_compile", ctx.torch_groups, fn, flops=mlp_flops)
+    ctx.add_result(r)
+
 # ---- Registered correctness components ----
 
 @Registry.correctness("gelu", "GELU backward only")
@@ -534,6 +581,84 @@ def _add_bwd_baselines(suite: CorrectnessSuite, out: dict, ctx: Context):
         spec.add_baseline("autocast_bf16", refs_auto[tensor_name])
         spec.add_baseline("raw_bf16", refs_raw[tensor_name])
         spec.add_baseline("cublas_bf16", refs_cublas[tensor_name])
+
+
+@Registry.correctness("mlp_e2e", "End-to-end Mlp fwd+bwd correctness")
+def test_mlp_e2e(ctx: Context):
+    """
+    Full Mlp training step: x -> fc1 -> GELU -> fc2 -> out -> loss -> backward.
+    Compares custom kernel chain against fp32 and autocast baselines.
+    """
+    suite = CorrectnessSuite(name="mlp_end_to_end")
+    M, K, N = ctx.M, ctx.K, ctx.N
+    H = K
+    hidden = H * 4
+    seed = ctx.seed
+
+    torch.manual_seed(seed)
+    x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    mlp_fp32 = nn.Sequential(
+        nn.Linear(H, hidden, bias=True, device="cuda", dtype=torch.float32),
+        nn.GELU(approximate="tanh"),
+        nn.Linear(hidden, N, bias=True, device="cuda", dtype=torch.float32),
+    )
+    mlp_bf16 = nn.Sequential(
+        nn.Linear(H, hidden, bias=True, device="cuda", dtype=torch.bfloat16),
+        nn.GELU(approximate="tanh"),
+        nn.Linear(hidden, N, bias=True, device="cuda", dtype=torch.bfloat16),
+    )
+
+    for idx in [0, 2]:
+        mlp_bf16[idx].weight.data = mlp_fp32[idx].weight.data.clone().to(torch.bfloat16)
+        mlp_bf16[idx].bias.data = mlp_fp32[idx].bias.data.clone().to(torch.bfloat16)
+
+    x_fp32 = x.clone().float().requires_grad_(True)
+    dy_fp32 = dy.clone().float()
+
+    mlp_fp32.zero_grad()
+    y_fp32 = mlp_fp32(x_fp32)
+    loss_fp32 = (y_fp32 * dy_fp32).sum()
+    loss_fp32.backward()
+
+    mlp_bf16.zero_grad()
+    x_bf16 = x.detach().clone().requires_grad_(True)
+    y_bf16 = mlp_bf16(x_bf16)
+    loss_bf16 = (y_bf16 * dy).sum()
+    loss_bf16.backward()
+
+    w1_ref = mlp_fp32[0].weight.grad.detach()
+    b1_ref = mlp_fp32[0].bias.grad.detach()
+    w2_ref = mlp_fp32[2].weight.grad.detach()
+    b2_ref = mlp_fp32[2].bias.grad.detach()
+    x_ref = x_fp32.grad.detach()
+
+    w1_bf16 = mlp_bf16[0].weight.grad.detach()
+    b1_bf16 = mlp_bf16[0].bias.grad.detach()
+    w2_bf16 = mlp_bf16[2].weight.grad.detach()
+    b2_bf16 = mlp_bf16[2].bias.grad.detach()
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        mlp_bf16.zero_grad()
+        x_auto = x.detach().clone().requires_grad_(True)
+        y_auto = mlp_bf16(x_auto)
+        loss_auto = (y_auto * dy).sum()
+        loss_auto.backward()
+        torch.cuda.synchronize()
+
+    for tensor_name, custom, fp32_ref, auto, tol in [
+        ("dw1", w1_bf16, w1_ref, mlp_bf16[0].weight.grad.detach(), 8.0),
+        ("db1", b1_bf16, b1_ref, mlp_bf16[0].bias.grad.detach(), 4.0),
+        ("dw2", w2_bf16, w2_ref, mlp_bf16[2].weight.grad.detach(), 8.0),
+        ("db2", b2_bf16, b2_ref, mlp_bf16[2].bias.grad.detach(), 4.0),
+        ("dx", x_bf16.grad.detach(), x_ref, x_auto.grad.detach(), 8.0),
+    ]:
+        spec = suite.add_tensor(tensor_name, custom, atol=tol)
+        spec.add_baseline("fp32", fp32_ref)
+        spec.add_baseline("autocast_bf16", auto)
+
+    ctx.correctness_report.add_suite(suite)
 
 # ---- CLI ----
 
