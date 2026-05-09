@@ -6,7 +6,7 @@ from references import fa2_test
 
 B = 4
 N = 3072 # token dim
-D = 128 # hidden dim todo: should it be 1024?
+D = 64 # hidd_dim/num_heads: 1024/16=64
 H = 16 # headdim
 causal = False
 save_to_file = False
