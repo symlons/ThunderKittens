@@ -3,6 +3,7 @@ import numpy as np
 import math
 from utils import stats, print_utils, run_pairs
 from references import fa2_test
+import _C as tk
 
 B = 4
 N = 3072 # token dim
@@ -57,8 +58,10 @@ print_utils(
 )
 
 fa2_o, fa2_q_grad, fa2_k_grad, fa2_v_grad = fa2_test(q, k, v, grad_output, causal)
+tk_o, tk_l_vec = tk.mha_forward(q, k, v, causal)
+
 pairs = [
-    ("o",  fa2_o,  o),
+    ("o",  fa2_o,  o, tk_o),
     # ("qg", fa2_q_grad, q_grad),
     # ("kg", fa2_k_grad, k_grad),
     # ("vg", fa2_v_grad, v_grad),
