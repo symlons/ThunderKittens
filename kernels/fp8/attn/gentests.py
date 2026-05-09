@@ -10,25 +10,48 @@ H = 16 # headdim
 causal = False
 save_to_file = False
 
+
+SEED = 2024
+def splitmix_bf16(count: int, seed: int, min_val: float, max_val: float) -> torch.Tensor:
+    """Splitmix64 hash -> uniform bf16, bitwise identical to common.cuh fill_kernel."""
+    idx = np.arange(count, dtype=np.uint64)
+    x = np.uint64(seed) + idx
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    x = x ^ (x >> np.uint64(31))
+    u = (x >> np.uint64(40)).astype(np.float32) * np.float32(1.0 / 16777216.0)
+    vals = u * np.float32(max_val - min_val) + np.float32(min_val)
+    return torch.from_numpy(vals).to(torch.bfloat16).cuda()
+
+def create_inputs(B, S, H, Dqk, Dv, seed):
+    """Create a single set of (Q, K, V, O, LSE) tensors."""
+    count_qk = B * S * H * Dqk
+    count_v = B * S * H * Dv
+    Q = splitmix_bf16(count_qk, seed, -1.0, 1.0).view(B, S, H, Dqk)
+    K = splitmix_bf16(count_qk, seed + 1, -1.0, 1.0).view(B, S, H, Dqk)
+    V = splitmix_bf16(count_v, seed + 2, -1.0, 1.0).view(B, S, H, Dv)
+    O = torch.zeros(B, S, H, Dv, dtype=torch.bfloat16, device="cuda")
+    LSE = torch.zeros(B, H, 1, S, dtype=torch.float32, device="cuda")
+    return Q, K, V, O, LSE
+
 torch.random.manual_seed(42)
 q = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
 k = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
 v = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
 grad_output = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda'))
-
+# q, k, v, o, lse = create_inputs(B, S, H, Dqk, Dv, SEED)
 
 # B, N, H, D
 scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(D)
 print(scores.shape)
+
 scores = torch.nn.functional.softmax(scores, dim=-1).type_as(q) 
 o = torch.matmul(scores, v)  # (bs, n_local_heads, seqlen, head_dim)
-
 o.backward(grad_output)
 
 q_grad = q.grad
 k_grad = k.grad
 v_grad = v.grad
-
 
 softmax_scale = 1 / math.sqrt(D)
 l_vec = torch.empty((B, H, N, N), dtype=torch.bfloat16, device=q.device)
@@ -38,7 +61,8 @@ for i in range(H):
 max_vec = l_vec.max(dim=-1, keepdim=True).values
 l_vec = l_vec - max_vec
 l_vec = torch.exp(l_vec)
-l_vec_sum = l_vec.sum(dim=-1, keepdim=True)
+l_vec_sum = l_vec.sum(dim=-1, keepdim=True) # changes shape to (B,H,N,1)
+print("l_vec_sum.shape: ", l_vec_sum.shape)
 l_vec = max_vec + torch.log(l_vec_sum)
 
 d_vec = torch.mul(o.to(torch.bfloat16), grad_output.to(torch.bfloat16))
@@ -70,8 +94,6 @@ print(f'1/100 magnitude of L tensor:        {l_vec.abs().mean()/100}')
 print(f'Average magnitude of D tensor:      {d_vec.abs().mean()}')
 print(f'1/100 magnitude of D tensor:        {d_vec.abs().mean()/100}')
 print("--------------------------------------")
-
-
 
 def fa2_test(Q, K, V, dO, causal):
     Q.requires_grad = True
