@@ -6,7 +6,7 @@
 
 #include "warp/warp.cuh"
 #include "warpgroup/warpgroup.cuh"
-// #include "tensor/tensor.cuh"
+#include "tensor/tensor.cuh"
 
 namespace group {
 namespace mma {

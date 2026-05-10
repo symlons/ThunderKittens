@@ -142,11 +142,14 @@ struct rt {
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_fl = rt<float, _r, _c, layout>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_bf = rt<bf16,  _r, _c, layout>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_hf = rt<half,  _r, _c, layout>;
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_int8 = rt<int8,  _r, _c, layout>;
+template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_uint8 = rt<uint8,  _r, _c, layout>;
+template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_int = rt<int, _r, _c, layout>;
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_fp8e4m3 = rt<fp8e4m3,  _r, _c, layout>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_fp8e5m2 = rt<fp8e5m2,  _r, _c, layout>;
 #endif
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_fp8e8m0 = rt<fp8e8m0,  _r, _c, layout>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row> using rt_fp4e2m1_2 = rt<fp4e2m1_2,  _r, _c, layout>;
 #endif
@@ -164,13 +167,13 @@ __device__ constexpr const char* get_rt_type_name() {
         return "rt_hf";
     } else if constexpr (std::is_same_v<T, bf16>) {
         return "rt_bf";
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     } else if constexpr (std::is_same_v<T, fp4e2m1_2>) {
         return "rt_fp4_e2m1_2";
     } else if constexpr (std::is_same_v<T, fp8e8m0>) {
         return "rt_fp8_e8m0";
 #endif
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     } else if constexpr (std::is_same_v<T, fp8e4m3>) {
         return "rt_fp8_e4m3";
     } else if constexpr (std::is_same_v<T, fp8e5m2>) {
@@ -222,7 +225,7 @@ __device__ inline void print(const RT& tile) {
                                 printf("%.3f ", __half2float(packed_val));
                             } else if constexpr (std::is_same_v<typename RT::T, bf16>) {
                                 printf("%.3f ", __bfloat162float(packed_val));
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                             } else if constexpr (std::is_same_v<typename RT::T, fp4e2m1>) {
                                 printf("%.3f ", (float)packed_val);
 #endif
@@ -236,7 +239,7 @@ __device__ inline void print(const RT& tile) {
                             } else if constexpr (std::is_same_v<typename RT::T, bf16>) {
                                 // Handle packed bf16_2 type
                                 printf("[%.3f, %.3f] ", __bfloat162float(packed_val.x), __bfloat162float(packed_val.y));
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                             } else if constexpr (std::is_same_v<typename RT::T, fp8e8m0>) {
                                 // Extract the 4 individual fp8e8m0 values from the packed fp8e8m0_4
                                 __nv_fp8_e8m0 *vals = reinterpret_cast<__nv_fp8_e8m0*>(const_cast<fp8e8m0_4*>(&packed_val));

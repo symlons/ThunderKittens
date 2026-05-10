@@ -1,4 +1,4 @@
-GPU := H100
+ARCH := SM90
 SRC := layernorm.cu
 
 # PyTorch extension mode

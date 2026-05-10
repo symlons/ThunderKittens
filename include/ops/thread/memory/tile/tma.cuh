@@ -744,7 +744,7 @@ namespace cluster {
  * @param[in] idx The coordinate of the requested tile. This is in units of complete tiles.
  * @param[in] cluster_mask The mask of the clusters to broadcast to.
  */
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1)
 #else
@@ -760,7 +760,7 @@ __device__ static inline void load_async(ST &dst, const GL &src, const COORD &id
     if constexpr (ST::swizzle) {
         int4 tma_coords = detail::tma_coords<ST, axis>(unit_coord);
 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         if(dst_mbar_cta != -1) {
             uint32_t neighbor_mbar_ptr;
             asm volatile (
@@ -811,7 +811,7 @@ __device__ static inline void load_async(ST &dst, const GL &src, const COORD &id
     } else {
         static_assert(axis == 2, "For non-swizzled tiles, only axis 2 is supported.");
 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         if(dst_mbar_cta != -1) {
             uint32_t neighbor_mbar_ptr;
             asm volatile (
@@ -862,7 +862,7 @@ __device__ static inline void load_async(ST &dst, const GL &src, const COORD &id
         }
     }
 }
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
 template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) {
     load_async<dim::ROW, cache_policy::NORMAL, ST, GL, COORD>(dst, src, idx, bar, cluster_mask, dst_mbar_cta);

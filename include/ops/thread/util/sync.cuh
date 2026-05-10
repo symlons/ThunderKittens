@@ -77,7 +77,7 @@ template<int num_warps> __device__ static inline void arrive(barrier<num_warps> 
     asm volatile("bar.arrive %0, %1;\n" :: "r"(bar.barrier_id), "n"(num_warps*WARP_THREADS) : "memory");
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
 * @brief Arrives at a semaphore.
 *
@@ -107,7 +107,7 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); 
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     asm volatile (
         "{\n"
         ".reg .pred                P1;\n"
@@ -137,7 +137,7 @@ __device__ static inline void wait(semaphore& sem, int kPhaseBit) {
 #endif
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 __device__ static inline bool try_wait(semaphore &sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); 
@@ -162,7 +162,7 @@ __device__ static inline void careful_wait(semaphore& sem, int kPhaseBit) {
     void const* const ptr = &sem;
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     asm volatile (
         "{\n"
         ".reg .b64                 start_clock, current_clock;\n"
@@ -257,7 +257,7 @@ template<typename T, typename... Args> inline constexpr uint32_t size_bytes<T, A
 
 /* ----------   TCGEN05 synchronization  ---------- */
 
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X)
 
 __device__ static inline void tensor_before_thread_sync() {
     asm volatile("tcgen05.fence::before_thread_sync;\n");
@@ -291,7 +291,7 @@ __device__ static inline void tensor_commit(kittens::semaphore &sem, uint16_t ds
 
 /* ----------   Multi-GPU synchronization  ---------- */
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 
 template <int NUM_DEVICES>
 __device__ static inline void signal(

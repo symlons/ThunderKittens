@@ -1,4 +1,4 @@
-GPU := H100
+ARCH := SM90
 
 # PyTorch extension mode
 SRC := linear_attn.cu

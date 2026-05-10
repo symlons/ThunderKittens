@@ -1,8 +1,8 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-gpu = os.environ.get("GPU", "")
-assert gpu == "B200", "GPU must be set to B200"
+arch = os.environ.get("ARCH", "")
+assert arch == "SM100", "ARCH must be set to SM100"
 
 import torch
 

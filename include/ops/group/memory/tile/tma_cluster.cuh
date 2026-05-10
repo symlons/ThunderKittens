@@ -3,7 +3,7 @@
  * @brief Functions for a group scope to call tile cluster-wide TMA functions.
  */
 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
 template<int axis, cache_policy policy, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
 __device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, semaphore& bar, uint16_t cluster_mask, int dst_mbar_cta=-1) {
     if(laneid() == 0) {

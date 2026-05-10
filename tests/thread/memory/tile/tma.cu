@@ -10,7 +10,9 @@ struct test_load { // load with TMA, write out normally
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "tma_load_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "tma_load_gmem=half" :
-                                                        #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+                                                      std::is_same_v<T, kittens::int8> ? "tma_load_gmem=int8" :
+                                                      std::is_same_v<T, kittens::uint8> ? "tma_load_gmem=uint8" :
+                                                        #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                                                       std::is_same_v<T, kittens::fp8e4m3> ? "tma_load_gmem=fp8e4m3":
                                                       std::is_same_v<T, kittens::fp8e5m2> ? "tma_load_gmem=fp8e5m2":
                                                         #endif
@@ -44,10 +46,12 @@ template<typename T>
 struct test_load_oob { // load oob memory via TMA
     using dtype = T;
     template<int H, int W, int NW> using valid = std::bool_constant<
-        ( NW == 1 && W*H*sizeof(dtype)*256*4<=kittens::MAX_SHARED_MEMORY-1024 ) && ( ( sizeof(T) != 1 ) || W%2 == 0 ) 
+        ( NW == 1 && W*H*sizeof(dtype)*256*4<=kittens::MAX_SHARED_MEMORY-1024 ) && ( sizeof(T) != 1 )
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "tma_load_oob_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "tma_load_oob_gmem=half" :
+                                                      std::is_same_v<T, kittens::int8> ? "tma_load_oob_gmem=int8" :
+                                                      std::is_same_v<T, kittens::uint8> ? "tma_load_oob_gmem=uint8" :
                                                                                          "tma_load_oob_gmem=float";
     template<int H, int W, int NW, kittens::ducks::gl::all GL> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         // everything should be zero
@@ -93,9 +97,11 @@ struct test_store { // load normally, store with TMA
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "tma_store_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "tma_store_gmem=half" :
-                                                      #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
-                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_load_gmem=fp8e4m3":
-                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_load_gmem=fp8e5m2":
+                                                      std::is_same_v<T, kittens::int8> ? "tma_store_gmem=int8" :
+                                                      std::is_same_v<T, kittens::uint8> ? "tma_store_gmem=uint8" :
+                                                      #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_store_gmem=fp8e4m3":
+                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_store_gmem=fp8e5m2":
                                                       #endif
                                                                                          "tma_store_gmem=float";
     template<int H, int W, int NW, kittens::ducks::gl::all GL> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
@@ -128,9 +134,11 @@ struct test_store_add_reduce {
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "tma_store_add_reduce_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "tma_store_add_reduce_gmem=half" :
-                                                      #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
-                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_load_gmem=fp8e4m3":
-                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_load_gmem=fp8e5m2":
+                                                      std::is_same_v<T, kittens::int8> ? "tma_store_add_reduce_gmem=int8" :
+                                                      std::is_same_v<T, kittens::uint8> ? "tma_store_add_reduce_gmem=uint8" :
+                                                      #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_store_add_reduce_gmem=fp8e4m3":
+                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_store_add_reduce_gmem=fp8e5m2":
                                                         #endif
                                                                                          "tma_store_add_reduce_gmem=float";
 
@@ -168,9 +176,11 @@ struct test_store_min_reduce {
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "tma_store_min_reduce_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "tma_store_min_reduce_gmem=half" :
-                                                      #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
-                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_load_gmem=fp8e4m3":
-                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_load_gmem=fp8e5m2":
+                                                      std::is_same_v<T, kittens::int8> ? "tma_store_min_reduce_gmem=int8" :
+                                                      std::is_same_v<T, kittens::uint8> ? "tma_store_min_reduce_gmem=uint8" :
+                                                      #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_store_min_reduce_gmem=fp8e4m3":
+                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_store_min_reduce_gmem=fp8e5m2":
                                                         #endif
                                                                                          "tma_store_min_reduce_gmem=float";
     template<int H, int W, int NW, kittens::ducks::gl::all GL> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
@@ -207,9 +217,11 @@ struct test_store_max_reduce {
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "tma_store_max_reduce_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "tma_store_max_reduce_gmem=half" :
-                                                      #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
-                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_load_gmem=fp8e4m3":
-                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_load_gmem=fp8e5m2":
+                                                      std::is_same_v<T, kittens::int8> ? "tma_store_max_reduce_gmem=int8" :
+                                                      std::is_same_v<T, kittens::uint8> ? "tma_store_max_reduce_gmem=uint8" :
+                                                      #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
+                                                      std::is_same_v<T, kittens::fp8e4m3> ? "tma_store_max_reduce_gmem=fp8e4m3":
+                                                      std::is_same_v<T, kittens::fp8e5m2> ? "tma_store_max_reduce_gmem=fp8e5m2":
                                                         #endif
                                                                                          "tma_store_max_reduce_gmem=float";
     template<int H, int W, int NW, kittens::ducks::gl::all GL> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
@@ -290,7 +302,9 @@ struct tma_sweep_gmem_type_2d {
         tma_sweep_size_2d<test<float>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         tma_sweep_size_2d<test<kittens::bf16>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         tma_sweep_size_2d<test<kittens::half>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
-        #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+        tma_sweep_size_2d<test<kittens::int8>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
+        tma_sweep_size_2d<test<kittens::uint8>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
+        #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
         tma_sweep_size_2d<test<kittens::fp8e4m3>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         tma_sweep_size_2d<test<kittens::fp8e5m2>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         #endif

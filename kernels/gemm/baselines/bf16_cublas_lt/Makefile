@@ -1,4 +1,4 @@
-GPU := B200
+ARCH := SM100
 SRC := bf16_cublas_lt_gemm.cu
 OUT := bf16_cublas_lt_gemm.out
 CMD := ./bf16_cublas_lt_gemm.out

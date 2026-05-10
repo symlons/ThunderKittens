@@ -1,4 +1,4 @@
-GPU := H100
+ARCH := SM90
 SRC := bf16_h100_gemm.cu
 OUT := bf16_h100_gemm.out
 CMD := ./bf16_h100_gemm.out

@@ -164,7 +164,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
                 tmp[1] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1]);
                 tmp[2] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[2]);
                 tmp[3] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[3]);
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                 int row = (local_warpid*warp_height + i)*RT::tile_size_row + (warp_laneid % 16);
                 int col = j*RT::tile_size_col + (warp_laneid / 16) * 8;
                 if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {

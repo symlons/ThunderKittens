@@ -5,7 +5,7 @@
 
 #pragma once
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 
 #include "../../common/common.cuh"
 #include "st.cuh"
@@ -30,7 +30,7 @@ __device__ static inline uint64_t matrix_descriptor_raw(
     uint32_t stride_dim_offset,
     uint32_t swizzle_mode
 ) {
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     // see https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-descriptor
     return matrix_descriptor_encode(reinterpret_cast<uint64_t>(addr)) | 
            (1llu << 46) | // needed for blackwell shared memory descriptors

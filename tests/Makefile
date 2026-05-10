@@ -2,8 +2,8 @@
 # If you want to run lots of tests without parallel compilation, be prepared
 # to spend a *long* time compiling. (like, HOURS single-threaded.)
 
-# GPU Selection: Set to either H100, B200, or B300
-GPU_TARGET=H100
+# Architecture Selection: Set to SM80, SM90, SM100, SM103, or SM120
+ARCH=SM90
 COMP_LEVEL=fast
 
 # Compiler
@@ -31,15 +31,17 @@ else ifeq ($(COMP_LEVEL),profile)
 NVCCFLAGS+= -O3 --threads=0 -diag-suppress 20054 --dlto
 endif
 
-# Compiler flags based on GPU target
-ifeq ($(GPU_TARGET),A100)
-NVCCFLAGS+= -gencode arch=compute_80a,code=sm_80 -DKITTENS_AMPERE -lcuda -lcudart
-else ifeq ($(GPU_TARGET),H100)
-NVCCFLAGS+= -gencode arch=compute_90a,code=sm_90a -DKITTENS_HOPPER -lcuda -lcudart
-else ifeq ($(GPU_TARGET),B200)
-NVCCFLAGS+= -gencode arch=compute_100a,code=sm_100a -DKITTENS_BLACKWELL -lcuda -lcudart
-else ifeq ($(GPU_TARGET),B300)
-NVCCFLAGS+= -gencode arch=compute_103a,code=sm_103a -DKITTENS_BLACKWELL -lcuda -lcudart
+# Compiler flags based on architecture target
+ifeq ($(ARCH),SM80)
+NVCCFLAGS+= -gencode arch=compute_80a,code=sm_80 -DKITTENS_SM80 -lcuda -lcudart
+else ifeq ($(ARCH),SM90)
+NVCCFLAGS+= -gencode arch=compute_90a,code=sm_90a -DKITTENS_SM90 -lcuda -lcudart
+else ifeq ($(ARCH),SM100)
+NVCCFLAGS+= -gencode arch=compute_100a,code=sm_100a -DKITTENS_SM100 -lcuda -lcudart
+else ifeq ($(ARCH),SM103)
+NVCCFLAGS+= -gencode arch=compute_103a,code=sm_103a -DKITTENS_SM103 -lcuda -lcudart
+else ifeq ($(ARCH),SM120)
+NVCCFLAGS+= -gencode arch=compute_120a,code=sm_120a -DKITTENS_SM120 -lcuda -lcudart
 endif
 
 # Target binary name

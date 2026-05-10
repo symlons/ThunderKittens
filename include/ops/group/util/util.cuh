@@ -8,7 +8,7 @@
 
 /* CLC scheduler operations */
 
-#ifdef KITTENS_BLACKWELL
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 
 struct clc {
 
@@ -57,7 +57,7 @@ __device__ static inline kittens::clc::result query(kittens::clc::handle &h) {
 
 #endif
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 
 /**
  * @brief Programmatic Dependent Kernel Launch (PDL) utilities. Available on Hopper and later.

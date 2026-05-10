@@ -1,5 +1,5 @@
-# You must set the environment variable GPU
-# export GPU=H100 | B200
+# You must set the environment variable ARCH
+# export ARCH=SM90 | SM100
 
 SRC := reduce_scatter.cu
 OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")

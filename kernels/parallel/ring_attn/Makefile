@@ -1,12 +1,12 @@
-# You must set the environment variable GPU
-# export GPU=H100 | B200
+# You must set the environment variable ARCH
+# export ARCH=SM90
 
-ifeq ($(GPU),B200)
-$(error B200 is unsupported.)
-else ifeq ($(GPU),H100)
+ifeq ($(ARCH),SM100)
+$(error SM100 is unsupported.)
+else ifeq ($(ARCH),SM90)
 SRC := ring_attn_h100.cu
 else
-$(error Unsupported GPU: $(GPU). Please set GPU to B200 or H100.)
+$(error Unsupported ARCH: $(ARCH). Please set ARCH to SM90.)
 endif
 
 OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")

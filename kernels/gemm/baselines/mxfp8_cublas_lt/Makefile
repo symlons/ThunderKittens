@@ -1,4 +1,4 @@
-GPU := B200
+ARCH := SM100
 SRC := mxfp8_cublas_lt_gemm.cu
 OUT := mxfp8_cublas_lt_gemm.out
 CMD := ./mxfp8_cublas_lt_gemm.out

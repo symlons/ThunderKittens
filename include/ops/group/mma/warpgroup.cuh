@@ -31,6 +31,9 @@ __device__ static inline void mma_fence(D &dst) {
                 if constexpr(std::is_same_v<typename D::T, float>) {
                     asm volatile("" : "+f"(dst.tiles[i][j].data[k].x) :: "memory");
                     asm volatile("" : "+f"(dst.tiles[i][j].data[k].y) :: "memory");
+                } else if constexpr(std::is_same_v<typename D::T, int>) {
+                    asm volatile("" : "+r"(dst.tiles[i][j].data[k].x) :: "memory");
+                    asm volatile("" : "+r"(dst.tiles[i][j].data[k].y) :: "memory");
                 } else {
                     asm volatile("" : "+r"(*(uint32_t*)&dst.tiles[i][j].data[k]) :: "memory");
                 }
@@ -53,6 +56,11 @@ __device__ static inline void mma_fence(D &dst) {
                     asm volatile("" : "+f"(dst.real.tiles[i][j].data[k].y) :: "memory");
                     asm volatile("" : "+f"(dst.imag.tiles[i][j].data[k].x) :: "memory");
                     asm volatile("" : "+f"(dst.imag.tiles[i][j].data[k].y) :: "memory");
+                } else if constexpr(std::is_same_v<typename D::T, int>) {
+                    asm volatile("" : "+r"(dst.real.tiles[i][j].data[k].x) :: "memory");
+                    asm volatile("" : "+r"(dst.real.tiles[i][j].data[k].y) :: "memory");
+                    asm volatile("" : "+r"(dst.imag.tiles[i][j].data[k].x) :: "memory");
+                    asm volatile("" : "+r"(dst.imag.tiles[i][j].data[k].y) :: "memory");
                 } else {
                     asm volatile("" : "+r"(*(uint32_t*)&dst.real.tiles[i][j].data[k]) :: "memory");
                     asm volatile("" : "+r"(*(uint32_t*)&dst.imag.tiles[i][j].data[k]) :: "memory");
@@ -151,6 +159,7 @@ __device__ static inline void mma_AB(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 0, 1>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<B>, 1> b_desc(b); // apologies for this hack -- it either calls ST constructor or copy constructor.
@@ -204,6 +213,7 @@ __device__ static inline void mma_AB(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 0, 1>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<A>, 0> a_desc(a);
@@ -397,6 +407,7 @@ __device__ static inline void mma_AtB(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 1, 1>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<A>, 1> a_desc(a);
@@ -458,6 +469,7 @@ __device__ static inline void mma_AtBt(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 1, 0>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<A>, 1> a_desc(a);
@@ -553,6 +565,7 @@ __device__ static inline void mma_AB(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 0, 1>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<B>, 1> b_desc_real(b.real);
@@ -644,6 +657,7 @@ __device__ static inline void mma_AB(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 0, 1>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<A>, 0> a_desc_real(a.real);
@@ -945,6 +959,7 @@ __device__ static inline void mma_AtB(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 1, 1>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<A>, 1> a_desc_real(a.real);
@@ -1041,6 +1056,7 @@ __device__ static inline void mma_AtBt(D &d,
     using T_AB = A::T;
     using T_D  = D::T;
     static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_AB, int8> && !std::is_same_v<T_AB, uint8>, "Transpose is not supported for integer WGMMA; use mma_ABt / mm_ABt.");
     static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
     using base = kittens::detail::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 1, 0>;
     kittens::st_descriptor<ducks::st_descriptor::detail::get_st<A>, 1> a_desc_real(a.real);

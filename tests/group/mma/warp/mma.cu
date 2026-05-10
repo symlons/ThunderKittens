@@ -249,7 +249,7 @@ struct test_mma_AtBt_half {
     template<int H, int W, typename K> using make_c_layout = typename kittens::gl<float, 1, 1, 16*H, 16*W>;
 };
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 struct test_mma_ABt_fp8 {
     using dtype = kittens::fp8e4m3;
     template<int H, int W, int NW, typename K> using valid = std::bool_constant<
@@ -301,6 +301,34 @@ struct test_mma_ABt_fp8 {
 };
 #endif
 
+template<typename A_T, typename B_T, int A_VAL, int B_VAL>
+struct test_mma_ABt_i8 {
+    template<int H, int W, int NW, typename K> using valid = std::bool_constant<NW == 1 && (2*W*H+W*K::value+H*K::value)<=64>; // this is warp-level
+    static inline const std::string test_identifier =
+        (std::is_same_v<A_T, kittens::int8> ? "warp_mma_ABt_int8_" : "warp_mma_ABt_uint8_") +
+        std::string(std::is_same_v<B_T, kittens::int8> ? "int8" : "uint8");
+    template<int H, int W, int NW, gl_t GTL_A, gl_t GTL_B, gl_t GTL_C, typename _K> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
+        constexpr int K = _K::value;
+        for(int i = 0; i < H*W*256; i++) {
+            o_ref[i] = float(A_VAL * B_VAL * K * 32);
+        }
+    }
+    template<int H, int W, int NW, gl_t GTL_A, gl_t GTL_B, gl_t GTL_C, typename _K> __device__ static void device_func(const GTL_A &a_input, const GTL_B &b_input, const GTL_C &c_output) {
+        constexpr int K = _K::value;
+        kittens::rt<A_T, 16*H, 32*K> a;
+        kittens::rt<B_T, 16*W, 32*K> b;
+        kittens::rt_int<16*H, 16*W> c;
+        a = A_T(A_VAL);
+        b = B_T(B_VAL);
+        kittens::warp::zero(c);
+        kittens::warp::mma_ABt(c, a, b, c);
+        kittens::warp::store(c_output, c, {});
+    }
+    template<int H, int W, typename K> using make_a_layout = typename kittens::gl<kittens::bf16, 1, 1, 16*H, 16*K::value>;
+    template<int H, int W, typename K> using make_b_layout = typename kittens::gl<kittens::bf16, 1, 1, 16*W, 16*K::value>;
+    template<int H, int W, typename K> using make_c_layout = typename kittens::gl<int, 1, 1, 16*H, 16*W>;
+};
+
 // Due to the strange sizes instantiated, we need a custom base wrapper here
 template<typename Ker, typename T, int H, int W, int NW, gl_t GTL_A, gl_t GTL_B, gl_t GTL_C, typename... args>
 static __global__ void mma_global_wrapper_2d(const GTL_A a_input, const GTL_B b_input, GTL_C c_output) {
@@ -348,7 +376,7 @@ template<typename test, int MAX_H=8, int MAX_W=8, int NUM_WORKERS=1, typename...
 template<typename test, int MAX_H=8, int MAX_W=8, typename... args> using mma_sweep_size_warp = mma_sweep_size<test, MAX_H, MAX_W, 1, args...>;
 
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 // fp8 
 template<typename test, int H, int W, int NUM_WORKERS, typename _K, typename... args>
 struct mma_wrapper_2d_fp8 {
@@ -392,6 +420,54 @@ template<typename test, int MAX_H=8, int MAX_W=8, int NUM_WORKERS=1, typename...
 template<typename test, int MAX_H=8, int MAX_W=8, typename... args> using mma_sweep_size_warp_fp8 = mma_sweep_size_fp8<test, MAX_H, MAX_W, 1, args...>;
 #endif
 
+// int8
+template<typename test, int H, int W, int NUM_WORKERS, typename _K, typename... args>
+struct mma_wrapper_2d_int8 {
+    static void run(test_data& results) {
+        using namespace kittens;
+        constexpr int K = _K::value;
+        test_info this_result;
+        this_result.label = generate_test_name<H,W,NUM_WORKERS,_K,args...>(test::test_identifier);
+        if constexpr (test::template valid<H, W, NUM_WORKERS, _K, args...>::value) {
+            // initialize
+            kittens::bf16 *d_i;
+            int *d_o;
+            std::vector<float> i_ref((H+W)*K*256);
+            std::vector<float> o_ref(H*W*256);
+            initialize<kittens::bf16>(&d_i, (kittens::bf16**)&d_o, i_ref, o_ref);
+            cudaFree(d_o);
+            cudaMalloc(&d_o, o_ref.size() * sizeof(int));
+            cudaMemset(d_o, 0, o_ref.size() * sizeof(int));
+            CudaCheckError();
+            // make descriptors
+            using GTL_A = test::template make_a_layout<H, W, _K>;
+            using GTL_B = test::template make_b_layout<H, W, _K>;
+            using GTL_C = test::template make_c_layout<H, W, _K>;
+            GTL_A a_input (d_i,           nullptr, nullptr, nullptr, nullptr);
+            GTL_B b_input (d_i + H*K*256, nullptr, nullptr, nullptr, nullptr);
+            GTL_C c_output(d_o,           nullptr, nullptr, nullptr, nullptr);
+            // run kernel
+            cudaFuncSetAttribute(
+                mma_global_wrapper_2d<test, kittens::bf16, H, W, NUM_WORKERS, GTL_A, GTL_B, GTL_C, _K, args...>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                kittens::MAX_SHARED_MEMORY-1024
+            );
+            mma_global_wrapper_2d<test, kittens::bf16, H, W, NUM_WORKERS, GTL_A, GTL_B, GTL_C, _K, args...><<<1, NUM_WORKERS*32, kittens::MAX_SHARED_MEMORY-1024>>>(a_input, b_input, c_output);
+            // fill in correct results on cpu
+            test::template host_func<H, W, NUM_WORKERS, GTL_A, GTL_B, GTL_C, _K, args...>(i_ref, o_ref);
+            // check and cleanup
+            this_result.result = validate<int>(nullptr, d_o, i_ref, o_ref, this_result.label, W*16, 0);
+            cudaFree(d_i);
+        }
+        else {
+            this_result.result = test_result::INVALID;
+        }
+        results.push_back(this_result);
+    }
+};
+template<typename test, int MAX_H=8, int MAX_W=8, int NUM_WORKERS=1, typename... args> using mma_sweep_size_int8 = loop_h<mma_wrapper_2d_int8, test, MAX_H, MAX_W, NUM_WORKERS, MAX_H, args...>;
+template<typename test, int MAX_H=8, int MAX_W=8, typename... args> using mma_sweep_size_warp_int8 = mma_sweep_size_int8<test, MAX_H, MAX_W, 1, args...>;
+
 void group::mma::warp::mma::tests(test_data &results) {
     std::cout << " ----- Starting ops/group/mma/warp/mma tests! -----\n" << std::endl;
     constexpr int SIZE = INTENSITY_1 ? 2  :
@@ -416,13 +492,23 @@ void group::mma::warp::mma::tests(test_data &results) {
     mma_sweep_size_warp<test_mma_AtBt, SIZE, SIZE, std::integral_constant<int, 3>>::run(results);
     mma_sweep_size_warp<test_mma_AtBt, SIZE, SIZE, std::integral_constant<int, 4>>::run(results);
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     // fp8
     mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 1>>::run(results);
     mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 2>>::run(results);
     mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 3>>::run(results);
     mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 4>>::run(results);
 #endif
+
+    // int8
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::int8,  kittens::int8,  -2, 3>, SIZE, SIZE, std::integral_constant<int, 1>>::run(results);
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::int8,  kittens::int8,  -2, 3>, SIZE, SIZE, std::integral_constant<int, 2>>::run(results);
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::int8,  kittens::uint8, -2, 3>, SIZE, SIZE, std::integral_constant<int, 1>>::run(results);
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::int8,  kittens::uint8, -2, 3>, SIZE, SIZE, std::integral_constant<int, 2>>::run(results);
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::uint8, kittens::int8,   2, 3>, SIZE, SIZE, std::integral_constant<int, 1>>::run(results);
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::uint8, kittens::int8,   2, 3>, SIZE, SIZE, std::integral_constant<int, 2>>::run(results);
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::uint8, kittens::uint8,  2, 3>, SIZE, SIZE, std::integral_constant<int, 1>>::run(results);
+    mma_sweep_size_warp_int8<test_mma_ABt_i8<kittens::uint8, kittens::uint8,  2, 3>, SIZE, SIZE, std::integral_constant<int, 2>>::run(results);
 
     std::cout << std::endl;
 }

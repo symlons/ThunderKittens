@@ -19,6 +19,11 @@ void group::memory::tile::tests(test_data &results) {
 #else
     std::cout << "INFO: Skipping ops/group/memory/tile/shared_to_register tests!\n" << std::endl;
 #endif
+#if defined(TEST_GROUP_MEMORY_TILE_TENSOR_TO_REGISTER)
+    group::memory::tile::tensor_to_register::tests(results);
+#else
+    std::cout << "INFO: Skipping ops/group/memory/tile/tensor_to_register tests!\n" << std::endl;
+#endif
     std::cout << std::endl;
 }
 

@@ -2,7 +2,7 @@
 
 #include "kittens.cuh"
 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
 
 #include <fstream>
 #include <string>
@@ -145,4 +145,4 @@ struct __align__(1024) TKProfiler {
     }
 };
 
-#endif // KITTENS_BLACKWELL
+#endif // KITTENS_SM10X

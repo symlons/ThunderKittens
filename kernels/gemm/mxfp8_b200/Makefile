@@ -1,4 +1,4 @@
-GPU := B200
+ARCH := SM100
 
 # Standalone mode
 SRC := mxfp8_b200_gemm.cu

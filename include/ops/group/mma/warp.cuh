@@ -137,7 +137,7 @@ __device__ static inline void hmma16816(      half_2 &d0,       half_2 &d1,
     );
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
 * @brief Perform the HMMA.16816 operation for FP8 using fp8e4m3_2.
 *
@@ -185,6 +185,88 @@ __device__ static inline void hmma16816(      float2 &d0,       float2 &d1,
     );
 }
 #endif
+/**
+ * @brief Perform the IMMA.16832 operation for 8-bit integer inputs.
+ *
+ * This function performs the integer matrix multiply-accumulate operation
+ * using the `mma.sync.aligned.m16n8k32.row.col.satfinite.s32.*8.*8.s32` instruction.
+ */
+__device__ static inline void imma16832(int2 &d0, int2 &d1,
+                                        const int8_4 &a0, const int8_4 &a1, const int8_4 &a2, const int8_4 &a3,
+                                        const int8_4 &b0, const int8_4 &b1,
+                                        const int2 &c0, const int2 &c1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};"
+    :   "=r"(d0.x), "=r"(d0.y),
+        "=r"(d1.x), "=r"(d1.y)
+    :   "r"(*(uint32_t*)(&a0)), "r"(*(uint32_t*)(&a1)),
+        "r"(*(uint32_t*)(&a2)), "r"(*(uint32_t*)(&a3)),
+        "r"(*(uint32_t*)(&b0)), "r"(*(uint32_t*)(&b1)),
+        "r"(c0.x), "r"(c0.y),
+        "r"(c1.x), "r"(c1.y)
+    );
+}
+__device__ static inline void imma16832(int2 &d0, int2 &d1,
+                                        const int8_4 &a0, const int8_4 &a1, const int8_4 &a2, const int8_4 &a3,
+                                        const uint8_4 &b0, const uint8_4 &b1,
+                                        const int2 &c0, const int2 &c1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.u8.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};"
+    :   "=r"(d0.x), "=r"(d0.y),
+        "=r"(d1.x), "=r"(d1.y)
+    :   "r"(*(uint32_t*)(&a0)), "r"(*(uint32_t*)(&a1)),
+        "r"(*(uint32_t*)(&a2)), "r"(*(uint32_t*)(&a3)),
+        "r"(*(uint32_t*)(&b0)), "r"(*(uint32_t*)(&b1)),
+        "r"(c0.x), "r"(c0.y),
+        "r"(c1.x), "r"(c1.y)
+    );
+}
+__device__ static inline void imma16832(int2 &d0, int2 &d1,
+                                        const uint8_4 &a0, const uint8_4 &a1, const uint8_4 &a2, const uint8_4 &a3,
+                                        const int8_4 &b0, const int8_4 &b1,
+                                        const int2 &c0, const int2 &c1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.s8.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};"
+    :   "=r"(d0.x), "=r"(d0.y),
+        "=r"(d1.x), "=r"(d1.y)
+    :   "r"(*(uint32_t*)(&a0)), "r"(*(uint32_t*)(&a1)),
+        "r"(*(uint32_t*)(&a2)), "r"(*(uint32_t*)(&a3)),
+        "r"(*(uint32_t*)(&b0)), "r"(*(uint32_t*)(&b1)),
+        "r"(c0.x), "r"(c0.y),
+        "r"(c1.x), "r"(c1.y)
+    );
+}
+__device__ static inline void imma16832(int2 &d0, int2 &d1,
+                                        const uint8_4 &a0, const uint8_4 &a1, const uint8_4 &a2, const uint8_4 &a3,
+                                        const uint8_4 &b0, const uint8_4 &b1,
+                                        const int2 &c0, const int2 &c1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.u8.u8.s32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};"
+    :   "=r"(d0.x), "=r"(d0.y),
+        "=r"(d1.x), "=r"(d1.y)
+    :   "r"(*(uint32_t*)(&a0)), "r"(*(uint32_t*)(&a1)),
+        "r"(*(uint32_t*)(&a2)), "r"(*(uint32_t*)(&a3)),
+        "r"(*(uint32_t*)(&b0)), "r"(*(uint32_t*)(&b1)),
+        "r"(c0.x), "r"(c0.y),
+        "r"(c1.x), "r"(c1.y)
+    );
+}
 
 /**
  * @brief Base matrix multiply-accumulate operation for row layout.
@@ -243,7 +325,7 @@ __device__ static inline void mma_AB_base(rt_base<float, ducks::rt_layout::row> 
         c.data[2], c.data[3]
     );
 }
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
  * @brief Base matrix multiply-accumulate operation for row layout.
  *
@@ -358,7 +440,7 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::row>
         c.data[2], c.data[3]
     );
 }
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
  * @brief Base dot product operation for row layout.
  *
@@ -388,6 +470,26 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::row>
     );
 }
 #endif
+template<typename A, typename B>
+__device__ static inline void mma_ABt_base(rt_base<int, ducks::rt_layout::row> &d,
+                                     const rt_base<A,   ducks::rt_layout::row> &a,
+                                     const rt_base<B,   ducks::rt_layout::row> &b, // in row-major mode
+                                     const rt_base<int, ducks::rt_layout::row> &c) {
+    static_assert((std::is_same_v<A, int8> || std::is_same_v<A, uint8>) &&
+                  (std::is_same_v<B, int8> || std::is_same_v<B, uint8>));
+    imma16832(
+        d.data[0], d.data[1],
+        a.data[0], a.data[1], a.data[2], a.data[3],
+        b.data[0], b.data[2], // for some reason this one seems to need to be backwards
+        c.data[0], c.data[1]
+    );
+    imma16832(
+        d.data[2], d.data[3],
+        a.data[0], a.data[1], a.data[2], a.data[3],
+        b.data[1], b.data[3], // for some reason this one seems to need to be backwards
+        c.data[2], c.data[3]
+    );
+}
 
 
 /**
@@ -447,7 +549,7 @@ __device__ static inline void mma_AtB_base(rt_base<float, ducks::rt_layout::row>
         c.data[2], c.data[3]
     );
 }
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
  * @brief Base matrix multiply-accumulate operation for row layout with transposed A.
  *
@@ -535,7 +637,7 @@ __device__ static inline void mma_AtBt_base(rt_base<float, ducks::rt_layout::row
         c.data[2], c.data[3]
     );
 }
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
  * @brief Base matrix multiply-accumulate operation for row layout with transposed A and B.
  *
@@ -589,7 +691,7 @@ __device__ static inline void mma_AB(D &d,
     static_assert(D::rows == A::rows && D::cols == B::cols); // Check D matches A, B
     static_assert(A::cols == B::rows); // Check reduction dim is same
     static_assert(D::rows == C::rows && D::cols == C::cols); // Check D matches C
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
             std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
@@ -653,14 +755,18 @@ __device__ static inline void mma_ABt(D &d,
     static_assert(D::rows == A::rows && D::cols == B::rows); // Check D matches A, B
     static_assert(A::cols == B::cols); // Check reduction dim is same
     static_assert(D::rows == C::rows && D::cols == C::cols); // Check D matches C
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
             std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
         (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
             std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>)  ||
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, fp8e4m3> &&
-            std::is_same_v<typename B::T, fp8e4m3> && std::is_same_v<typename C::T, float>)
+            std::is_same_v<typename B::T, fp8e4m3> && std::is_same_v<typename C::T, float>) ||
+        (std::is_same_v<typename D::T, int> &&
+            (std::is_same_v<typename A::T, int8> || std::is_same_v<typename A::T, uint8>) &&
+            (std::is_same_v<typename B::T, int8> || std::is_same_v<typename B::T, uint8>) &&
+            std::is_same_v<typename C::T, int>)
     );
     #else
     static_assert(
@@ -669,7 +775,11 @@ __device__ static inline void mma_ABt(D &d,
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, half> &&
             std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, float>) ||
         (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
-            std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>)
+            std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>) ||
+        (std::is_same_v<typename D::T, int> &&
+            (std::is_same_v<typename A::T, int8> || std::is_same_v<typename A::T, uint8>) &&
+            (std::is_same_v<typename B::T, int8> || std::is_same_v<typename B::T, uint8>) &&
+            std::is_same_v<typename C::T, int>)
     );
     #endif
     #pragma unroll
@@ -717,7 +827,7 @@ __device__ static inline void mma_AtB(D &d,
     static_assert(D::rows == A::cols && D::cols == B::cols); // Check D matches A, B
     static_assert(A::rows == B::rows); // Check reduction dim is same
     static_assert(D::rows == C::rows && D::cols == C::cols); // Check D matches C
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
             std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
@@ -781,7 +891,7 @@ __device__ static inline void mma_AtBt(D &d,
     static_assert(D::rows == A::cols && D::cols == B::rows); // Check D matches A, B
     static_assert(A::rows == B::cols); // Check reduction dim is same
     static_assert(D::rows == C::rows && D::cols == C::cols); // Check D matches C
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
             std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||

@@ -52,7 +52,7 @@ void kernel(const __grid_constant__ typename lcsft::layout::globals globals) {
     constexpr int NUM_CONSUMER_WARPS = detail::NUM_CONSUMER_WARPS_v<lcsft>;
     constexpr int NUM_PRODUCER_WARPS = detail::NUM_PRODUCER_WARPS_v<lcsft>;
 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     constexpr int NCTA_TENSOR_ALLOC = detail::CLUSTER_BLOCKS_v<lcsft> > 1 ? 2 : 1;
     tensor_allocator<detail::NUM_BLOCKS_v<lcsft>, NCTA_TENSOR_ALLOC> tensor_alloc{};
 #endif
@@ -136,7 +136,7 @@ void kernel(const __grid_constant__ typename lcsft::layout::globals globals) {
         producer_state p_state;
         for(int task_iter = 0; true; task_iter++) {
             int num_iters = 0;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem, tensor_alloc};
 #else
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem};
@@ -184,7 +184,7 @@ void kernel(const __grid_constant__ typename lcsft::layout::globals globals) {
         consumer_state c_state;
         for(int task_iter = 0; true; task_iter++) {
             int num_iters = 0;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem, tensor_alloc};
 #else
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem};
@@ -219,7 +219,7 @@ void kernel(const __grid_constant__ typename lcsft::layout::globals globals) {
     } // consumer warpgroup
     // all warps must arrive here, confirming semaphore initialization is visible to all threads.
     if constexpr (detail::CLUSTER_BLOCKS_v<lcsft> > 1) everyone::tma::cluster::sync();
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     else everyone::sync(15);
 #endif
 }

@@ -1,4 +1,4 @@
-GPU := H100
+ARCH := SM90
 
 # Producer-consumer kernel + PyTorch extension mode
 SRC := fftconv_pc.cu

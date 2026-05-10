@@ -1,8 +1,8 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-gpu = os.environ.get("GPU", "")
-assert gpu == "B200" or gpu == "H100", "GPU must be set to B200 or H100"
+arch = os.environ.get("ARCH", "")
+assert arch == "SM100" or arch == "SM90", "ARCH must be set to SM100 or SM90"
 
 import torch
 
@@ -24,7 +24,7 @@ def nccl_matmul_reduce_scatter_func(
     B: torch.Tensor,
     C: torch.Tensor
 ) -> None:
-    intermediate = torch.matmul(A, B if gpu == "H100" else B.T)
+    intermediate = torch.matmul(A, B if arch == "SM90" else B.T)
     torch.distributed.reduce_scatter_tensor(C, intermediate, op=torch.distributed.ReduceOp.SUM)
 
 
@@ -49,9 +49,9 @@ def run(
     do_profile: bool = False
 ) -> None:
     A = torch.randn(M, K, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
-    if gpu == "H100":
+    if arch == "SM90":
         B = torch.randn(K, N, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
-    elif gpu == "B200":
+    elif arch == "SM100":
         B = torch.randn(N, K, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
     C_tk = TKParallelTensor(
         (M // local_world_size, N),

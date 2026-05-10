@@ -32,7 +32,7 @@ struct test_subtile {
     )>;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "shared_subtile_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "shared_subtile_gmem=half" :
-                                                      #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+                                                      #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
                                                       std::is_same_v<T, kittens::fp8e4m3> ? "shared_subtile_gmem=fp8e4m3" :
                                                       std::is_same_v<T, kittens::fp8e5m2> ? "shared_subtile_gmem=fp8e5m2" :
                                                       #endif

@@ -72,7 +72,7 @@ template<typename Op> __device__ inline void run_op_producer(const typename Op::
         using producers = group<NUM_PRODUCER_WARPS>;
         producer_state p_state;
         int num_iters = 0;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.tensor_alloc, ps.instruction};
 #else
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.instruction};
@@ -133,7 +133,7 @@ template<typename Op> __device__ inline void run_op_producer(const typename Op::
         using producers = group<NUM_PRODUCER_WARPS>;
         producer_state p_state;
         int num_iters = -1;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.tensor_alloc, ps.instruction};
 #else
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.instruction};
@@ -204,7 +204,7 @@ template<typename Op> __device__ inline void run_op_consumer(const typename Op::
         using consumers = group<NUM_CONSUMER_WARPS>;
         consumer_state c_state;
         int num_iters = 0;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.tensor_alloc, ps.instruction};
 #else
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.instruction};
@@ -259,7 +259,7 @@ template<typename Op> __device__ inline void run_op_consumer(const typename Op::
         using consumers = group<NUM_CONSUMER_WARPS>;
         consumer_state c_state;
         int num_iters = -1;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.tensor_alloc, ps.instruction};
 #else
         common_setup_args<L> unif{common, ps.task_iter, num_iters, globals, **scratch_smem, ps.instruction};
@@ -339,7 +339,7 @@ __global__ void kernel(const __grid_constant__ typename config::globals globals)
         timings[1][threadIdx.x] = 0;
     }
 #endif
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     constexpr int NCTA_TENSOR_ALLOC = detail::CLUSTER_BLOCKS_v<config> > 1 ? 2 : 1;
     tensor_allocator<1, NCTA_TENSOR_ALLOC> tensor_alloc{};
 #endif
@@ -362,7 +362,7 @@ __global__ void kernel(const __grid_constant__ typename config::globals globals)
         &outputs_finished[0],
         &finish_finished,
         0xFFFF0000, // semaphore_bitfield
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         tensor_alloc,
 #endif
 #ifdef KITTENS_TIMINGS

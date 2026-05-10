@@ -16,13 +16,11 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using T2 = RT::dtype;
     using U = typename GL::dtype;
 
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
-    static_assert(!std::is_same_v<T2, fp8e4m3_4> && !std::is_same_v<T2, fp8e5m2_4>, "Unsupported type for load/store");
-    #endif
-
     U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
     using U2 = base_types::packing<U>::packed_type;
+    constexpr int pack_size = base_types::packing<U2>::num();
+    constexpr int half_col = RT::tile_size_col / 2;
     int warp_laneid = threadIdx.x % WARP_THREADS;
     int local_warpid;
     if constexpr(GROUP_WARPS % 4 == 0) local_warpid = (warpid()/4+(warpid()%4)*(GROUP_WARPS/4));
@@ -33,15 +31,15 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
         int row = row_offset + i*RT::tile_size_row + (warp_laneid / 4);
         #pragma unroll
         for(int j = 0; j < RT::width; j++) {
-            int col = j*RT::tile_size_col + 2*(warp_laneid % 4);
+            int col = j*RT::tile_size_col + pack_size*(warp_laneid % 4);
             dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(*(U2*)(&src_ptr[(row+0)*row_stride + (col+0)]));
-            dst.tiles[i][j].data[2] = base_types::convertor<T2, U2>::convert(*(U2*)(&src_ptr[(row+0)*row_stride + (col+8)]));
+            dst.tiles[i][j].data[2] = base_types::convertor<T2, U2>::convert(*(U2*)(&src_ptr[(row+0)*row_stride + (col+half_col)]));
         }
         #pragma unroll
         for(int j = 0; j < RT::width; j++) {
-            int col = j*RT::tile_size_col + 2*(warp_laneid % 4);
+            int col = j*RT::tile_size_col + pack_size*(warp_laneid % 4);
             dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(*(U2*)(&src_ptr[(row+8)*row_stride + (col+0)]));
-            dst.tiles[i][j].data[3] = base_types::convertor<T2, U2>::convert(*(U2*)(&src_ptr[(row+8)*row_stride + (col+8)]));
+            dst.tiles[i][j].data[3] = base_types::convertor<T2, U2>::convert(*(U2*)(&src_ptr[(row+8)*row_stride + (col+half_col)]));
         }
     }
 }
@@ -58,7 +56,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using T = typename RT::T;
     using U = typename GL::dtype;
 
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<T, fp8e5m2>, "Unsupported type for load/store");
     #endif
 
@@ -115,13 +113,11 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     using T2 = RT::dtype;
     using U = typename GL::dtype;
 
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
-    static_assert(!std::is_same_v<T2, fp8e4m3_4> && !std::is_same_v<T2, fp8e5m2_4>, "Unsupported type for load/store");
-    #endif
-
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();
     using U2 = base_types::packing<U>::packed_type;
+    constexpr int pack_size = base_types::packing<U2>::num();
+    constexpr int half_col = RT::tile_size_col / 2;
     int warp_laneid = threadIdx.x % WARP_THREADS;
     int local_warpid;
     if constexpr(GROUP_WARPS % 4 == 0) local_warpid = (warpid()/4+(warpid()%4)*(GROUP_WARPS/4));
@@ -132,15 +128,15 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
         int row = row_offset + i*RT::tile_size_row + (warp_laneid / 4);
         #pragma unroll
         for(int j = 0; j < RT::width; j++) {
-            int col = j*RT::tile_size_col + 2*(warp_laneid % 4);
+            int col = j*RT::tile_size_col + pack_size*(warp_laneid % 4);
             *(U2*)(&dst_ptr[(row+0)*row_stride + (col+0)]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[0]);
-            *(U2*)(&dst_ptr[(row+0)*row_stride + (col+8)]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[2]);
+            *(U2*)(&dst_ptr[(row+0)*row_stride + (col+half_col)]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[2]);
         }
         #pragma unroll
         for(int j = 0; j < RT::width; j++) {
-            int col = j*RT::tile_size_col + 2*(warp_laneid % 4);
+            int col = j*RT::tile_size_col + pack_size*(warp_laneid % 4);
             *(U2*)(&dst_ptr[(row+8)*row_stride + (col+0)]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1]);
-            *(U2*)(&dst_ptr[(row+8)*row_stride + (col+8)]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[3]);
+            *(U2*)(&dst_ptr[(row+8)*row_stride + (col+half_col)]) = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[3]);
         }
     }
 }
@@ -157,7 +153,7 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     using T = base_types::packing<typename RT::dtype>::unpacked_type;
     using U = typename GL::dtype;
 
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(!std::is_same_v<T, fp8e4m3_4> && !std::is_same_v<T, fp8e5m2_4>, "Unsupported type for load/store");
     #endif
     

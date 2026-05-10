@@ -12,7 +12,7 @@ struct persistent_state {
     int max_finish_offset;
     kittens::semaphore *inputs_arrived, *outputs_arrived, *inputs_finished, *outputs_finished, *finish_finished;
     uint32_t semaphore_bitfield;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     tensor_allocator<1, 1> &tensor_alloc;
 #endif
 #ifdef KITTENS_TIMINGS
@@ -29,7 +29,7 @@ template<kittens_layout T> struct uniform_args {
     int & num_iters; // how many iters are there for this task?
     const typename CKL::globals_t & globals;
     typename CKL::scratch_block_t & scratch;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     tensor_allocator<1, 1> &tensor_alloc;
 #endif
 #ifdef KITTENS_TIMINGS
@@ -42,7 +42,7 @@ template<kittens_layout T> struct uniform_args {
         int & _num_iters,
         const typename CKL::globals_t& _globals,
         typename CKL::scratch_block_t& _scratch,
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         tensor_allocator<1, 1> &_tensor_alloc,
 #endif
         int * _instruction
@@ -51,7 +51,7 @@ template<kittens_layout T> struct uniform_args {
         num_iters(_num_iters),
         globals(_globals),
         scratch(_scratch),
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         tensor_alloc(_tensor_alloc),
 #endif
         instruction(_instruction) {}
@@ -61,7 +61,7 @@ template<kittens_layout T> struct uniform_args {
         num_iters(_args.num_iters),
         globals(_args.globals),
         scratch(_args.scratch),
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
         tensor_alloc(_args.tensor_alloc),
 #endif
 #ifdef KITTENS_TIMINGS

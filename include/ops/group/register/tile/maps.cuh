@@ -562,6 +562,60 @@ __device__ static inline T relu(const T &src) {
 }
 
 /**
+ * @brief Negates each element of a tile.
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile to negate.
+ */
+template<ducks::rt::all T>
+__device__ static inline void neg(T &dst, const T &src) {
+    unary_map<base_ops::neg, T>(dst, src);
+}
+template<ducks::rt::all T>
+__device__ static inline T neg(const T &src) {
+    T dst;
+    neg(dst, src);
+    return dst;
+}
+
+/**
+ * @brief Applies the square root function to each element of a tile.
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile to apply the square root function on.
+ */
+template<ducks::rt::all T>
+__device__ static inline void sqrt(T &dst, const T &src) {
+    unary_map<base_ops::sqrt, T>(dst, src);
+}
+template<ducks::rt::all T>
+__device__ static inline T sqrt(const T &src) {
+    T dst;
+    sqrt(dst, src);
+    return dst;
+}
+
+/**
+ * @brief Applies the reciprocal square root function to each element of a tile.
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile to apply the reciprocal square root function on.
+ */
+template<ducks::rt::all T>
+__device__ static inline void rsqrt(T &dst, const T &src) {
+    unary_map<base_ops::rsqrt, T>(dst, src);
+}
+template<ducks::rt::all T>
+__device__ static inline T rsqrt(const T &src) {
+    T dst;
+    rsqrt(dst, src);
+    return dst;
+}
+
+/**
  * @brief Copies the elements from one tile to another.
  *
  * @tparam T Destination tile type.

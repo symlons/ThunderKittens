@@ -4,13 +4,13 @@ Each directory contains a single operator (e.g., fused all-gather GEMM). All ker
 
 ## How to run
 
-First export the `GPU` environment variable.
+First export the `ARCH` environment variable.
 
 ```bash
-export GPU=H100 # or B200
+export ARCH=SM90 # or SM100
 ```
 
-Note that B200 is supported if the directory includes a `*_b200.cu` file or a file with no GPU-specific suffix. Likewise, H100 is supported if the directory includes a `*_h100.cu` file or a file with no GPU-specific suffix
+Note that SM100 (Blackwell) is supported if the directory includes a `*_b200.cu` file or a file with no architecture-specific suffix. Likewise, SM90 (Hopper) is supported if the directory includes a `*_h100.cu` file or a file with no architecture-specific suffix.
 
 ```bash
 cd <directory> # navigate to the desired operator directory

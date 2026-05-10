@@ -1,4 +1,4 @@
-GPU := H100
+ARCH := SM90
 
 # Flux gate + PyTorch extension mode
 SRC := flux_gate.cu

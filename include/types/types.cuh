@@ -8,10 +8,10 @@
 #include "register/register.cuh"
 #include "shared/shared.cuh"
 #include "global/global.cuh"
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 #include "system/system.cuh"
 #endif
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
 #include "tensor/tensor.cuh"
 #endif
 

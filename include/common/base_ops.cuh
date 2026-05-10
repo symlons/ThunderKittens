@@ -177,6 +177,54 @@ template<> __device__ inline bf16_2 relu::op<bf16_2>(const bf16_2 &x) { return _
 template<> __device__ inline half   relu::op<half>  (const half &x  ) { return __hmax(x, base_types::constants<half>::zero());    }
 template<> __device__ inline half_2 relu::op<half_2>(const half_2 &x) { return __hmax2(x, base_types::constants<half_2>::zero()); }
 /**
+ * @brief Negation operation.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return The negated value.
+ */
+struct neg {
+    template<typename T> static __device__ inline T op(const T &x) { return -x; }
+};
+template<> __device__ inline float   neg::op<float>  (const float &x  ) { return -x;                              }
+template<> __device__ inline float2  neg::op<float2> (const float2 &x ) { return float2{-x.x, -x.y};             }
+template<> __device__ inline bf16    neg::op<bf16>   (const bf16 &x   ) { return __hneg(x);                       }
+template<> __device__ inline bf16_2  neg::op<bf16_2> (const bf16_2 &x ) { return __hneg2(x);                      }
+template<> __device__ inline half    neg::op<half>   (const half &x   ) { return __hneg(x);                       }
+template<> __device__ inline half_2  neg::op<half_2> (const half_2 &x ) { return __hneg2(x);                      }
+/**
+ * @brief Square root operation.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return The square root of the input value.
+ */
+struct sqrt {
+    template<typename T> static __device__ inline T op(const T &x) { return sqrt(x); }
+};
+template<> __device__ inline float   sqrt::op<float>  (const float &x  ) { return sqrtf(x);                       }
+template<> __device__ inline float2  sqrt::op<float2> (const float2 &x ) { return float2{sqrtf(x.x), sqrtf(x.y)}; }
+template<> __device__ inline bf16    sqrt::op<bf16>   (const bf16 &x   ) { return hsqrt(x);                       }
+template<> __device__ inline bf16_2  sqrt::op<bf16_2> (const bf16_2 &x ) { return h2sqrt(x);                      }
+template<> __device__ inline half    sqrt::op<half>   (const half &x   ) { return hsqrt(x);                       }
+template<> __device__ inline half_2  sqrt::op<half_2> (const half_2 &x ) { return h2sqrt(x);                      }
+/**
+ * @brief Reciprocal square root operation.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return The reciprocal square root of the input value.
+ */
+struct rsqrt {
+    template<typename T> static __device__ inline T op(const T &x) { return rsqrt(x); }
+};
+template<> __device__ inline float   rsqrt::op<float>  (const float &x  ) { return rsqrtf(x);                         }
+template<> __device__ inline float2  rsqrt::op<float2> (const float2 &x ) { return float2{rsqrtf(x.x), rsqrtf(x.y)}; }
+template<> __device__ inline bf16    rsqrt::op<bf16>   (const bf16 &x   ) { return hrsqrt(x);                         }
+template<> __device__ inline bf16_2  rsqrt::op<bf16_2> (const bf16_2 &x ) { return h2rsqrt(x);                        }
+template<> __device__ inline half    rsqrt::op<half>   (const half &x   ) { return hrsqrt(x);                         }
+template<> __device__ inline half_2  rsqrt::op<half_2> (const half_2 &x ) { return h2rsqrt(x);                        }
+/**
  * @brief Copy operation.
  *
  * This operation returns the input value unchanged.
@@ -219,7 +267,7 @@ struct sum {
     template<typename T> static __device__ inline T op(const T &a, const T &b) { return a+b; }
 };
 template<> __device__ inline float2 sum::op<float2>(const float2 &a, const float2 &b) {
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     float2 c;
     asm volatile("add.f32x2 %0, %1, %2;" : "=l"(*(uint64_t*)&c) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&b));
     return c;
@@ -245,7 +293,7 @@ struct sub {
     template<typename T> static __device__ inline T op(const T &a, const T &b) { return a-b; }
 };
 template<> __device__ inline float2 sub::op<float2>(const float2 &a, const float2 &b) { 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     float2 c;
     asm volatile("sub.f32x2 %0, %1, %2;" : "=l"(*(uint64_t*)&c) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&b));
     return c;
@@ -271,7 +319,7 @@ struct mul {
     template<typename T> static __device__ inline T op(const T &a, const T &b) { return a*b; }
 };
 template<> __device__ inline float2 mul::op<float2>(const float2 &a, const float2 &b) { 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     float2 c;
     asm volatile("mul.f32x2 %0, %1, %2;" : "=l"(*(uint64_t*)&c) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&b));
     return c;
@@ -358,7 +406,7 @@ struct fma_AxBtC {
     }
 };
 template<> __device__ inline float2 fma_AxBtC::op<float2>(const float2 &a, const float2 &b, const float2 &c) {
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     float2 d;
     asm volatile("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(*(uint64_t*)&d) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&b), "l"(*(uint64_t*)&c));
     return d;
@@ -384,7 +432,7 @@ struct fma_AxCtB { // this is the one needed for attention
     }
 };
 template<> __device__ inline float2 fma_AxCtB::op<float2>(const float2 &a, const float2 &b, const float2 &c) {
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     float2 d;
     asm volatile("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(*(uint64_t*)&d) : "l"(*(uint64_t*)&a), "l"(*(uint64_t*)&c), "l"(*(uint64_t*)&b));
     return d;

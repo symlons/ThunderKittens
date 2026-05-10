@@ -214,7 +214,7 @@ __device__ static inline void copy(rt_base<T, layout> &dst, const rt_base<U, lay
         dst.data[k] = base_types::convertor<T2, U2>::convert(src.data[k]);
     }
 }
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
  * @brief Copies a register tile, converting the underlying type if necessary.
  *
@@ -409,7 +409,7 @@ template<ducks::rt::row_layout RT>
 __device__ static inline void make_causal(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     KITTENS_CHECK_WARP
     const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(!std::is_same_v<typename RT::dtype, fp8e4m3_4> && !std::is_same_v<typename RT::dtype, fp8e5m2_4>, "Unsupported type for make_causal");
     #endif
     #pragma unroll
@@ -470,7 +470,7 @@ template<ducks::rt::row_layout RT>
 __device__ static inline void make_causal_t(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     KITTENS_CHECK_WARP
     const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
-    #if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+    #if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(!std::is_same_v<typename RT::dtype, fp8e4m3_4> && !std::is_same_v<typename RT::dtype, fp8e5m2_4>, "Unsupported type for make_causal");
     #endif
     #pragma unroll

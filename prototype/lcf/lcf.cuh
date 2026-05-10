@@ -22,7 +22,7 @@ template<typename lcft> concept kernel_template = requires {
 
 template<typename lcft> // load-compute-store-finish template
 __global__ __launch_bounds__(detail::NUM_THREADS_v<lcft>, detail::NUM_BLOCKS_v<lcft>)
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
 __cluster_dims__(detail::CLUSTER_BLOCKS_v<lcft>)
 #endif
 void kernel(const __grid_constant__ typename lcft::layout::globals globals) {
@@ -47,7 +47,7 @@ void kernel(const __grid_constant__ typename lcft::layout::globals globals) {
     constexpr int NUM_CONSUMER_WARPS = detail::NUM_CONSUMER_WARPS_v<lcft>;
     constexpr int NUM_PRODUCER_WARPS = detail::NUM_PRODUCER_WARPS_v<lcft>;
 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     constexpr int NCTA_TENSOR_ALLOC = detail::CLUSTER_BLOCKS_v<lcft> > 1 ? 2 : 1;
     tensor_allocator<detail::NUM_BLOCKS_v<lcft>, NCTA_TENSOR_ALLOC> tensor_alloc{};
 #endif
@@ -119,7 +119,7 @@ void kernel(const __grid_constant__ typename lcft::layout::globals globals) {
         producer_state p_state;
         for(int task_iter = 0; true; task_iter++) {
             int num_iters = -1;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem, tensor_alloc};
 #else
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem};
@@ -153,7 +153,7 @@ void kernel(const __grid_constant__ typename lcft::layout::globals globals) {
         consumer_state c_state;
         for(int task_iter = 0; true; task_iter++) {
             int num_iters = -1;
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem, tensor_alloc};
 #else
             common_setup_args<L> unif{common, task_iter, num_iters, globals, *scratch_smem};
@@ -213,7 +213,7 @@ void kernel(const __grid_constant__ typename lcft::layout::globals globals) {
     } // consumer warpgroup
     // all warps must arrive here, confirming semaphore initialization is visible to all threads.
     if constexpr (detail::CLUSTER_BLOCKS_v<lcft> > 1) everyone::tma::cluster::sync();
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
     else everyone::sync(15);
 #endif
 }

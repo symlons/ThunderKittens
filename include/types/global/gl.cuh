@@ -8,7 +8,7 @@
 #include "../../common/common.cuh"
 #include "../shared/shared.cuh"
 #include "util.cuh"
-#if (defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)) && !defined(KITTENS_NO_HOST)
+#if (defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)) && !defined(KITTENS_NO_HOST)
 #include "tma.cuh"
 #endif
 
@@ -25,7 +25,7 @@ struct dim {
 
 /* ----------   Associative dictionary for global layouts  ---------- */
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 namespace ducks {
 namespace tma {
 namespace descriptor {
@@ -67,7 +67,7 @@ struct descriptor_dict {
     template<typename T> __host__ descriptor_dict(T _, int b, int d, int r, int c) {}
 #endif
     __host__ __device__ descriptor_dict(const descriptor_dict &other) {}
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     template<typename T, int U> __device__ const CUtensorMap* get() const {
         static_assert(
             std::is_same_v<T, std::true_type> && std::is_same_v<T, std::false_type>,
@@ -78,7 +78,7 @@ struct descriptor_dict {
 #endif
 };
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<typename _T, typename... Args>
 struct descriptor_dict<_T, Args...> {
     static_assert(ducks::sv::all<_T> || ducks::st::all<_T> || ducks::tma::descriptor::all<_T>, "Must be a shared TK type to generate a TMA descriptor.");
@@ -111,7 +111,7 @@ struct identifier {};
 
 template<typename _T, int b, int d, int r, int c, typename... TMA_Types>
 struct gl {
-#ifdef KITTENS_BLACKWELL
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(!std::is_same_v<_T, fp4e2m1>, "For FP4 types, you must use a packed type (i.e., fp4e2m1_2 or fp4e2m1_4).");
 #endif
     using identifier = ducks::gl::identifier;
@@ -161,7 +161,7 @@ struct gl {
 #endif
     __host__ __device__ inline gl(const gl &other) :
             raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal), tma_descs(other.tma_descs) {}
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     template<typename U, int axis> __device__ inline const CUtensorMap* get_tma() const {
         return tma_descs.template get<U, axis>();
     }

@@ -1,8 +1,8 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-gpu = os.environ.get("GPU", "")
-assert gpu == "B200" or gpu == "H100", "GPU must be set to B200 or H100"
+arch = os.environ.get("ARCH", "")
+assert arch == "SM100" or arch == "SM90", "ARCH must be set to SM100 or SM90"
 
 import torch
 
@@ -26,7 +26,7 @@ def nccl_all_gather_matmul_func(
     C: torch.Tensor
 ) -> None:
     torch.distributed.all_gather_into_tensor(A, A_local)
-    torch.matmul(A, B if gpu == "H100" else B.T, out=C)
+    torch.matmul(A, B if arch == "SM90" else B.T, out=C)
 
 
 def tk_all_gather_matmul_func(
@@ -62,9 +62,9 @@ def run(
     # Note: this is ONLY for convenience; separating A and A_local does NOT affect performance
     A_tk.data_[local_rank * (M // local_world_size):(local_rank + 1) * (M // local_world_size)] = A_local
     A_nccl = torch.zeros(M, K, dtype=torch.bfloat16, device=f"cuda:{local_rank}")
-    if gpu == "H100":
+    if arch == "SM90":
         B = torch.randn(K, N, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
-    elif gpu == "B200":
+    elif arch == "SM100":
         B = torch.randn(N, K, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
     C_tk = torch.zeros(M, N, dtype=torch.bfloat16, device=f"cuda:{local_rank}")
     C_nccl = torch.zeros(M, N, dtype=torch.bfloat16, device=f"cuda:{local_rank}")

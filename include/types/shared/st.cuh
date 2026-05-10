@@ -57,7 +57,7 @@ struct st_subtile;
  */
 template<typename _T, int _rows, int _cols, bool _swizzle=true, int _swizzle_bytes=0>
 struct KITTENS_DEFAULT_ALIGN st {
-#ifdef KITTENS_BLACKWELL
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     static_assert(!std::is_same_v<_T, fp4e2m1>, "For FP4 types, you must use a packed type (i.e., fp4e2m1_2 or fp4e2m1_4).");
 #endif
     using identifier = ducks::st::identifier; ///< Type identifier for shared memory tile.
@@ -79,7 +79,7 @@ struct KITTENS_DEFAULT_ALIGN st {
     static_assert(!swizzle || (rows % kittens::TILE_ROW_DIM<T> == 0), "Rows must be divisible by the tile dimension");
     static_assert((swizzle && (cols % kittens::TILE_COL_DIM<T> == 0)) || (!swizzle && (cols % kittens::BASE_TILE_DIM == 0)), "Cols must be divisible by the tile dimension");
 
-#ifdef KITTENS_BLACKWELL
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     // Must be a 1-packed type (e.g. float, bf16, etc) unless fp4
     static_assert(base_types::packing<dtype>::num() == 1 || std::is_same_v<dtype, fp4e2m1_2>); 
 #else
@@ -315,13 +315,19 @@ template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0>
 using st_hf = st<half,  _height, _width, _swizzle, _swizzle_bytes>;
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fl = st<float, _height, _width, _swizzle, _swizzle_bytes>;
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
+using st_int8 = st<int8, _height, _width, _swizzle, _swizzle_bytes>;
+template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
+using st_uint8 = st<uint8, _height, _width, _swizzle, _swizzle_bytes>;
+template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
+using st_int = st<int, _height, _width, _swizzle, _swizzle_bytes>;
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fp8e4m3 = st<fp8e4m3, _height, _width, _swizzle, _swizzle_bytes>;
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fp8e5m2 = st<fp8e5m2, _height, _width, _swizzle, _swizzle_bytes>;
 #endif
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
 using st_fp8e8m0 = st<fp8e8m0, _height, _width, _swizzle, _swizzle_bytes>;
 template<int _height, int _width, bool _swizzle=true, int _swizzle_bytes=0> 
@@ -341,13 +347,13 @@ __device__ constexpr const char* get_tile_type_name() {
         return "st_hf";
     } else if constexpr (std::is_same_v<T, bf16>) {
         return "st_bf";
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     } else if constexpr (std::is_same_v<T, fp4e2m1_2>) {
         return "st_fp4_e2m1_2";
     } else if constexpr (std::is_same_v<T, fp8e8m0>) {
         return "st_fp8_e8m0";
 #endif
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
     } else if constexpr (std::is_same_v<T, fp8e4m3>) {
         return "st_fp8_e4m3";
     } else if constexpr (std::is_same_v<T, fp8e5m2>) {
@@ -358,7 +364,7 @@ __device__ constexpr const char* get_tile_type_name() {
     }
 }
 
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 /**
  * @brief Print the contents of a shared tile as a formatted table.
  * 
@@ -446,13 +452,13 @@ __device__ inline void print(const ST& tile) {
                 printf("%8.3f ", __bfloat162float(tile[{r,c}]));
             } else if constexpr (std::is_integral_v<typename ST::dtype>) {
                 printf("%8d ", (int)tile[{r,c}]);
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             } else if constexpr (std::is_same_v<typename ST::dtype, fp8e4m3>) {
                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
             } else if constexpr (std::is_same_v<typename ST::dtype, fp8e5m2>) {
                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
 #endif
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             } else if constexpr (std::is_same_v<typename ST::dtype, fp8e8m0>) {
                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
 #endif
@@ -533,7 +539,7 @@ __device__ inline void fill_value(ST& tile, float value) {
                 tile[{r,c}] = value;
             } else if constexpr (std::is_same_v<typename ST::dtype, __nv_bfloat16>) {
                 tile[{r,c}] = __float2bfloat16(value);
-#if defined(KITTENS_BLACKWELL)  
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             } else if constexpr (std::is_same_v<typename ST::dtype, fp4e2m1>) {
                 tile.data[r*ST::cols + c] = fp4e2m1(value);
             } else if constexpr (std::is_same_v<typename ST::dtype, fp8e8m0>) {
@@ -567,7 +573,7 @@ __device__ inline void fill_identity(ST& tile) {
             } else if constexpr (std::is_same_v<typename ST::dtype, __nv_bfloat16>) {
                 // printf("%8.3f ", __bfloat162float(tile[{r,c}]));
                 tile[{r,c}] = __float2bfloat16(1.0f);
-#if defined(KITTENS_BLACKWELL)  
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             } else if constexpr (std::is_same_v<typename ST::dtype, fp4e2m1>) {
                 if(r == c){
                     // tile[{r,c}] = std::bit_cast<fp4e2m1>(uint8_t(0xFF));
@@ -620,7 +626,7 @@ __device__ inline void print_bits(const ST& tile, bool unswizzle = false) {
                 printf("%8.3f ", __bfloat162float(tile[{r,c}]));
             // } else if constexpr (std::is_integral_v<typename ST::dtype>) {
             //     printf("%8d ", (int)tile[{r,c}]);
-#if defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
             } else if constexpr (std::is_same_v<typename ST::dtype, fp4e2m1> || std::is_same_v<typename ST::dtype, fp8e8m0>) {
                 // print as bitfield
 

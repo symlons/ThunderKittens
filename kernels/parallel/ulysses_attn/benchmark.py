@@ -9,8 +9,8 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-gpu = os.environ.get("GPU", "")
-assert gpu == "B200" or gpu == "H100", "GPU must be set to B200 or H100"
+arch = os.environ.get("ARCH", "")
+assert arch == "SM100" or arch == "SM90", "ARCH must be set to SM100 or SM90"
 
 from flash_attn.cute.interface import _flash_attn_fwd
 

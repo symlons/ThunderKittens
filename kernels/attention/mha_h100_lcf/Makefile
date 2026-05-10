@@ -1,4 +1,4 @@
-GPU := H100
+ARCH := SM90
 SRC := mha_h100_lcf.cu
 OUT := mha_h100_lcf.out
 CMD := python gentests.py randn; ./mha_h100_lcf.out randn_3072_128.txt

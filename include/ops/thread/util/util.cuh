@@ -6,7 +6,7 @@
 #pragma once
 
 #include "sync.cuh"
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 #include "tma.cuh"
 #endif
 
@@ -166,7 +166,7 @@ template<> struct move<float4> {
         asm volatile("st.global.v4.f32 [%4], {%0, %1, %2, %3};\n" : : "f"(src.x), "f"(src.y), "f"(src.z), "f"(src.w), "l"(dst));
     }
 };
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<> struct move<fp8e4m3_4> {
     __device__ static inline void ldsm4(fp8e4m3_4& dst1, fp8e4m3_4& dst2, fp8e4m3_4& dst3, fp8e4m3_4& dst4, uint32_t src) {
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n" :
@@ -184,6 +184,26 @@ template<> struct move<fp8e5m2_4> {
                      "=r"(*(uint32_t*)&dst1),  "=r"(*(uint32_t*)&dst2), "=r"(*(uint32_t*)&dst3), "=r"(*(uint32_t*)&dst4) : "r"(src));
     }
     __device__ static inline void stsm4(uint32_t dst, fp8e5m2_4& src1, fp8e5m2_4& src2, fp8e5m2_4& src3, fp8e5m2_4& src4) {
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 [%4], {%0, %1, %2, %3};\n" ::
+                     "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
+    }
+};
+template<> struct move<int8_4> {
+    __device__ static inline void ldsm4(int8_4& dst1, int8_4& dst2, int8_4& dst3, int8_4& dst4, uint32_t src) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n" :
+                     "=r"(*(uint32_t*)&dst1),  "=r"(*(uint32_t*)&dst2), "=r"(*(uint32_t*)&dst3), "=r"(*(uint32_t*)&dst4) : "r"(src));
+    }
+    __device__ static inline void stsm4(uint32_t dst, int8_4& src1, int8_4& src2, int8_4& src3, int8_4& src4) {
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 [%4], {%0, %1, %2, %3};\n" ::
+                     "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
+    }
+};
+template<> struct move<uint8_4> {
+    __device__ static inline void ldsm4(uint8_4& dst1, uint8_4& dst2, uint8_4& dst3, uint8_4& dst4, uint32_t src) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n" :
+                     "=r"(*(uint32_t*)&dst1),  "=r"(*(uint32_t*)&dst2), "=r"(*(uint32_t*)&dst3), "=r"(*(uint32_t*)&dst4) : "r"(src));
+    }
+    __device__ static inline void stsm4(uint32_t dst, uint8_4& src1, uint8_4& src2, uint8_4& src3, uint8_4& src4) {
         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared::cta.b16 [%4], {%0, %1, %2, %3};\n" ::
                      "r"(*(uint32_t*)&src1), "r"(*(uint32_t*)&src2), "r"(*(uint32_t*)&src3), "r"(*(uint32_t*)&src4), "r"(dst));
     }
@@ -212,7 +232,7 @@ template<cache_policy policy> __device__ inline uint64_t make_cache_policy() {
 
 /* CLC scheduler operations */
 
-#ifdef KITTENS_BLACKWELL
+#if defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 
 namespace clc {
 
@@ -270,7 +290,7 @@ __device__ static inline result query(handle &h) {
 
 #endif
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 
 /**
  * @brief Programmatic Dependent Kernel Launch (PDL) utilities. Available on Hopper and later.

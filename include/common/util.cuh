@@ -63,10 +63,12 @@ __device__ __forceinline__ int smid() {
     return static_cast<int>(r);
 }
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM80)
+constexpr int MAX_SHARED_MEMORY = 163 * 1024;
+#elif defined(KITTENS_SM90) || defined(KITTENS_SM10X)
 constexpr int MAX_SHARED_MEMORY = 227 * 1024;
-#elif defined(KITTENS_AMPERE)
-constexpr int MAX_SHARED_MEMORY = 164 * 1024;
+#elif defined(KITTENS_SM120)
+constexpr int MAX_SHARED_MEMORY = 99 * 1024;
 #endif
 
 struct transpose {
@@ -175,7 +177,7 @@ __device__ inline float2 packed_shfl_sync<float2>(uint32_t mask, const float2 &f
 #define KITTENS_ALIGN_AS(n) alignas(n)
 #endif
 
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 #define KITTENS_DEFAULT_ALIGN KITTENS_ALIGN_AS(128)
 #else
 #define KITTENS_DEFAULT_ALIGN KITTENS_ALIGN_AS(16)
@@ -201,7 +203,7 @@ struct KITTENS_DEFAULT_ALIGN alignment_dummy { int dummy; };
  * @brief Very simple allocator for dynamic shared memory. Advances pointer and tracks alignments.
  * @tparam default_alignment The default alignment this allocator will enforce. If <=0 (default -1) it will not align.
  */
-#if defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL)
+#if defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120)
 template<int default_alignment=1024> 
 #else
 template<int default_alignment=16> 
@@ -273,7 +275,7 @@ public:
     }
 };
 
-#if (defined(KITTENS_HOPPER) || defined(KITTENS_BLACKWELL))
+#if (defined(KITTENS_SM90) || defined(KITTENS_SM10X) || defined(KITTENS_SM120))
 /**
  * @brief A wrapper for an allocator that enforces sufficient alignment to be used for TMA loads and stores.
  */

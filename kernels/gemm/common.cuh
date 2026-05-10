@@ -211,7 +211,7 @@ static inline void reference_blockscaled_gemm(
 // A: RowMajor (M x K) packed as Mx(K/2), B: ColMajor (N x K) packed as Nx(K/2), D: RowMajor (M x N)
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-#ifdef KITTENS_BLACKWELL
+#ifdef KITTENS_SM10X
 
 #include <cuda_fp4.h>
 
