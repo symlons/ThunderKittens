@@ -16,8 +16,9 @@ python3 smooth.py --qk all --smooth all
 python3 smooth.py --qk all --smooth all --plots --plot-qk int4 --plot-dir smooth_plots
 ```
 
-The plots include tensor magnitude heatmaps, channel-mean artifacts, and
-quantized-value histograms for the selected Q/K dtype.
+The plots include tensor magnitude heatmaps, channel-mean artifacts,
+quantized-value histograms for the selected Q/K dtype, and reconstruction QSNR
+by channel and density before and after smoothing.
 
 ## Interactive Menu
 
@@ -35,3 +36,5 @@ changing sort metrics, grouping results, and saving plots.
   data generation.
 - `smooth_report.py`: terminal tables, filtering, sorting, and grouping.
 - `smooth_viz.py`: tensor visualization helpers.
+
+Smooth K/V

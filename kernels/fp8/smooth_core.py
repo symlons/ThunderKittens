@@ -136,6 +136,102 @@ def qdq_k_per_thread(x, mode):
     return y
 
 
+def quantize_block(x, mode):
+    if mode == "int4":
+        scale = x.abs().max().clamp_min(1e-12) / int4_max
+        q = torch.round(x / scale).clamp(-int4_max, int4_max).to(torch.int8)
+        return q, scale
+
+    if mode == "int8":
+        scale = x.abs().max().clamp_min(1e-12) / int8_max
+        q = torch.round(x / scale).clamp(-int8_max, int8_max).to(torch.int8)
+        return q, scale
+
+    if mode == "fp8_e4m3":
+        scale = x.abs().max().clamp_min(1e-12) / fp8_max
+        q = (x / scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        return q, scale
+
+    raise ValueError(f"unknown quantization mode: {mode}")
+
+
+def quantize_q_per_thread(x, warp_count, mode):
+    n, _ = x.shape
+    q = torch.empty(x.shape, device=x.device, dtype=torch.int8 if mode in {"int4", "int8"} else fp8_dtype)
+    scales = torch.empty(n, 1, device=x.device, dtype=torch.float32)
+    seg = math.ceil(n / warp_count)
+
+    for w in range(warp_count):
+        base = w * seg
+        end = min(base + seg, n)
+        if base >= end:
+            continue
+        for i in range(8):
+            rows = base + torch.arange(i, end - base, 8, device=x.device)
+            if rows.numel() == 0:
+                continue
+            q_block, scale = quantize_block(x[rows], mode)
+            q[rows] = q_block
+            scales[rows] = scale
+
+    return q, scales
+
+
+def quantize_k_per_thread(x, mode):
+    n, _ = x.shape
+    q = torch.empty(x.shape, device=x.device, dtype=torch.int8 if mode in {"int4", "int8"} else fp8_dtype)
+    scales = torch.empty(n, 1, device=x.device, dtype=torch.float32)
+
+    for i in range(4):
+        idx = []
+        for k in range(math.ceil(n / 8)):
+            r0 = 8 * k + 2 * i
+            r1 = 8 * k + 2 * i + 1
+            if r0 < n:
+                idx.append(r0)
+            if r1 < n:
+                idx.append(r1)
+
+        rows = torch.tensor(idx, device=x.device)
+        if rows.numel() == 0:
+            continue
+        q_block, scale = quantize_block(x[rows], mode)
+        q[rows] = q_block
+        scales[rows] = scale
+
+    return q, scales
+
+
+def can_use_low_mm(A, B):
+    return (
+        A.is_cuda
+        and B.is_cuda
+        and A.shape[0] > 16
+        and B.shape[1] % 16 == 0
+        and A.shape[1] % 16 == 0
+    )
+
+
+def low_precision_mm(Aq, A_scale, Kq, K_scale, mode):
+    if not can_use_low_mm(Aq, Kq.T):
+        return (Aq.float() * A_scale) @ (Kq.float() * K_scale).T
+
+    if mode in {"int4", "int8"}:
+        acc = torch._int_mm(Aq.contiguous(), Kq.T.contiguous()).float()
+        return acc * A_scale * K_scale.T
+
+    if mode == "fp8_e4m3":
+        return torch._scaled_mm(
+            Aq.contiguous(),
+            Kq.T,
+            scale_a=A_scale.contiguous(),
+            scale_b=K_scale.T.contiguous(),
+            out_dtype=torch.float32,
+        )
+
+    raise ValueError(f"unknown quantization mode: {mode}")
+
+
 def fp8_quantize_p_static(p):
     return (p * fp8_max).clamp(0, fp8_max).to(fp8_dtype).to(torch.float32)
 
@@ -180,13 +276,13 @@ def quantized_scores(
         Qi = Q[qs:qe]
         q_mean = Qi.mean(dim=0, keepdim=True) if smooth_q else torch.zeros(1, head_dim, device=Q.device, dtype=Q.dtype)
         Qg = Qi - q_mean
-        Qdq = qdq_q_per_thread(Qg, warp_count, qk_mode)
+        Qq, Q_scale = quantize_q_per_thread(Qg, warp_count, qk_mode)
 
         for ks in range(0, K.shape[0], block_k):
             ke = min(ks + block_k, K.shape[0])
             Kj = Kg[ks:ke]
-            Kdq = qdq_k_per_thread(Kj, qk_mode)
-            Sij = Qdq @ Kdq.T
+            Kq, K_scale = quantize_k_per_thread(Kj, qk_mode)
+            Sij = low_precision_mm(Qq, Q_scale, Kq, K_scale, qk_mode)
 
             if smooth_q:
                 Sij = Sij + q_mean @ Kj.T
@@ -230,7 +326,7 @@ def quantized_attention(
         Qi = Q[qs:qe]
         q_mean = Qi.mean(dim=0, keepdim=True) if smooth_q else torch.zeros(1, head_dim, device=Q.device, dtype=Q.dtype)
         Qg = Qi - q_mean
-        Qdq = qdq_q_per_thread(Qg, warp_count, qk_mode)
+        Qq, Q_scale = quantize_q_per_thread(Qg, warp_count, qk_mode)
 
         m = torch.full((q_rows,), -float("inf"), device=Q.device, dtype=Q.dtype)
         l = torch.zeros((q_rows,), device=Q.device, dtype=Q.dtype)
@@ -239,9 +335,9 @@ def quantized_attention(
         for ks in range(0, K.shape[0], block_k):
             ke = min(ks + block_k, K.shape[0])
             Kj = Kg[ks:ke]
-            Kdq = qdq_k_per_thread(Kj, qk_mode)
+            Kq, K_scale = quantize_k_per_thread(Kj, qk_mode)
 
-            Sij = Qdq @ Kdq.T
+            Sij = low_precision_mm(Qq, Q_scale, Kq, K_scale, qk_mode)
             if smooth_q:
                 Sij = Sij + q_mean @ Kj.T
             Sij = Sij / math.sqrt(head_dim)
