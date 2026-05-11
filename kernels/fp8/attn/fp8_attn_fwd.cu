@@ -48,6 +48,170 @@ namespace cg = cooperative_groups;
 
 // log2(e), used to convert exp -> exp2 for the softmax fast-path.
 constexpr float LOG2E = 1.44269504089f;
+constexpr float FP8_E4M3_MAX_F = 448.0f;
+
+// -----------------------------------------------------------------------------
+// Standalone FP8 quantization kernels used by the Python test harness.
+// -----------------------------------------------------------------------------
+
+__global__ void fp8_quantize_per_token_ker(const float *__restrict__ x,
+                                           fp8e4m3 *__restrict__ xq,
+                                           float *__restrict__ descale,
+                                           int rows, int D) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float amax = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        amax = fmaxf(amax, fabsf(x[row * D + d]));
+    }
+    smem[tid] = amax;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        __syncthreads();
+    }
+
+    float s = fmaxf(smem[0] / FP8_E4M3_MAX_F, 1.0e-12f);
+    if (tid == 0) descale[row] = s;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float y = fminf(fmaxf(x[row * D + d] / s, -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        xq[row * D + d] = fp8e4m3(y);
+    }
+}
+
+__global__ void fp8_quantize_per_channel_ker(const float *__restrict__ x,
+                                             fp8e4m3 *__restrict__ xq,
+                                             float *__restrict__ descale,
+                                             int B, int H, int N, int D) {
+    extern __shared__ float smem[];
+    int ch = blockIdx.x;
+    int tid = threadIdx.x;
+    int d = ch % D;
+    int h = (ch / D) % H;
+    int b = ch / (H * D);
+    int base = ((b * H + h) * N * D) + d;
+
+    float amax = 0.0f;
+    for (int n = tid; n < N; n += blockDim.x) {
+        amax = fmaxf(amax, fabsf(x[base + n * D]));
+    }
+    smem[tid] = amax;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        __syncthreads();
+    }
+
+    float s = fmaxf(smem[0] / FP8_E4M3_MAX_F, 1.0e-12f);
+    if (tid == 0) descale[ch] = s;
+    for (int n = tid; n < N; n += blockDim.x) {
+        float y = fminf(fmaxf(x[base + n * D] / s, -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        xq[base + n * D] = fp8e4m3(y);
+    }
+}
+
+std::vector<at::Tensor> fp8_quantize_per_token(at::Tensor x) {
+    CHECK_INPUT(x);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Float, "input must be float32");
+    TORCH_CHECK(x.dim() == 4, "input must have shape (B,H,N,D)");
+    auto xc = x.contiguous();
+    int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
+    TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
+
+    auto q_opts = xc.options().dtype(at::ScalarType::Float8_e4m3fn);
+    auto s_opts = xc.options().dtype(at::kFloat);
+    at::Tensor xq = at::empty_like(xc, q_opts);
+    at::Tensor s = at::empty({B, H, N}, s_opts);
+
+    int rows = (int)(B * H * N);
+    int threads = 128;
+    size_t smem = threads * sizeof(float);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    fp8_quantize_per_token_ker<<<rows, threads, smem, stream>>>(
+        xc.data_ptr<float>(),
+        reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
+        s.data_ptr<float>(),
+        rows, (int)D);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {xq, s};
+}
+
+void fp8_quantize_per_token_out(at::Tensor x, at::Tensor xq, at::Tensor s) {
+    CHECK_INPUT(x); CHECK_INPUT(xq); CHECK_INPUT(s);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Float, "input must be float32");
+    TORCH_CHECK(xq.scalar_type() == at::ScalarType::Float8_e4m3fn, "xq must be FP8 e4m3");
+    TORCH_CHECK(s.scalar_type() == at::ScalarType::Float, "scale must be float32");
+    TORCH_CHECK(x.dim() == 4, "input must have shape (B,H,N,D)");
+    TORCH_CHECK(xq.sizes() == x.sizes(), "xq shape must match input");
+    TORCH_CHECK(s.size(0) == x.size(0) && s.size(1) == x.size(1) && s.size(2) == x.size(2),
+                "scale must have shape (B,H,N)");
+    auto xc = x.contiguous();
+    int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
+    TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
+    int rows = (int)(B * H * N);
+    int threads = 128;
+    size_t smem = threads * sizeof(float);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    fp8_quantize_per_token_ker<<<rows, threads, smem, stream>>>(
+        xc.data_ptr<float>(),
+        reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
+        s.data_ptr<float>(),
+        rows, (int)D);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+}
+
+std::vector<at::Tensor> fp8_quantize_per_channel(at::Tensor x) {
+    CHECK_INPUT(x);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Float, "input must be float32");
+    TORCH_CHECK(x.dim() == 4, "input must have shape (B,H,N,D)");
+    auto xc = x.contiguous();
+    int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
+    TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
+
+    auto q_opts = xc.options().dtype(at::ScalarType::Float8_e4m3fn);
+    auto s_opts = xc.options().dtype(at::kFloat);
+    at::Tensor xq = at::empty_like(xc, q_opts);
+    at::Tensor s = at::empty({B, H, D}, s_opts);
+
+    int channels = (int)(B * H * D);
+    int threads = 256;
+    size_t smem = threads * sizeof(float);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    fp8_quantize_per_channel_ker<<<channels, threads, smem, stream>>>(
+        xc.data_ptr<float>(),
+        reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
+        s.data_ptr<float>(),
+        (int)B, (int)H, (int)N, (int)D);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {xq, s};
+}
+
+void fp8_quantize_per_channel_out(at::Tensor x, at::Tensor xq, at::Tensor s) {
+    CHECK_INPUT(x); CHECK_INPUT(xq); CHECK_INPUT(s);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Float, "input must be float32");
+    TORCH_CHECK(xq.scalar_type() == at::ScalarType::Float8_e4m3fn, "xq must be FP8 e4m3");
+    TORCH_CHECK(s.scalar_type() == at::ScalarType::Float, "scale must be float32");
+    TORCH_CHECK(x.dim() == 4, "input must have shape (B,H,N,D)");
+    TORCH_CHECK(xq.sizes() == x.sizes(), "xq shape must match input");
+    TORCH_CHECK(s.size(0) == x.size(0) && s.size(1) == x.size(1) && s.size(2) == x.size(3),
+                "scale must have shape (B,H,D)");
+    auto xc = x.contiguous();
+    int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
+    TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
+    int channels = (int)(B * H * D);
+    int threads = 256;
+    size_t smem = threads * sizeof(float);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    fp8_quantize_per_channel_ker<<<channels, threads, smem, stream>>>(
+        xc.data_ptr<float>(),
+        reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
+        s.data_ptr<float>(),
+        (int)B, (int)H, (int)N, (int)D);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+}
 
 // -----------------------------------------------------------------------------
 // Tile dimensions
@@ -525,9 +689,9 @@ template<int D>
 struct fp8_bwd_globals {
     using G = fp8_bwd_tile_dims<D>;
 
-    // FP8 e4m3 inputs for Q, K, V, dO with per-token (per-row) scales (sq, sk,
-    // sv, sdo_row) consumed by the score-recompute mmas (S^T, dP^T) where the
-    // contraction axis is D — per-token scales factor cleanly post-mma.
+    // FP8 e4m3 inputs for Q, K, V use per-token descales (sq, sk, sv). dO
+    // and dP/dS use externally managed scalar descales broadcast through the
+    // same vector-shaped layout, matching cuDNN-style FP8 SDPA scale handling.
     //
     // Transposed FP8 copies (q_t, og_t) of shape (B, H, D, N) with per-channel
     // SR-quantized scales (sq_ch, sdo_ch) feed the gradient mmas (dV via
@@ -582,7 +746,8 @@ struct fp8_bwd_globals {
     scale_layout sq;       // [B, H,    1, N]   per-token Q scale (S^T)
     scale_layout sk;       // [B, H_kv, 1, N]   per-token K scale (S^T)
     scale_layout sv;       // [B, H_kv, 1, N]   per-token V scale (dP^T)
-    scale_layout sdo_row;  // [B, H,    1, N]   per-token dO scale (dP^T)
+    scale_layout sdo_row;  // [B, H,    1, N]   broadcast scalar dO descale
+    scale_layout sdp_row;  // [B, H,    1, N]   broadcast scalar dP/dS descale
     scale_layout sq_ch;    // [B, H,    1, D]   per-channel Q scale (q_t → dK)
     scale_layout sdo_ch;   // [B, H,    1, D]   per-channel dO scale (og_t → dV)
 
@@ -663,35 +828,26 @@ fp8_stream_add_tile(auto &reg_tile, auto &smem_vec, int tic) {
 // before the RTNE cast.
 template<bool fp8_dS_sr>
 __device__ static inline void
-fp8_dS_fake_quant(rt_fl<16, 64> &ds_block_t, uint32_t &prng_state) {
+fp8_dS_fake_quant(rt_fl<16, 64> &ds_block_t,
+                  row_vec<rt_fl<16, 64>> &ds_descale_rv,
+                  uint32_t &prng_state) {
     using vec_t = row_vec<rt_fl<16, 64>>;
-    rt_fl<16, 64> ds_abs;
-    warp::abs(ds_abs, ds_block_t);
-    vec_t ds_amax_rv;
-    warp::col_max(ds_amax_rv, ds_abs);
-
-    // scale = max / 448. Divide by max-eps to keep zero-rows zero on the
-    // round trip (we multiply back by the same scale at the end, so a
-    // zero scale would NaN; we guard with a tiny floor).
-    constexpr float fp8_e4m3_max     = 448.0f;
-    constexpr float inv_fp8_e4m3_max = 1.0f / 448.0f;
     constexpr float scale_floor      = 1e-30f;
 
-    // scale_rv = clamp(amax / 448, scale_floor, inf)
-    warp::mul(ds_amax_rv, ds_amax_rv, inv_fp8_e4m3_max);
+    // Clamp the externally supplied descale to avoid NaNs on all-zero tensors.
     #pragma unroll
     for (int i = 0; i < vec_t::outer_dim; i++) {
         #pragma unroll
         for (int j = 0; j < vec_t::inner_dim; j++) {
-            float v = ds_amax_rv[i][j].x;
-            ds_amax_rv[i][j].x = v < scale_floor ? scale_floor : v;
-            v = ds_amax_rv[i][j].y;
-            ds_amax_rv[i][j].y = v < scale_floor ? scale_floor : v;
+            float v = ds_descale_rv[i][j].x;
+            ds_descale_rv[i][j].x = v < scale_floor ? scale_floor : v;
+            v = ds_descale_rv[i][j].y;
+            ds_descale_rv[i][j].y = v < scale_floor ? scale_floor : v;
         }
     }
 
-    // y = dS / scale  (broadcast on cols = per-Q-row)
-    warp::div_col(ds_block_t, ds_block_t, ds_amax_rv);
+    // y = dS / descale  (descale is broadcast through the Q-row vector)
+    warp::div_col(ds_block_t, ds_block_t, ds_descale_rv);
 
     if constexpr (fp8_dS_sr) {
         // Per-element ULP-scaled jitter in [-0.5*ulp, 0.5*ulp).
@@ -729,8 +885,8 @@ fp8_dS_fake_quant(rt_fl<16, 64> &ds_block_t, uint32_t &prng_state) {
     warp::copy(ds_fp8, ds_block_t);
     warp::copy(ds_block_t, ds_fp8);
 
-    // Re-scale: dS_q = y_snap * scale.
-    warp::mul_col(ds_block_t, ds_block_t, ds_amax_rv);
+    // Re-scale: dS_q = y_snap * descale.
+    warp::mul_col(ds_block_t, ds_block_t, ds_descale_rv);
 }
 
 // FP8 e4m3 SR quantization of a transposed-layout (rows=K-rows, cols=Q-cols)
@@ -806,6 +962,58 @@ fp8_quant_per_K_row(rt_fl<16, 64> &block_t,
     warp::copy(block_t_fp8, block_t);
 }
 
+template<bool sr>
+__device__ static inline void
+fp8_quant_with_K_row_descale(rt_fl<16, 64> &block_t,
+                             rt_fp8e4m3<16, 64> &block_t_fp8,
+                             col_vec<rt_fl<16, 64>> &descale_cv,
+                             uint32_t &prng_state)
+{
+    using cv_t = col_vec<rt_fl<16, 64>>;
+    constexpr float scale_floor = 1e-30f;
+
+    #pragma unroll
+    for (int i = 0; i < cv_t::outer_dim; i++) {
+        #pragma unroll
+        for (int j = 0; j < cv_t::inner_dim; j++) {
+            float v = descale_cv[i][j].x;
+            descale_cv[i][j].x = v < scale_floor ? scale_floor : v;
+            v = descale_cv[i][j].y;
+            descale_cv[i][j].y = v < scale_floor ? scale_floor : v;
+        }
+    }
+
+    warp::div_row(block_t, block_t, descale_cv);
+
+    if constexpr (sr) {
+        #pragma unroll
+        for (int j = 0; j < block_t.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < block_t.packed_per_tile; k++) {
+                float2 &v = block_t.tiles[0][j].data[k];
+                prng_state ^= prng_state << 13;
+                prng_state ^= prng_state >> 17;
+                prng_state ^= prng_state << 5;
+                float u0 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
+                prng_state ^= prng_state << 13;
+                prng_state ^= prng_state >> 17;
+                prng_state ^= prng_state << 5;
+                float u1 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
+                float ay0 = fabsf(v.x); if (ay0 < 0.015625f) ay0 = 0.015625f;
+                float ay1 = fabsf(v.y); if (ay1 < 0.015625f) ay1 = 0.015625f;
+                float e0 = floorf(log2f(ay0)) - 3.0f;
+                float e1 = floorf(log2f(ay1)) - 3.0f;
+                float ulp0 = exp2f(e0); if (ulp0 < 1.953125e-3f) ulp0 = 1.953125e-3f;
+                float ulp1 = exp2f(e1); if (ulp1 < 1.953125e-3f) ulp1 = 1.953125e-3f;
+                v.x += u0 * ulp0;
+                v.y += u1 * ulp1;
+            }
+        }
+    }
+
+    warp::copy(block_t_fp8, block_t);
+}
+
 template<bool fp8_dS, bool fp8_dS_sr,
          int tile_h_qo, int tile_h, int tile_width, int D>
 __device__ static inline void
@@ -846,7 +1054,7 @@ fp8_compute_bwd_loop(
     // ---- Apply per-token scales to S^T and dP^T ---------------------
     // s_block_t / dp_block_t are rt_fl<16, 64> in transposed layout
     // (rows = K-rows, cols = Q-rows). sk/sv are per-K-row → col_vec
-    // (length 16). sq/sdo_row are per-Q-row → row_vec (length 64).
+    // (length 16). sq is per-Q-row; sdo_row is a broadcast scalar descale.
     {
         col_vec<rt_fl<16, 64>> sk_cv, sv_cv;
         row_vec<rt_fl<16, 64>> sq_rv, sdo_rv;
@@ -883,7 +1091,9 @@ fp8_compute_bwd_loop(
 
     // ---- dQ path: bf16 mma_AtB with bf16 SHADOW K ------------------
     if constexpr (fp8_dS) {
-        fp8_dS_fake_quant<fp8_dS_sr>(ds_for_dQ, prng_state);
+        row_vec<rt_fl<16, 64>> sdp_rv;
+        warp::load(sdp_rv, g.sdp_row, {blockIdx.z, blockIdx.y, 0, qo_idx});
+        fp8_dS_fake_quant<fp8_dS_sr>(ds_for_dQ, sdp_rv, prng_state);
     }
     warp::copy(ds_block_t_mma, ds_for_dQ);
     warpgroup::store(ds_smem[wg_id], ds_for_dQ);
@@ -908,7 +1118,8 @@ fp8_compute_bwd_loop(
     warp::add(vg_reg, vg_reg, vg_tmp);
 
     // ---- dK path: FP8 mma_ABt on dS^T and Q^T ----------------------
-    fp8_quant_per_K_row<fp8_dS_sr>(
+    warpgroup::load(ds_scale_cv, g.sdp_row, {blockIdx.z, blockIdx.y, 0, kv_block_idx});
+    fp8_quant_with_K_row_descale<fp8_dS_sr>(
         ds_block_t, ds_block_t_fp8, ds_scale_cv, prng_state);
     warp::load(sq_ch_rv, g.sq_ch, {blockIdx.z, blockIdx.y, 0, 0});
     warp::zero(kg_tmp);
@@ -1220,7 +1431,8 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
                       at::Tensor sq,       // fp32 (B,H,N)     per-token Q
                       at::Tensor sk,       // fp32 (B,H_kv,N)  per-token K
                       at::Tensor sv,       // fp32 (B,H_kv,N)  per-token V
-                      at::Tensor sdo_row,  // fp32 (B,H,N)     per-token dO
+                      at::Tensor sdo_row,  // fp32 (B,H,N)     broadcast scalar dO descale
+                      at::Tensor sdp_row,  // fp32 (B,H,N)     broadcast scalar dP/dS descale
                       at::Tensor sq_ch,    // fp32 (B,H,D)     per-channel Q
                       at::Tensor sdo_ch,   // fp32 (B,H,D)     per-channel dO
                       int64_t fp8_dS_mode = 0)
@@ -1234,7 +1446,8 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
     CHECK_INPUT(q_t); CHECK_INPUT(og_t); CHECK_INPUT(k_bf);
     CHECK_INPUT(o_bf); CHECK_INPUT(og_bf); CHECK_INPUT(l_vec);
     CHECK_INPUT(sq); CHECK_INPUT(sk); CHECK_INPUT(sv);
-    CHECK_INPUT(sdo_row); CHECK_INPUT(sq_ch); CHECK_INPUT(sdo_ch);
+    CHECK_INPUT(sdo_row); CHECK_INPUT(sdp_row);
+    CHECK_INPUT(sq_ch); CHECK_INPUT(sdo_ch);
 
     auto batch    = q.size(0);
     auto qo_heads = q.size(1);
@@ -1273,6 +1486,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
     float   *d_sk   = sk.data_ptr<float>();
     float   *d_sv   = sv.data_ptr<float>();
     float   *d_sdor = sdo_row.data_ptr<float>();
+    float   *d_sdpr = sdp_row.data_ptr<float>();
     float   *d_sqch = sq_ch.data_ptr<float>();
     float   *d_sdoch= sdo_ch.data_ptr<float>();
 
@@ -1349,6 +1563,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
         sl_  sk_arg  {d_sk,    (size_t)batch, (size_t)kv_heads, nullptr, (size_t)seq_len};
         sl_  sv_arg  {d_sv,    (size_t)batch, (size_t)kv_heads, nullptr, (size_t)seq_len};
         sl_  sdor_arg{d_sdor,  (size_t)batch, (size_t)qo_heads, nullptr, (size_t)seq_len};
+        sl_  sdpr_arg{d_sdpr,  (size_t)batch, (size_t)qo_heads, nullptr, (size_t)seq_len};
         sl_  sqch_arg{d_sqch,  (size_t)batch, (size_t)qo_heads, nullptr, (size_t)Dim};
         sl_  sdoch_arg{d_sdoch,(size_t)batch, (size_t)qo_heads, nullptr, (size_t)Dim};
 
@@ -1356,7 +1571,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
                  qt_arg, ot_arg, kbf_arg,
                  qg_arg, kg_arg, vg_arg,
                  l_arg, d_arg,
-                 sq_arg, sk_arg, sv_arg, sdor_arg,
+                 sq_arg, sk_arg, sv_arg, sdor_arg, sdpr_arg,
                  sqch_arg, sdoch_arg,
                  (int)seq_len, (int)hr};
 
@@ -1386,6 +1601,14 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fp8_quantize_per_token", fp8_quantize_per_token,
+          "FP8 e4m3 quantization with one descale per token/row");
+    m.def("fp8_quantize_per_token_out", fp8_quantize_per_token_out,
+          "FP8 e4m3 token quantization into preallocated output tensors");
+    m.def("fp8_quantize_per_channel", fp8_quantize_per_channel,
+          "FP8 e4m3 quantization with one descale per channel");
+    m.def("fp8_quantize_per_channel_out", fp8_quantize_per_channel_out,
+          "FP8 e4m3 channel quantization into preallocated output tensors");
     m.def("fp8_mha_forward", fp8_attention_forward,
           "FP8 e4m3 multi-head attention forward (SageAttention2 recipe, "
           "non-causal / bidirectional — diffusion attention only)");
@@ -1403,6 +1626,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("l_vec"),
           pybind11::arg("sq"), pybind11::arg("sk"),
           pybind11::arg("sv"), pybind11::arg("sdo_row"),
+          pybind11::arg("sdp_row"),
           pybind11::arg("sq_ch"), pybind11::arg("sdo_ch"),
           pybind11::arg("fp8_dS_mode") = (int64_t)0);
 }
