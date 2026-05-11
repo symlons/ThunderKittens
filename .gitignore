@@ -16,3 +16,18 @@ __pycache__/
 *.out
 tests/unit_tests
 tests/build
+
+# Local generated artifacts
+kernels/attention/mha_h100/*.png
+kernels/conv3d/
+kernels/debugging/
+kernels/fp8/out
+kernels/fp8/smooth_plots_test/
+kernels/fp8/ue8m0_example
+kernels/gemm/baselines/cutedsl/
+kernels/gemm/bf16_h100/*.sw?
+kernels/gemm/bf16_h100_custom/*.sw?
+kernels/gemm/bf16_h100_custom/CORRECTNESS_AND_PROFILE_REPORT.md
+kernels/gemm/bf16_h100_custom/KERNEL_REPORT.md
+kernels/gemm/bf16_h100_custom/Makefile.gemm
+kernels/gemm/bf16_h100_custom/my_todos.md

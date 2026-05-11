@@ -37,6 +37,7 @@ from smooth_viz import (
     save_backward_plots,
     save_granularity_plots,
     save_smoothquant_plots,
+    save_summary_plot,
     save_tensor_plots,
 )
 
@@ -179,6 +180,8 @@ def parse_args():
                         help="Run the backward pass ablation")
     parser.add_argument("--plot-qk", default="int4", choices=qk_modes)
     parser.add_argument("--plot-dir", default="smooth_plots")
+    parser.add_argument("--summary-smooth", default="Q+K+V",
+                        help="Smoothing combo used for the summary fwd+bwd QSNR plot")
     return parser.parse_args()
 
 
@@ -214,15 +217,19 @@ def main():
         print_smoothquant_table(rows)
         save_smoothquant_plots(rows, plot_dir, args.smoothquant_qk)
 
+    bwd_rows = None
     if args.bwd:
         torch.manual_seed(1)
         dO = torch.randn_like(Q)
-        rows = build_backward_rows(Q, K, V, dO, granularity=args.granularity)
-        print_backward_table(rows)
-        save_backward_plots(rows, plot_dir)
+        bwd_rows = build_backward_rows(Q, K, V, dO, granularity=args.granularity)
+        print_backward_table(bwd_rows)
+        save_backward_plots(bwd_rows, plot_dir)
 
     if args.ablation_plots:
         save_ablation_plots(data["rows"], plot_dir)
+        if bwd_rows is not None:
+            save_summary_plot(data["rows"], bwd_rows, plot_dir,
+                              smooth_filter=args.summary_smooth)
 
     if args.plots:
         save_tensor_plots(Q, K, V, args.plot_qk, plot_dir)
