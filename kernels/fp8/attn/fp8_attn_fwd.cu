@@ -357,7 +357,7 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
     warpgroup::increase_registers<160>();
 
     rt_fl<16, K::kv_height>  att_block;             // QK^T accumulator (fp32)
-    rt_bf<16, K::kv_height>  p_bf;                  // P in bf16 for PV (TODO: fp8)
+    rt_bf<16, K::kv_height>  p_bf;                  // P in bf16 for PV (TODO optional: fp8)
     rt_fl<16, K::tile_width> o_reg;                 // O accumulator (fp32)
 
     col_vec<rt_fl<16, K::kv_height>> max_vec, norm_vec, max_vec_last_scaled, max_vec_scaled;
@@ -804,6 +804,67 @@ fp8_stream_add_tile(auto &reg_tile, auto &smem_vec, int tic) {
     }
 }
 
+__device__ static inline float fp8_sr_uniform01(uint32_t &prng_state) {
+    prng_state ^= prng_state << 13;
+    prng_state ^= prng_state >> 17;
+    prng_state ^= prng_state << 5;
+    return (float)(prng_state & 0x00FFFFFF) * (1.0f / 16777216.0f);
+}
+
+__device__ static inline float fp8e4m3fn_floor_abs(float ax) {
+    constexpr float fp8_e4m3_max = 448.0f;
+    constexpr float min_normal   = 0.015625f;      // 2^-6
+    constexpr float sub_step     = 0.001953125f;   // 2^-9
+
+    if (!(ax > 0.0f)) return 0.0f;
+    if (ax >= fp8_e4m3_max) return fp8_e4m3_max;
+    if (ax < min_normal) return floorf(ax / sub_step) * sub_step;
+
+    float step = exp2f(floorf(log2f(ax)) - 3.0f);
+    float lo = floorf(ax / step) * step;
+    return lo > fp8_e4m3_max ? fp8_e4m3_max : lo;
+}
+
+__device__ static inline float fp8e4m3fn_next_abs(float lo) {
+    constexpr float fp8_e4m3_max = 448.0f;
+    constexpr float min_normal   = 0.015625f;      // 2^-6
+    constexpr float sub_step     = 0.001953125f;   // 2^-9
+
+    if (lo >= fp8_e4m3_max) return fp8_e4m3_max;
+    if (lo < min_normal) return lo + sub_step;
+
+    float step = exp2f(floorf(log2f(lo)) - 3.0f);
+    float hi = lo + step;
+    return hi > fp8_e4m3_max ? fp8_e4m3_max : hi;
+}
+
+// Gupta et al.-style stochastic rounding onto the FP8 e4m3fn grid:
+// choose one of the two adjacent representable values with probability
+// proportional to proximity, saturating outside the finite FP8 range.
+__device__ static inline float fp8e4m3fn_stochastic_round(float x,
+                                                          uint32_t &prng_state) {
+    constexpr float fp8_e4m3_max = 448.0f;
+
+    if (isnan(x)) return 0.0f;
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = fabsf(x);
+    if (ax >= fp8_e4m3_max) return sign * fp8_e4m3_max;
+
+    float lo = fp8e4m3fn_floor_abs(ax);
+    float hi = fp8e4m3fn_next_abs(lo);
+    if (hi <= lo) return sign * lo;
+
+    float p_hi = (ax - lo) / (hi - lo);
+    float rounded = fp8_sr_uniform01(prng_state) < p_hi ? hi : lo;
+    return sign * rounded;
+}
+
+__device__ static inline void fp8e4m3fn_stochastic_round(float2 &v,
+                                                        uint32_t &prng_state) {
+    v.x = fp8e4m3fn_stochastic_round(v.x, prng_state);
+    v.y = fp8e4m3fn_stochastic_round(v.y, prng_state);
+}
+
 // FP8 e4m3 fake-quantization of dS in registers.
 //
 // Recipe-correctness step: snap dS to the FP8 e4m3 grid before both
@@ -822,10 +883,9 @@ fp8_stream_add_tile(auto &reg_tile, auto &smem_vec, int tic) {
 // per_block ≡ per_tensor and per_token ≡ per_thread within ~0.5 dB
 // for FP8 E4M3.
 //
-// `fp8_dS_sr` enables stochastic rounding via a per-thread xorshift PRNG
-// (recipe-mandated for backward gradients to avoid systematic bias).
-// SR is implemented as a coarse per-element ULP-scaled jitter applied
-// before the RTNE cast.
+// `fp8_dS_sr` enables stochastic rounding via a per-thread xorshift PRNG.
+// SR chooses the lower/upper adjacent FP8 values with distance-proportional
+// probabilities, following Gupta et al.'s unbiased rounding rule.
 template<bool fp8_dS_sr>
 __device__ static inline void
 fp8_dS_fake_quant(rt_fl<16, 64> &ds_block_t,
@@ -850,37 +910,18 @@ fp8_dS_fake_quant(rt_fl<16, 64> &ds_block_t,
     warp::div_col(ds_block_t, ds_block_t, ds_descale_rv);
 
     if constexpr (fp8_dS_sr) {
-        // Per-element ULP-scaled jitter in [-0.5*ulp, 0.5*ulp).
-        // For FP8 e4m3 (3 mantissa bits), normal-range ULP is
-        // 2^(floor(log2|y|) - 3); we floor at 2^-9 for the subnormal
-        // region. This matches the host SR formula in the test.
         #pragma unroll
         for (int j = 0; j < ds_block_t.width; j++) {
             #pragma unroll
             for (int k = 0; k < ds_block_t.packed_per_tile; k++) {
-                float2 &v = ds_block_t.tiles[0][j].data[k];
-                // Generate two uniforms in [-0.5, 0.5)
-                prng_state ^= prng_state << 13;
-                prng_state ^= prng_state >> 17;
-                prng_state ^= prng_state << 5;
-                float u0 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
-                prng_state ^= prng_state << 13;
-                prng_state ^= prng_state >> 17;
-                prng_state ^= prng_state << 5;
-                float u1 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
-                float ay0 = fabsf(v.x); if (ay0 < 0.015625f) ay0 = 0.015625f; // 2^-6
-                float ay1 = fabsf(v.y); if (ay1 < 0.015625f) ay1 = 0.015625f;
-                float e0 = floorf(log2f(ay0)) - 3.0f; // log2 ulp
-                float e1 = floorf(log2f(ay1)) - 3.0f;
-                float ulp0 = exp2f(e0); if (ulp0 < 1.953125e-3f) ulp0 = 1.953125e-3f; // 2^-9
-                float ulp1 = exp2f(e1); if (ulp1 < 1.953125e-3f) ulp1 = 1.953125e-3f;
-                v.x += u0 * ulp0;
-                v.y += u1 * ulp1;
+                fp8e4m3fn_stochastic_round(ds_block_t.tiles[0][j].data[k],
+                                            prng_state);
             }
         }
     }
 
-    // Snap to FP8 grid: cast to fp8e4m3 (RTNE) then back to float.
+    // Snap to FP8 grid: SR pre-selects exact FP8 values when enabled; the cast
+    // preserves them. RTNE mode reaches this cast directly.
     rt_fp8e4m3<16, 64> ds_fp8;
     warp::copy(ds_fp8, ds_block_t);
     warp::copy(ds_block_t, ds_fp8);
@@ -935,23 +976,8 @@ fp8_quant_per_K_row(rt_fl<16, 64> &block_t,
         for (int j = 0; j < block_t.width; j++) {
             #pragma unroll
             for (int k = 0; k < block_t.packed_per_tile; k++) {
-                float2 &v = block_t.tiles[0][j].data[k];
-                prng_state ^= prng_state << 13;
-                prng_state ^= prng_state >> 17;
-                prng_state ^= prng_state << 5;
-                float u0 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
-                prng_state ^= prng_state << 13;
-                prng_state ^= prng_state >> 17;
-                prng_state ^= prng_state << 5;
-                float u1 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
-                float ay0 = fabsf(v.x); if (ay0 < 0.015625f) ay0 = 0.015625f;
-                float ay1 = fabsf(v.y); if (ay1 < 0.015625f) ay1 = 0.015625f;
-                float e0 = floorf(log2f(ay0)) - 3.0f;
-                float e1 = floorf(log2f(ay1)) - 3.0f;
-                float ulp0 = exp2f(e0); if (ulp0 < 1.953125e-3f) ulp0 = 1.953125e-3f;
-                float ulp1 = exp2f(e1); if (ulp1 < 1.953125e-3f) ulp1 = 1.953125e-3f;
-                v.x += u0 * ulp0;
-                v.y += u1 * ulp1;
+                fp8e4m3fn_stochastic_round(block_t.tiles[0][j].data[k],
+                                            prng_state);
             }
         }
     }
@@ -990,23 +1016,8 @@ fp8_quant_with_K_row_descale(rt_fl<16, 64> &block_t,
         for (int j = 0; j < block_t.width; j++) {
             #pragma unroll
             for (int k = 0; k < block_t.packed_per_tile; k++) {
-                float2 &v = block_t.tiles[0][j].data[k];
-                prng_state ^= prng_state << 13;
-                prng_state ^= prng_state >> 17;
-                prng_state ^= prng_state << 5;
-                float u0 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
-                prng_state ^= prng_state << 13;
-                prng_state ^= prng_state >> 17;
-                prng_state ^= prng_state << 5;
-                float u1 = (float)(prng_state & 0x00FFFFFF) * (1.0f/16777216.0f) - 0.5f;
-                float ay0 = fabsf(v.x); if (ay0 < 0.015625f) ay0 = 0.015625f;
-                float ay1 = fabsf(v.y); if (ay1 < 0.015625f) ay1 = 0.015625f;
-                float e0 = floorf(log2f(ay0)) - 3.0f;
-                float e1 = floorf(log2f(ay1)) - 3.0f;
-                float ulp0 = exp2f(e0); if (ulp0 < 1.953125e-3f) ulp0 = 1.953125e-3f;
-                float ulp1 = exp2f(e1); if (ulp1 < 1.953125e-3f) ulp1 = 1.953125e-3f;
-                v.x += u0 * ulp0;
-                v.y += u1 * ulp1;
+                fp8e4m3fn_stochastic_round(block_t.tiles[0][j].data[k],
+                                            prng_state);
             }
         }
     }
@@ -1601,17 +1612,11 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fp8_quantize_per_token", fp8_quantize_per_token,
-          "FP8 e4m3 quantization with one descale per token/row");
-    m.def("fp8_quantize_per_token_out", fp8_quantize_per_token_out,
-          "FP8 e4m3 token quantization into preallocated output tensors");
-    m.def("fp8_quantize_per_channel", fp8_quantize_per_channel,
-          "FP8 e4m3 quantization with one descale per channel");
-    m.def("fp8_quantize_per_channel_out", fp8_quantize_per_channel_out,
-          "FP8 e4m3 channel quantization into preallocated output tensors");
-    m.def("fp8_mha_forward", fp8_attention_forward,
-          "FP8 e4m3 multi-head attention forward (SageAttention2 recipe, "
-          "non-causal / bidirectional — diffusion attention only)");
+    m.def("fp8_quantize_per_token", fp8_quantize_per_token, "FP8 e4m3 quantization with one descale per token/row");
+    m.def("fp8_quantize_per_token_out", fp8_quantize_per_token_out, "FP8 e4m3 token quantization into preallocated output tensors");
+    m.def("fp8_quantize_per_channel", fp8_quantize_per_channel, "FP8 e4m3 quantization with one descale per channel");
+    m.def("fp8_quantize_per_channel_out", fp8_quantize_per_channel_out, "FP8 e4m3 channel quantization into preallocated output tensors");
+    m.def("fp8_mha_forward", fp8_attention_forward, "FP8 e4m3 multi-head attention forward (SageAttention2 recipe, " "non-causal / bidirectional — diffusion attention only)");
     m.def("fp8_mha_backward", fp8_attention_backward,
           "FP8 e4m3 multi-head attention backward with actual FP8 wgmma for "
           "S^T, dP^T, dV, dK (mma_ABt). dQ uses bf16 mma_AtB on a bf16 "

@@ -162,6 +162,35 @@ def host_quantize_per_tensor_fp8(x):
     return xq.contiguous(), descale
 
 
+def stochastic_round_to_fp8e4m3fn_grid(y, *, gen=None):
+    """Distance-proportional stochastic rounding onto the FP8 e4m3fn grid."""
+    min_normal = 2.0 ** -6
+    sub_step = 2.0 ** -9
+
+    sign = torch.where(y < 0, -1.0, 1.0).to(y.dtype)
+    ay = y.abs().clamp(max=FP8_E4M3_MAX)
+
+    lo_sub = torch.floor(ay / sub_step) * sub_step
+    step = 2.0 ** (torch.floor(torch.log2(ay.clamp_min(min_normal))) - 3.0)
+    lo_norm = torch.floor(ay / step) * step
+    lo = torch.where(ay < min_normal, lo_sub, lo_norm)
+    lo = torch.where(ay <= 0, torch.zeros_like(lo), lo).clamp(max=FP8_E4M3_MAX)
+
+    step_lo = 2.0 ** (torch.floor(torch.log2(lo.clamp_min(min_normal))) - 3.0)
+    hi = torch.where(lo < min_normal, lo + sub_step, lo + step_lo)
+    hi = hi.clamp(max=FP8_E4M3_MAX)
+
+    denom = (hi - lo).clamp_min(torch.finfo(torch.float32).tiny)
+    p_hi = ((ay - lo) / denom).clamp(0.0, 1.0)
+    if gen is None:
+        u = torch.rand_like(y)
+    else:
+        u = torch.rand(y.shape, generator=gen, device=y.device, dtype=y.dtype)
+    rounded = torch.where(u < p_hi, hi, lo)
+    rounded = torch.where(torch.isnan(y), torch.zeros_like(rounded), rounded)
+    return (rounded * sign).to(torch.float8_e4m3fn)
+
+
 def host_quantize_per_tensor_fp8_sr(x, *, gen=None):
     """Per-tensor FP8 e4m3 SR quant, returning (xq_fp8, descale_scalar).
 
@@ -170,31 +199,13 @@ def host_quantize_per_tensor_fp8_sr(x, *, gen=None):
     """
     descale = (x.abs().amax().clamp_min(1e-12) / FP8_E4M3_MAX).to(torch.float32)
     y = x / descale
-    abs_y = y.abs().clamp_min(2.0 ** -6)
-    exp = torch.floor(torch.log2(abs_y))
-    ulp = (2.0 ** (exp - 3.0)).clamp_min(2.0 ** -9)
-    if gen is None:
-        noise = (torch.rand_like(y) - 0.5) * ulp
-    else:
-        noise = (torch.rand(y.shape, generator=gen,
-                            device=y.device, dtype=y.dtype) - 0.5) * ulp
-    y_jit = (y + noise).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    xq = y_jit.to(torch.float8_e4m3fn)
+    xq = stochastic_round_to_fp8e4m3fn_grid(y, gen=gen)
     return xq.contiguous(), descale
 
 
 def host_quantize_with_descale_fp8_sr(x, descale, *, gen=None):
     y = x / descale
-    abs_y = y.abs().clamp_min(2.0 ** -6)
-    exp = torch.floor(torch.log2(abs_y))
-    ulp = (2.0 ** (exp - 3.0)).clamp_min(2.0 ** -9)
-    if gen is None:
-        noise = (torch.rand_like(y) - 0.5) * ulp
-    else:
-        noise = (torch.rand(y.shape, generator=gen,
-                            device=y.device, dtype=y.dtype) - 0.5) * ulp
-    y_jit = (y + noise).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    return y_jit.to(torch.float8_e4m3fn).contiguous()
+    return stochastic_round_to_fp8e4m3fn_grid(y, gen=gen).contiguous()
 
 
 def host_quantize_per_row_fp8_sr_dequant(x, *, gen=None):
@@ -204,25 +215,13 @@ def host_quantize_per_row_fp8_sr_dequant(x, *, gen=None):
     FP8-grid values with stochastic rounding. Mathematically equivalent
     to FP8 mma + fp32 accumulator since the kernel accumulators are fp32.
 
-    SR is implemented as: jitter by uniform[-0.5, 0.5] * local_ULP in
-    FP8-units before RTNE cast. Local ULP is approximated as
-    max(2^floor(log2|y|) - 23, 2^-9) where y = x/scale (in FP8 units).
+    SR chooses the lower/upper adjacent FP8 e4m3fn values with probability
+    proportional to proximity, matching Gupta et al.'s stochastic rounding.
     """
     amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     scale = (amax / FP8_E4M3_MAX).to(torch.float32)
     y = x / scale
-    # crude per-element ULP for FP8 e4m3 (3 mantissa bits): 2^(exp-3)
-    # for normal range; 2^-9 for subnormals.
-    abs_y = y.abs().clamp_min(2.0 ** -6)
-    exp = torch.floor(torch.log2(abs_y))
-    ulp = (2.0 ** (exp - 3.0)).clamp_min(2.0 ** -9)
-    if gen is None:
-        noise = (torch.rand_like(y) - 0.5) * ulp
-    else:
-        noise = (torch.rand(y.shape, generator=gen,
-                            device=y.device, dtype=y.dtype) - 0.5) * ulp
-    y_jit = (y + noise).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    xq = y_jit.to(torch.float8_e4m3fn)
+    xq = stochastic_round_to_fp8e4m3fn_grid(y, gen=gen)
     return (xq.to(torch.float32) * scale).to(torch.bfloat16).contiguous()
 
 
@@ -231,16 +230,7 @@ def host_quantize_per_row_fp8_sr(x, *, gen=None):
     amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     scale = (amax / FP8_E4M3_MAX).to(torch.float32)
     y = x / scale
-    abs_y = y.abs().clamp_min(2.0 ** -6)
-    exp = torch.floor(torch.log2(abs_y))
-    ulp = (2.0 ** (exp - 3.0)).clamp_min(2.0 ** -9)
-    if gen is None:
-        noise = (torch.rand_like(y) - 0.5) * ulp
-    else:
-        noise = (torch.rand(y.shape, generator=gen,
-                            device=y.device, dtype=y.dtype) - 0.5) * ulp
-    y_jit = (y + noise).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    xq = y_jit.to(torch.float8_e4m3fn)
+    xq = stochastic_round_to_fp8e4m3fn_grid(y, gen=gen)
     return xq.contiguous(), scale.squeeze(-1).contiguous()
 
 
@@ -255,16 +245,7 @@ def host_quantize_per_channel_fp8_sr(x, *, gen=None):
     amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     scale = (amax / FP8_E4M3_MAX).to(torch.float32)
     y = x / scale
-    abs_y = y.abs().clamp_min(2.0 ** -6)
-    exp = torch.floor(torch.log2(abs_y))
-    ulp = (2.0 ** (exp - 3.0)).clamp_min(2.0 ** -9)
-    if gen is None:
-        noise = (torch.rand_like(y) - 0.5) * ulp
-    else:
-        noise = (torch.rand(y.shape, generator=gen,
-                            device=y.device, dtype=y.dtype) - 0.5) * ulp
-    y_jit = (y + noise).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    xq = y_jit.to(torch.float8_e4m3fn)
+    xq = stochastic_round_to_fp8e4m3fn_grid(y, gen=gen)
     return xq.contiguous(), scale.squeeze(-1).contiguous()
 
 
@@ -410,12 +391,9 @@ def profile_kernels(Q, K, V, dO, *, bench_iters):
 
     token_bytes = Q.numel() * (4 + 1) + B * H * N * 4
     channel_bytes = V.numel() * (4 + 1) + B * H * D * 4
-    q_ms = time_ms(lambda: cuda_quantize_per_token_out(Q, q_out, q_scale),
-                   warmup=5, iters=bench_iters)
-    k_ms = time_ms(lambda: cuda_quantize_per_token_out(K_s, k_out, k_scale),
-                   warmup=5, iters=bench_iters)
-    v_ms = time_ms(lambda: cuda_quantize_per_channel_out(V_s, v_ch_out, v_ch_scale),
-                   warmup=5, iters=bench_iters)
+    q_ms = time_ms(lambda: cuda_quantize_per_token_out(Q, q_out, q_scale), warmup=5, iters=bench_iters)
+    k_ms = time_ms(lambda: cuda_quantize_per_token_out(K_s, k_out, k_scale), warmup=5, iters=bench_iters)
+    v_ms = time_ms(lambda: cuda_quantize_per_channel_out(V_s, v_ch_out, v_ch_scale), warmup=5, iters=bench_iters)
 
     p = prepare_kernel_args(Q, K, V, dO, sr_dO=True)
     fwd = lambda: _C.fp8_mha_forward(
@@ -530,14 +508,10 @@ def run_one(B, H, N, D, seed, *, bench_iters):
     print(f"  {'kernel O vs torch SDPA':<28} "
           f"QSNR={o_m['qsnr_dB']:5.2f} relL1={o_m['rel_L1']:.2e} cos={o_m['cos']:.5f}")
 
-    print(" ", fmt("kernel recipe SR-dO+SR-dS",
-                   *recipe_m))
-    print(" ", fmt("kernel SR-dO + RTNE-dS  ",
-                   *rtne_m))
-    print(" ", fmt("kernel SR-dO + bf16 dS  ",
-                   *sr_dO_m))
-    print(" ", fmt("kernel RTNE-dO + bf16 dS",
-                   *rtne_dO_m))
+    print(" ", fmt("kernel recipe SR-dO+SR-dS", *recipe_m))
+    print(" ", fmt("kernel SR-dO + RTNE-dS  ", *rtne_m))
+    print(" ", fmt("kernel SR-dO + bf16 dS  ", *sr_dO_m))
+    print(" ", fmt("kernel RTNE-dO + bf16 dS", *rtne_dO_m))
 
     if bench_iters > 0:
         profile_kernels(Q, K, V, dO, bench_iters=bench_iters)

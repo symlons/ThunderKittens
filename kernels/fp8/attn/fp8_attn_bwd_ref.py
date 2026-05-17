@@ -109,20 +109,37 @@ def quantize_v_per_channel_fp8(v: torch.Tensor, mode: str = "fp8_e4m3"):
 
 
 def _stochastic_round_to_fp8(x: torch.Tensor, mode: str):
-    """Approximate stochastic rounding into FP8.
-
-    True SR for FP8 is non-trivial because of the irregular grid. We use a
-    practical proxy: cast x to bf16, then to FP8 with random tie-breaking
-    via a sub-LSB jitter. For evaluating the *recipe* this is sufficient;
-    the kernel will issue native SR via PTX intrinsics.
-    """
+    """Distance-proportional stochastic rounding into FP8."""
     fp_max = _fp8_max(mode)
     x = x.clamp(-fp_max, fp_max).to(torch.float32)
-    # add uniform jitter scaled to the smallest representable step locally
-    # (use bf16 ULP as an approximation since FP8 ULP varies wildly).
-    eps = (x.abs().clamp_min(1.0)) * (1.0 / 256.0)  # ~ FP8 e4m3 typical step
-    noise = (torch.rand_like(x) - 0.5) * eps
-    return (x + noise).to(_fp8_dtype(mode)).to(torch.float32)
+
+    if mode == "fp8_e4m3":
+        mant_bits = 3
+        min_normal = 2.0 ** -6
+        sub_step = 2.0 ** -9
+    else:
+        mant_bits = 2
+        min_normal = 2.0 ** -14
+        sub_step = 2.0 ** -16
+
+    sign = torch.where(x < 0, -1.0, 1.0).to(x.dtype)
+    ax = x.abs()
+
+    lo_sub = torch.floor(ax / sub_step) * sub_step
+    step = 2.0 ** (torch.floor(torch.log2(ax.clamp_min(min_normal))) - mant_bits)
+    lo_norm = torch.floor(ax / step) * step
+    lo = torch.where(ax < min_normal, lo_sub, lo_norm)
+    lo = torch.where(ax <= 0, torch.zeros_like(lo), lo).clamp(max=fp_max)
+
+    step_lo = 2.0 ** (torch.floor(torch.log2(lo.clamp_min(min_normal))) - mant_bits)
+    hi = torch.where(lo < min_normal, lo + sub_step, lo + step_lo)
+    hi = hi.clamp(max=fp_max)
+
+    denom = (hi - lo).clamp_min(torch.finfo(torch.float32).tiny)
+    p_hi = ((ax - lo) / denom).clamp(0.0, 1.0)
+    rounded = torch.where(torch.rand_like(x) < p_hi, hi, lo)
+    rounded = torch.where(torch.isnan(x), torch.zeros_like(rounded), rounded)
+    return (rounded * sign).to(_fp8_dtype(mode)).to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
