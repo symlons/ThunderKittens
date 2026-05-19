@@ -19,7 +19,8 @@ def make_sdpa_groups(shape, dtype, *, seed, group_count):
         K = uniform_tensor(shape, generator=generator).to(dtype).requires_grad_(True)
         V = uniform_tensor(shape, generator=generator).to(dtype).requires_grad_(True)
         dO = uniform_tensor(shape, generator=generator).to(dtype)
-        groups.append((Q, K, V, dO))
+        O = F.scaled_dot_product_attention(Q, K, V, is_causal=False)
+        groups.append((Q, K, V, dO, O))
     torch.cuda.synchronize()
     return groups
 
@@ -28,19 +29,18 @@ def profile_sdpa(shape, dtype, *, seed, group_count, warmup, iters, cooldown_s):
     groups = make_sdpa_groups(shape, dtype, seed=seed, group_count=group_count)
 
     def fwd(i):
-        Q, K, V, _ = groups[i]
+        Q, K, V, _, _ = groups[i]
         return F.scaled_dot_product_attention(Q, K, V, is_causal=False)
 
     def bwd(i):
-        Q, K, V, dO = groups[i]
-        O = F.scaled_dot_product_attention(Q, K, V, is_causal=False)
-        return torch.autograd.grad(O, (Q, K, V), dO, retain_graph=False, create_graph=False)
+        Q, K, V, dO, O = groups[i]
+        return torch.autograd.grad(O, (Q, K, V), dO, retain_graph=True, create_graph=False)
 
     fwd_ms = benchmark_ms(fwd, group_count, warmup=warmup, iters=iters, cooldown_s=cooldown_s)
     bwd_ms = benchmark_ms(bwd, group_count, warmup=warmup, iters=iters, cooldown_s=cooldown_s)
     name = "torch sdpa " + str(dtype).replace("torch.", "")
     print_profile_line(f"{name} fwd", fwd_ms, flops_shape=shape, kind="fwd")
-    print_profile_line(f"{name} bwd", bwd_ms, flops_shape=shape, kind="bwd")
+    print_profile_line(f"{name} bwd-only", bwd_ms, flops_shape=shape, kind="bwd")
     return {"fwd_ms": fwd_ms, "bwd_ms": bwd_ms}
 
 

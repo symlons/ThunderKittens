@@ -335,7 +335,6 @@ attention_forward(at::Tensor q, at::Tensor k, at::Tensor v, bool causal)
             fwd_attend_ker<64, false><<<grid, (32*NUM_WORKERS), mem_size, stream>>>(g);
         }
         CHECK_CUDA_ERROR(cudaGetLastError());
-        cudaStreamSynchronize(stream);
     }
 
     if (head_dim == 128) {
@@ -375,7 +374,6 @@ attention_forward(at::Tensor q, at::Tensor k, at::Tensor v, bool causal)
         }
 
         CHECK_CUDA_ERROR(cudaGetLastError());
-        cudaStreamSynchronize(stream);
     }
 
     return {o, l_vec};
