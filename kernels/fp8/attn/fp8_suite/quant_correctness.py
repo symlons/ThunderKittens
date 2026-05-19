@@ -125,31 +125,37 @@ CRITERIA = {
 }
 
 
-def quant_kernel_metrics(xq, scale, xq_ref, scale_ref, *, granularity):
-    """Return {scale, dequant, fp8_byte} metric dicts for one case.
-
-    Mirrors the comparison used by check_quant_kernel: compares (a) the
-    fp32 scale tensors directly and (b) the dequantized values xq*scale.
-    Also reports fp8 byte agreement.
-    """
+def _dequant(xq, scale, granularity):
     if granularity == "token":
-        deq_got = xq.to(torch.float32) * scale.unsqueeze(-1)
-        deq_ref = xq_ref.to(torch.float32) * scale_ref.unsqueeze(-1)
-    elif granularity == "channel":
-        deq_got = xq.to(torch.float32) * scale.unsqueeze(-2)
-        deq_ref = xq_ref.to(torch.float32) * scale_ref.unsqueeze(-2)
-    else:
-        raise ValueError(f"unknown granularity {granularity!r}")
+        return xq.to(torch.float32) * scale.unsqueeze(-1)
+    if granularity == "channel":
+        return xq.to(torch.float32) * scale.unsqueeze(-2)
+    raise ValueError(f"unknown granularity {granularity!r}")
 
+
+def quant_kernel_metrics(xq, scale, xq_ref, scale_ref, *, granularity, x_fp32=None):
+    """Return {scale, dequant, fp8_byte[, vs_fp32]} metric dicts for one case.
+
+    Mirrors check_quant_kernel: compares (a) the fp32 scale tensors and
+    (b) the dequantized values xq*scale. Also reports fp8 byte agreement.
+    If `x_fp32` is provided, additionally reports the intrinsic FP8
+    quantization noise — `tensor_metrics(dequant_kernel, x_fp32)` —
+    which is what shows up downstream as quantization error.
+    """
+    deq_got = _dequant(xq, scale, granularity)
+    deq_ref = _dequant(xq_ref, scale_ref, granularity)
     a = xq.view(torch.uint8)
     b = xq_ref.view(torch.uint8)
-    return {
+    out = {
         "scale": tensor_metrics(scale, scale_ref),
         "dequant": tensor_metrics(deq_got, deq_ref),
         "fp8_byte_exact_frac": (a == b).float().mean().item(),
         "fp8_byte_max_delta": (a.to(torch.int16) - b.to(torch.int16))
                               .abs().max().item(),
     }
+    if x_fp32 is not None:
+        out["vs_fp32"] = tensor_metrics(deq_got, x_fp32)
+    return out
 
 
 def passed(m):
