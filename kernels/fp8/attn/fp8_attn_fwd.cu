@@ -54,62 +54,172 @@ constexpr float FP8_E4M3_MAX_F = 448.0f;
 // Standalone FP8 quantization kernels used by the Python test harness.
 // -----------------------------------------------------------------------------
 
+// ---- Per-token (per-row) quantization ----------------------------------------
+//
+// One warp processes one row of width D. 4 warps per block -> 4 rows per
+// block. Loads are vectorized (float4 for D=128, float2 for D=64) and the
+// amax reduction uses a warp shuffle (no shared memory). FP8 outputs are
+// packed into 32-bit (D=128) or 16-bit (D=64) stores via fp8e4m3_4 /
+// fp8e4m3_2 so the writes are coalesced and minimal.
+
+template <int D>
 __global__ void fp8_quantize_per_token_ker(const float *__restrict__ x,
                                            fp8e4m3 *__restrict__ xq,
                                            float *__restrict__ descale,
-                                           int rows, int D) {
-    extern __shared__ float smem[];
-    int row = blockIdx.x;
-    int tid = threadIdx.x;
-    float amax = 0.0f;
-    for (int d = tid; d < D; d += blockDim.x) {
-        amax = fmaxf(amax, fabsf(x[row * D + d]));
-    }
-    smem[tid] = amax;
-    __syncthreads();
+                                           int rows) {
+    static_assert(D == 64 || D == 128, "Only D=64 or D=128 supported");
+    constexpr int WARPS_PER_BLOCK = 4;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row  = (int)blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (row >= rows) return;
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
-        __syncthreads();
-    }
+    const float *xr = x  + row * D;
+    fp8e4m3    *xqr = xq + row * D;
 
-    float s = fmaxf(smem[0] / FP8_E4M3_MAX_F, 1.0e-12f);
-    if (tid == 0) descale[row] = s;
-    for (int d = tid; d < D; d += blockDim.x) {
-        float y = fminf(fmaxf(x[row * D + d] / s, -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
-        xq[row * D + d] = fp8e4m3(y);
+    if constexpr (D == 128) {
+        const float4 *xr_v = reinterpret_cast<const float4*>(xr);
+        float4 v = xr_v[lane];
+        float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                           fmaxf(fabsf(v.z), fabsf(v.w)));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+
+        // IEEE-rounded division to match the PyTorch reference exactly
+        // (the build uses --use_fast_math, which turns `/` into recip*mul).
+        float s = fmaxf(__fdiv_rn(amax, FP8_E4M3_MAX_F), 1.0e-12f);
+        if (lane == 0) descale[row] = s;
+
+        float4 y;
+        y.x = fminf(fmaxf(__fdiv_rn(v.x, s), -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        y.y = fminf(fmaxf(__fdiv_rn(v.y, s), -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        y.z = fminf(fmaxf(__fdiv_rn(v.z, s), -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        y.w = fminf(fmaxf(__fdiv_rn(v.w, s), -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        fp8e4m3_4 packed(y);
+        reinterpret_cast<uint32_t*>(xqr)[lane] = *reinterpret_cast<uint32_t*>(&packed);
+    } else { // D == 64
+        const float2 *xr_v = reinterpret_cast<const float2*>(xr);
+        float2 v = xr_v[lane];
+        float amax = fmaxf(fabsf(v.x), fabsf(v.y));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+
+        float s = fmaxf(__fdiv_rn(amax, FP8_E4M3_MAX_F), 1.0e-12f);
+        if (lane == 0) descale[row] = s;
+
+        float2 y;
+        y.x = fminf(fmaxf(__fdiv_rn(v.x, s), -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        y.y = fminf(fmaxf(__fdiv_rn(v.y, s), -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        fp8e4m3_2 packed(y);
+        reinterpret_cast<uint16_t*>(xqr)[lane] = *reinterpret_cast<uint16_t*>(&packed);
     }
 }
 
-__global__ void fp8_quantize_per_channel_ker(const float *__restrict__ x,
-                                             fp8e4m3 *__restrict__ xq,
-                                             float *__restrict__ descale,
-                                             int B, int H, int N, int D) {
-    extern __shared__ float smem[];
-    int ch = blockIdx.x;
-    int tid = threadIdx.x;
-    int d = ch % D;
-    int h = (ch / D) % H;
-    int b = ch / (H * D);
-    int base = ((b * H + h) * N * D) + d;
+// ---- Per-channel (per-column) quantization ----------------------------------
+//
+// Original kernel mapped one block to one channel and read along N with a D
+// stride - uncoalesced. The new layout maps thread d to column d within a
+// (B,H) slab so consecutive threads access consecutive memory positions. To
+// fill the grid even for small (B*H), N is split into CHUNK_ROWS tiles and
+// the amax is reduced across blocks via an atomicMax on the float
+// bit-pattern (amax is non-negative so the bit order is monotonic). A second
+// pass kernel reads the final amax, computes the scale, and quantizes.
+
+constexpr int FP8_PCH_CHUNK_ROWS = 256;
+
+template <int D>
+__global__ void fp8_per_channel_amax_ker(const float *__restrict__ x,
+                                         float *__restrict__ amax_buf,
+                                         int N) {
+    int bh    = blockIdx.x;
+    int chunk = blockIdx.y;
+    int d     = threadIdx.x;
+    int n0    = chunk * FP8_PCH_CHUNK_ROWS;
+    int n1    = min(n0 + FP8_PCH_CHUNK_ROWS, N);
+    int base  = bh * N * D;
 
     float amax = 0.0f;
-    for (int n = tid; n < N; n += blockDim.x) {
-        amax = fmaxf(amax, fabsf(x[base + n * D]));
-    }
-    smem[tid] = amax;
-    __syncthreads();
+    #pragma unroll 4
+    for (int n = n0; n < n1; ++n)
+        amax = fmaxf(amax, fabsf(x[base + n * D + d]));
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
-        __syncthreads();
+    if (amax > 0.0f) {
+        atomicMax(reinterpret_cast<int*>(&amax_buf[bh * D + d]),
+                  __float_as_int(amax));
     }
+}
 
-    float s = fmaxf(smem[0] / FP8_E4M3_MAX_F, 1.0e-12f);
-    if (tid == 0) descale[ch] = s;
-    for (int n = tid; n < N; n += blockDim.x) {
-        float y = fminf(fmaxf(x[base + n * D] / s, -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
-        xq[base + n * D] = fp8e4m3(y);
+template <int D>
+__global__ void fp8_per_channel_quant_ker(const float *__restrict__ x,
+                                          fp8e4m3 *__restrict__ xq,
+                                          const float *__restrict__ amax_buf,
+                                          float *__restrict__ descale,
+                                          int N) {
+    int bh    = blockIdx.x;
+    int chunk = blockIdx.y;
+    int d     = threadIdx.x;
+    int n0    = chunk * FP8_PCH_CHUNK_ROWS;
+    int n1    = min(n0 + FP8_PCH_CHUNK_ROWS, N);
+    int base  = bh * N * D;
+
+    float a = amax_buf[bh * D + d];
+    float s = fmaxf(__fdiv_rn(a, FP8_E4M3_MAX_F), 1.0e-12f);
+    if (chunk == 0) descale[bh * D + d] = s;
+
+    #pragma unroll 4
+    for (int n = n0; n < n1; ++n) {
+        float y = fminf(fmaxf(__fdiv_rn(x[base + n * D + d], s),
+                              -FP8_E4M3_MAX_F),
+                        FP8_E4M3_MAX_F);
+        xq[base + n * D + d] = fp8e4m3(y);
+    }
+}
+
+static inline void launch_fp8_quantize_per_token(const float *x,
+                                                 fp8e4m3 *xq,
+                                                 float *s,
+                                                 int rows,
+                                                 int D,
+                                                 cudaStream_t stream) {
+    constexpr int WARPS_PER_BLOCK = 4;
+    constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
+    int blocks = (rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    if (D == 128) {
+        fp8_quantize_per_token_ker<128>
+            <<<blocks, THREADS_PER_BLOCK, 0, stream>>>(x, xq, s, rows);
+    } else {
+        fp8_quantize_per_token_ker<64>
+            <<<blocks, THREADS_PER_BLOCK, 0, stream>>>(x, xq, s, rows);
+    }
+}
+
+static inline void launch_fp8_quantize_per_channel(const float *x,
+                                                   fp8e4m3 *xq,
+                                                   float *descale,
+                                                   int B, int H, int N, int D,
+                                                   cudaStream_t stream) {
+    int bh = B * H;
+    int chunks = (N + FP8_PCH_CHUNK_ROWS - 1) / FP8_PCH_CHUNK_ROWS;
+    dim3 grid((unsigned)bh, (unsigned)chunks);
+
+    // Scratch for atomic-reduced amax. Zero-init because we use atomicMax on
+    // the int bit-pattern of non-negative floats (0.0f -> 0).
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
+    at::Tensor amax_buf = at::zeros({bh * D}, opts);
+    float *amax_ptr = amax_buf.data_ptr<float>();
+
+    if (D == 128) {
+        fp8_per_channel_amax_ker<128>
+            <<<grid, 128, 0, stream>>>(x, amax_ptr, N);
+        fp8_per_channel_quant_ker<128>
+            <<<grid, 128, 0, stream>>>(x, xq, amax_ptr, descale, N);
+    } else {
+        fp8_per_channel_amax_ker<64>
+            <<<grid, 64,  0, stream>>>(x, amax_ptr, N);
+        fp8_per_channel_quant_ker<64>
+            <<<grid, 64,  0, stream>>>(x, xq, amax_ptr, descale, N);
     }
 }
 
@@ -127,14 +237,12 @@ std::vector<at::Tensor> fp8_quantize_per_token(at::Tensor x) {
     at::Tensor s = at::empty({B, H, N}, s_opts);
 
     int rows = (int)(B * H * N);
-    int threads = 128;
-    size_t smem = threads * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    fp8_quantize_per_token_ker<<<rows, threads, smem, stream>>>(
+    launch_fp8_quantize_per_token(
         xc.data_ptr<float>(),
         reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
         s.data_ptr<float>(),
-        rows, (int)D);
+        rows, (int)D, stream);
     CHECK_CUDA_ERROR(cudaGetLastError());
     return {xq, s};
 }
@@ -152,14 +260,12 @@ void fp8_quantize_per_token_out(at::Tensor x, at::Tensor xq, at::Tensor s) {
     int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
     TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
     int rows = (int)(B * H * N);
-    int threads = 128;
-    size_t smem = threads * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    fp8_quantize_per_token_ker<<<rows, threads, smem, stream>>>(
+    launch_fp8_quantize_per_token(
         xc.data_ptr<float>(),
         reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
         s.data_ptr<float>(),
-        rows, (int)D);
+        rows, (int)D, stream);
     CHECK_CUDA_ERROR(cudaGetLastError());
 }
 
@@ -176,15 +282,12 @@ std::vector<at::Tensor> fp8_quantize_per_channel(at::Tensor x) {
     at::Tensor xq = at::empty_like(xc, q_opts);
     at::Tensor s = at::empty({B, H, D}, s_opts);
 
-    int channels = (int)(B * H * D);
-    int threads = 256;
-    size_t smem = threads * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    fp8_quantize_per_channel_ker<<<channels, threads, smem, stream>>>(
+    launch_fp8_quantize_per_channel(
         xc.data_ptr<float>(),
         reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
         s.data_ptr<float>(),
-        (int)B, (int)H, (int)N, (int)D);
+        (int)B, (int)H, (int)N, (int)D, stream);
     CHECK_CUDA_ERROR(cudaGetLastError());
     return {xq, s};
 }
@@ -201,15 +304,12 @@ void fp8_quantize_per_channel_out(at::Tensor x, at::Tensor xq, at::Tensor s) {
     auto xc = x.contiguous();
     int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
     TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
-    int channels = (int)(B * H * D);
-    int threads = 256;
-    size_t smem = threads * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    fp8_quantize_per_channel_ker<<<channels, threads, smem, stream>>>(
+    launch_fp8_quantize_per_channel(
         xc.data_ptr<float>(),
         reinterpret_cast<fp8e4m3*>(xq.data_ptr()),
         s.data_ptr<float>(),
-        (int)B, (int)H, (int)N, (int)D);
+        (int)B, (int)H, (int)N, (int)D, stream);
     CHECK_CUDA_ERROR(cudaGetLastError());
 }
 
@@ -357,7 +457,7 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
     warpgroup::increase_registers<160>();
 
     rt_fl<16, K::kv_height>  att_block;             // QK^T accumulator (fp32)
-    rt_bf<16, K::kv_height>  p_bf;                  // P in bf16 for PV (TODO optional: fp8)
+    rt_bf<16, K::kv_height>  p_bf;                  // P in bf16 for PV (kept bf16 per SageBwd)
     rt_fl<16, K::tile_width> o_reg;                 // O accumulator (fp32)
 
     col_vec<rt_fl<16, K::kv_height>> max_vec, norm_vec, max_vec_last_scaled, max_vec_scaled;
@@ -415,14 +515,12 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
         warp::mul(norm_vec, norm_vec, max_vec_last_scaled);
         warp::row_sum(norm_vec, att_block, norm_vec);
 
-        // ---- Cast P → bf16 for PV (TODO: switch to fp8 e4m3 + V^T smem) -----
         warp::copy(p_bf, att_block);
 
         warp::mul_row(o_reg, o_reg, max_vec_last_scaled);
 
         wait(v_sem[kv_idx % K::stages], (kv_idx / K::stages) % 2);
 
-        // ---- PV : bf16 wgmma into fp32 (TODO: fp8 mma_ABt with V^T) --------
         warpgroup::mma_AB(o_reg, p_bf, v_smem[kv_idx % K::stages]);
         warpgroup::mma_async_wait();
 
