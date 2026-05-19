@@ -24,7 +24,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from .kernel_api import fp8_forward, require_extension
+from .kernel_api import fp8_forward, int8_forward, require_extension
 from .metrics import tensor_metrics
 from .recipe import prepare_forward_inputs
 from .references import (
@@ -89,6 +89,39 @@ def forward_metrics(B, H, N, D, *, seed):
         "vs_bf16":  tensor_metrics(O_kern, O_bf16),
         "vs_quant": tensor_metrics(O_kern, O_quant),
         # Baseline: how much error bf16 SDPA itself introduces vs fp32.
+        "bf16_vs_fp32": tensor_metrics(O_bf16, O_fp32),
+    }
+
+
+def forward_metrics_int8(B, H, N, D, *, seed):
+    """Run the INT8-GEMM1 forward kernel and compare to the same baselines.
+
+    INT8 path uses per-token symmetric INT8 quantization for Q,K (GEMM1 only);
+    PV stays bf16 so it can be compared directly to the FP8 forward kernel
+    on the same input tensors.
+    """
+    torch.manual_seed(seed)
+    Q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
+    K = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
+    V = torch.randn(B, H, N, D, device="cuda", dtype=torch.float32)
+
+    fwd = prepare_forward_inputs(Q, K, V, quant_dtype="int8")
+    O_kern, _ = int8_forward(fwd)
+    O_kern = O_kern.to(torch.float32)
+
+    O_fp32 = reference_attention(Q, K, V, causal=False)
+    O_bf16 = _bf16_sdpa(Q, K, V)
+    # fp8_quant_reference also works for int8: it just multiplies the
+    # integer-typed Qq/Kq by the float scale and runs fp32 SDPA.
+    O_quant = fp8_quant_reference(fwd.Qq, fwd.Kq, fwd.sq, fwd.sk, fwd.K_mean, V, causal=False)
+
+    return {
+        "shape": (B, H, N, D),
+        "seed": seed,
+        "qk_dtype": "int8",
+        "vs_fp32":  tensor_metrics(O_kern, O_fp32),
+        "vs_bf16":  tensor_metrics(O_kern, O_bf16),
+        "vs_quant": tensor_metrics(O_kern, O_quant),
         "bf16_vs_fp32": tensor_metrics(O_bf16, O_fp32),
     }
 
@@ -162,3 +195,7 @@ def bwd_passed(r):
 
 def require_kernels():
     require_extension("fp8_mha_forward", "fp8_mha_backward")
+
+
+def require_int8_kernels():
+    require_extension("int8_mha_forward", "int8_quantize_per_token")

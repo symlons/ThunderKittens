@@ -8,12 +8,15 @@ def tensor_metrics(out, ref):
     out = out.detach().to(torch.float32)
     ref = ref.detach().to(torch.float32)
     diff = (out - ref).abs()
+    sq_err = diff * diff
     sig = (ref * ref).sum().clamp_min(1e-30)
-    noise = (diff * diff).sum().clamp_min(1e-30)
+    noise = sq_err.sum().clamp_min(1e-30)
     ratio = (sig / noise).item()
+    rmse = math.sqrt(sq_err.mean().item())
     return {
         "max": diff.max().item(),
         "mean": diff.mean().item(),
+        "rmse": rmse,
         "rel_L1": diff.sum().item() / max(ref.abs().sum().item(), 1e-30),
         "rel_Linf": diff.max().item() / max(ref.abs().max().item(), 1e-30),
         "cos": F.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item(),
@@ -38,16 +41,23 @@ def fmt_forward(m):
     return (
         f"max={m['max']:.4f}  mean={m['mean']:.5f}  "
         f"rel-L1={m['rel_L1']:.3e}  rel-Linf={m['rel_Linf']:.3e}  "
-        f"cos={m['cos']:.6f}  QSNR={m['qsnr_dB']:.2f} dB"
+        f"RMSE={m['rmse']:.3e}  cos={m['cos']:.6f}  QSNR={m['qsnr_dB']:.2f} dB"
+    )
+
+
+def _fmt_grad_one(name, m):
+    return (
+        f"{name}[QSNR={m['qsnr_dB']:5.2f} relL1={m['rel_L1']:.2e} "
+        f"RMSE={m['rmse']:.2e} cos={m['cos']:.5f}]"
     )
 
 
 def fmt_grad(label, dQm, dKm, dVm):
     return (
         f"{label:<28} "
-        f"dQ[QSNR={dQm['qsnr_dB']:5.2f} relL1={dQm['rel_L1']:.2e} cos={dQm['cos']:.5f}] "
-        f"dK[QSNR={dKm['qsnr_dB']:5.2f} relL1={dKm['rel_L1']:.2e} cos={dKm['cos']:.5f}] "
-        f"dV[QSNR={dVm['qsnr_dB']:5.2f} relL1={dVm['rel_L1']:.2e} cos={dVm['cos']:.5f}]"
+        f"{_fmt_grad_one('dQ', dQm)} "
+        f"{_fmt_grad_one('dK', dKm)} "
+        f"{_fmt_grad_one('dV', dVm)}"
     )
 
 

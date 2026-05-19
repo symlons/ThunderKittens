@@ -19,7 +19,12 @@ from fp8_suite.kernel_api import (
     cuda_quantize_per_token,
     require_extension,
 )
-from fp8_suite.quant import quantize_per_channel_fp8, quantize_per_row_fp8
+from fp8_suite.metrics import tensor_metrics
+from fp8_suite.quant import (
+    quantize_per_channel_fp8,
+    quantize_per_row_fp8,
+    quantize_per_row_int8,
+)
 from fp8_suite.quant_correctness import (
     CRITERIA,
     INPUT_DISTRIBUTIONS,
@@ -79,6 +84,7 @@ def aggregate(rows, key_fn):
             "fail": len(rs) - n_pass,
             "min_qsnr": min((d["qsnr_dB"] for d in m_deq), default=float("nan")),
             "max_rel_L1": max((d["rel_L1"] for d in m_deq), default=0.0),
+            "max_rmse": max((d["rmse"] for d in m_deq), default=0.0),
             "min_cos": min((d["cos"] for d in m_deq), default=float("nan")),
             "max_byte_delta": max(r["fp8_byte_max_delta"] for r in rs),
             "max_scale_err": max(r["scale"]["max"] for r in rs),
@@ -91,14 +97,15 @@ def aggregate(rows, key_fn):
 def fmt_table(title, rows, key_label):
     lines = [
         f"### {title}\n",
-        f"| {key_label} | n | pass | fail | min QSNR | max rel-L1 | min cos | "
-        "max byte Δ | max scale err | max |Δdeq| | non-det |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        f"| {key_label} | n | pass | fail | min QSNR | max rel-L1 | max RMSE | "
+        "min cos | max byte Δ | max scale err | max |Δdeq| | non-det |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
             f"| {r['key']} | {r['n']} | {r['pass']} | {r['fail']} | "
-            f"{r['min_qsnr']:.2f} | {r['max_rel_L1']:.2e} | {r['min_cos']:.5f} | "
+            f"{r['min_qsnr']:.2f} | {r['max_rel_L1']:.2e} | "
+            f"{r['max_rmse']:.2e} | {r['min_cos']:.5f} | "
             f"{r['max_byte_delta']} | {r['max_scale_err']:.2e} | "
             f"{r['max_deq_max']:.2e} | {'yes' if r['any_nondet'] else 'no'} |"
         )
@@ -158,15 +165,17 @@ def write_report(out_path, device, results, fail_cases):
                      "dynamic per-token / per-channel scales, then dequantizing. "
                      "Lower is *better* (less loss). This is what downstream consumers "
                      "see as input noise.\n")
-        lines.append("| kind | granularity | mean QSNR | min QSNR | max rel-L1 | min cos |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| kind | granularity | mean QSNR | min QSNR | max rel-L1 | max RMSE | min cos |")
+        lines.append("|---|---|---|---|---|---|---|")
         for (kind, gran), ms in sorted(noise.items()):
             qs = [m["qsnr_dB"] for m in ms]
             cs = [m["cos"] for m in ms]
             rs = [m["rel_L1"] for m in ms]
+            rmses = [m["rmse"] for m in ms]
             lines.append(
                 f"| {kind} | {gran} | {sum(qs)/len(qs):.2f} dB | "
-                f"{min(qs):.2f} dB | {max(rs):.2e} | {min(cs):.5f} |"
+                f"{min(qs):.2f} dB | {max(rs):.2e} | {max(rmses):.2e} | "
+                f"{min(cs):.5f} |"
             )
         lines.append("")
         lines.append(
@@ -178,6 +187,40 @@ def write_report(out_path, device, results, fail_cases):
             "inside the kernel — not the input quantization — is the dominant "
             "error source.\n"
         )
+
+    # ---- INT8 quantization noise floor (same meaningful inputs) ----
+    int8_noise = defaultdict(list)
+    for r in meaningful:
+        if r["granularity"] != "token":
+            continue  # INT8 implementation is per-token only
+        gen = torch.Generator(device="cuda").manual_seed(r["seed"])
+        x = make_input(r["kind"], r["shape"], generator=gen).to(torch.float32)
+        xq_i8, s_i8 = quantize_per_row_int8(x)
+        deq_i8 = xq_i8.to(torch.float32) * s_i8.unsqueeze(-1)
+        int8_noise[r["kind"]].append(tensor_metrics(deq_i8, x))
+    if int8_noise:
+        lines.append("## INT8 (per-token symmetric) noise floor — head-to-head with FP8\n")
+        lines.append(
+            "Same fp32 inputs, same per-token granularity, dynamic scale = "
+            "`max(amax/127, 1e-12)`. Direct comparison with the FP8 e4m3 "
+            "per-token rows above. Motivated by SageBwd (arXiv:2410.02367): "
+            "INT8's uniform 8-bit resolution per element can outperform "
+            "FP8 e4m3 (4 exp + 3 mant bits) on roughly-symmetric, bounded-"
+            "tail data even before considering backward sensitivity.\n"
+        )
+        lines.append("| kind | n | mean QSNR | min QSNR | max rel-L1 | max RMSE | min cos |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for kind, ms in sorted(int8_noise.items()):
+            qs = [m["qsnr_dB"] for m in ms]
+            cs = [m["cos"] for m in ms]
+            rs = [m["rel_L1"] for m in ms]
+            rmses = [m["rmse"] for m in ms]
+            lines.append(
+                f"| {kind} | {len(ms)} | {sum(qs)/len(qs):.2f} dB | "
+                f"{min(qs):.2f} dB | {max(rs):.2e} | {max(rmses):.2e} | "
+                f"{min(cs):.5f} |"
+            )
+        lines.append("")
 
     if n_fail or fail_cases:
         lines.append("## Failures\n")

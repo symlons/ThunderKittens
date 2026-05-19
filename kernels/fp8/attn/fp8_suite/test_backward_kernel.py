@@ -193,7 +193,7 @@ def run_one(B, H, N, D, seed, *, bench_iters, bench_warmup=500, bench_groups=Non
     o_m = tensor_metrics(O, O_sdpa)
     if o_m["qsnr_dB"] < 20.0 or o_m["rel_L1"] > 0.1 or o_m["cos"] < 0.99:
         raise AssertionError(f"kernel forward O vs torch SDPA failed: QSNR={o_m['qsnr_dB']:.2f}")
-    print(f"  {'kernel O vs torch SDPA':<28} QSNR={o_m['qsnr_dB']:5.2f} relL1={o_m['rel_L1']:.2e} cos={o_m['cos']:.5f}")
+    print(f"  {'kernel O vs torch SDPA':<28} QSNR={o_m['qsnr_dB']:5.2f} relL1={o_m['rel_L1']:.2e} RMSE={o_m['rmse']:.2e} cos={o_m['cos']:.5f}")
     print_grads("kernel recipe SR-dO+SR-dS", recipe, ref)
     print_grads("kernel SR-dO + RTNE-dS", rtne, ref)
     print_grads("kernel SR-dO + bf16 dS", sr_dO_only, ref)

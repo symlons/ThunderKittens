@@ -2,6 +2,14 @@ import torch
 
 
 FP8_E4M3_MAX = 448.0
+INT8_MAX = 127.0
+
+
+def quantize_per_row_int8(x):
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    scale = (amax / INT8_MAX).to(torch.float32)
+    xq = torch.round(x / scale).clamp(-INT8_MAX, INT8_MAX).to(torch.int8)
+    return xq.contiguous(), scale.squeeze(-1).contiguous()
 
 
 def quantize_per_row_fp8(x):

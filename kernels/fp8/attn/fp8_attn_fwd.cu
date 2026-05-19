@@ -1707,11 +1707,421 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
     return {qg, kg, vg};
 }
 
+// =============================================================================
+// INT8 GEMM1 forward variant
+// =============================================================================
+//
+// SageBwd (https://arxiv.org/abs/2410.02367) reports that INT8 keeps higher
+// gradient quality than FP8 e4m3 in the attention backward path. To make
+// that comparison apples-to-apples on real hardware we expose an INT8 option
+// for GEMM1 (QK^T) only — PV stays in bf16 exactly like the FP8 forward
+// kernel above. Per-token symmetric int8 quantization mirrors the FP8 e4m3
+// per-token recipe (one scale per row, scale = max(amax/127, 1e-12)).
+
+constexpr float INT8_MAX_F = 127.0f;
+
+// TK's generic copy(rt<float>, rt<int>) routes through
+// convertor<float2, int2>, which isn't declared. Add the trivial
+// element-wise specialization so warp::copy(att_block, att_block_i32) works.
+namespace kittens { namespace base_types {
+template<> struct convertor<float2, int2> {
+    static __host__ __device__ inline float2 convert(const int2 & u) {
+        return make_float2((float)u.x, (float)u.y);
+    }
+};
+} } // namespace kittens::base_types
+
+template <int D>
+__global__ void int8_quantize_per_token_ker(const float *__restrict__ x,
+                                            int8_t *__restrict__ xq,
+                                            float *__restrict__ descale,
+                                            int rows) {
+    static_assert(D == 64 || D == 128, "Only D=64 or D=128 supported");
+    constexpr int WARPS_PER_BLOCK = 4;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row  = (int)blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (row >= rows) return;
+
+    const float *xr = x  + row * D;
+    int8_t      *xqr = xq + row * D;
+
+    if constexpr (D == 128) {
+        const float4 *xr_v = reinterpret_cast<const float4*>(xr);
+        float4 v = xr_v[lane];
+        float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                           fmaxf(fabsf(v.z), fabsf(v.w)));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+
+        float s = fmaxf(__fdiv_rn(amax, INT8_MAX_F), 1.0e-12f);
+        if (lane == 0) descale[row] = s;
+
+        char4 packed;
+        packed.x = (int8_t)max(-127, min(127, __float2int_rn(__fdiv_rn(v.x, s))));
+        packed.y = (int8_t)max(-127, min(127, __float2int_rn(__fdiv_rn(v.y, s))));
+        packed.z = (int8_t)max(-127, min(127, __float2int_rn(__fdiv_rn(v.z, s))));
+        packed.w = (int8_t)max(-127, min(127, __float2int_rn(__fdiv_rn(v.w, s))));
+        reinterpret_cast<uint32_t*>(xqr)[lane] = *reinterpret_cast<uint32_t*>(&packed);
+    } else { // D == 64
+        const float2 *xr_v = reinterpret_cast<const float2*>(xr);
+        float2 v = xr_v[lane];
+        float amax = fmaxf(fabsf(v.x), fabsf(v.y));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+
+        float s = fmaxf(__fdiv_rn(amax, INT8_MAX_F), 1.0e-12f);
+        if (lane == 0) descale[row] = s;
+
+        char2 packed;
+        packed.x = (int8_t)max(-127, min(127, __float2int_rn(__fdiv_rn(v.x, s))));
+        packed.y = (int8_t)max(-127, min(127, __float2int_rn(__fdiv_rn(v.y, s))));
+        reinterpret_cast<uint16_t*>(xqr)[lane] = *reinterpret_cast<uint16_t*>(&packed);
+    }
+}
+
+static inline void launch_int8_quantize_per_token(const float *x,
+                                                  int8_t *xq,
+                                                  float *s,
+                                                  int rows,
+                                                  int D,
+                                                  cudaStream_t stream) {
+    constexpr int WARPS_PER_BLOCK   = 4;
+    constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
+    int blocks = (rows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    if (D == 128) {
+        int8_quantize_per_token_ker<128>
+            <<<blocks, THREADS_PER_BLOCK, 0, stream>>>(x, xq, s, rows);
+    } else {
+        int8_quantize_per_token_ker<64>
+            <<<blocks, THREADS_PER_BLOCK, 0, stream>>>(x, xq, s, rows);
+    }
+}
+
+std::vector<at::Tensor> int8_quantize_per_token(at::Tensor x) {
+    CHECK_INPUT(x);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Float, "input must be float32");
+    TORCH_CHECK(x.dim() == 4, "input must have shape (B,H,N,D)");
+    auto xc = x.contiguous();
+    int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
+    TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
+
+    auto q_opts = xc.options().dtype(at::kChar);
+    auto s_opts = xc.options().dtype(at::kFloat);
+    at::Tensor xq = at::empty_like(xc, q_opts);
+    at::Tensor s  = at::empty({B, H, N}, s_opts);
+
+    int rows = (int)(B * H * N);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    launch_int8_quantize_per_token(
+        xc.data_ptr<float>(),
+        xq.data_ptr<int8_t>(),
+        s.data_ptr<float>(),
+        rows, (int)D, stream);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {xq, s};
+}
+
+// ---- INT8 forward kernel (GEMM1 in int8, softmax / PV unchanged) -----------
+
+template<int D> struct int8_attn_globals {
+    using K = fp8_attn_tile_dims<D>;
+
+    using q_tile = st<kittens::int8, K::qo_height, K::tile_width>;
+    using k_tile = st<kittens::int8, K::kv_height, K::tile_width>;
+    using v_tile = st_bf<K::kv_height, K::tile_width>;
+    using o_tile = st_bf<K::qo_height, K::tile_width>;
+    using l_col_vec = col_vec<st_fl<K::qo_height, K::tile_width>>;
+
+    using scale_qk_layout = gl<float, -1, -1, 1, -1>;
+    using vmean_layout    = gl<bf16,  -1, -1, 1, -1>;
+
+    using q_gl = gl<kittens::int8, -1, -1, -1, -1, q_tile>;
+    using k_gl = gl<kittens::int8, -1, -1, -1, -1, k_tile>;
+    using v_gl = gl<bf16,          -1, -1, -1, -1, v_tile>;
+    using l_gl = gl<float,         -1, -1, -1, -1, l_col_vec>;
+    using o_gl = gl<bf16,          -1, -1, -1, -1, o_tile>;
+
+    q_gl q;
+    k_gl k;
+    v_gl v;
+    l_gl l;
+    o_gl o;
+
+    scale_qk_layout sq;
+    scale_qk_layout sk;
+    vmean_layout    vm;
+
+    const int N;
+    const int hr;
+};
+
+template<int D>
+__global__ __launch_bounds__(NUM_WORKERS * kittens::WARP_THREADS, 1)
+void int8_attn_fwd_ker(const __grid_constant__ int8_attn_globals<D> g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+
+    using K = fp8_attn_tile_dims<D>;
+    using q_tile    = st<kittens::int8, K::qo_height, K::tile_width>;
+    using k_tile    = st<kittens::int8, K::kv_height, K::tile_width>;
+    using v_tile    = st_bf<K::kv_height, K::tile_width>;
+    using o_tile    = st_bf<K::qo_height, K::tile_width>;
+    using l_col_vec = col_vec<st_fl<K::qo_height, K::tile_width>>;
+
+    int warpid       = kittens::warpid();
+    int warpgroupid  = warpid / kittens::WARPGROUP_WARPS;
+
+    q_tile    (&q_smem)[CONSUMER_WARPGROUPS] = al.allocate<q_tile, CONSUMER_WARPGROUPS>();
+    k_tile    (&k_smem)[K::stages]           = al.allocate<k_tile, K::stages>();
+    v_tile    (&v_smem)[K::stages]           = al.allocate<v_tile, K::stages>();
+    l_col_vec (&l_smem)[CONSUMER_WARPGROUPS] = al.allocate<l_col_vec, CONSUMER_WARPGROUPS>();
+    auto      (*o_smem)                      = reinterpret_cast<o_tile(*)>(q_smem);
+
+    int kv_blocks   = g.N / K::kv_height;
+    int kv_head_idx = blockIdx.y / g.hr;
+    int seq_idx     = blockIdx.x * CONSUMER_WARPGROUPS;
+
+    __shared__ kittens::semaphore qsmem_sem,
+                                  k_sem[K::stages], v_sem[K::stages],
+                                  done_sem[K::stages];
+
+    if (threadIdx.x == 0) {
+        init_semaphore(qsmem_sem, 0, 1);
+        for (int j = 0; j < K::stages; ++j) {
+            init_semaphore(k_sem[j], 0, 1);
+            init_semaphore(v_sem[j], 0, 1);
+            init_semaphore(done_sem[j], CONSUMER_WARPGROUPS, 0);
+        }
+
+        tma::expect_bytes(qsmem_sem, sizeof(q_smem));
+        for (int wg = 0; wg < CONSUMER_WARPGROUPS; ++wg) {
+            coord<q_tile> q_idx = {blockIdx.z, blockIdx.y, seq_idx + wg, 0};
+            tma::load_async(q_smem[wg], g.q, q_idx, qsmem_sem);
+        }
+
+        for (int j = 0; j < K::stages - 1; ++j) {
+            coord<k_tile> kv_idx = {blockIdx.z, kv_head_idx, j, 0};
+            tma::expect_bytes(k_sem[j], sizeof(k_tile));
+            tma::load_async(k_smem[j], g.k, kv_idx, k_sem[j]);
+            tma::expect_bytes(v_sem[j], sizeof(v_tile));
+            tma::load_async(v_smem[j], g.v, kv_idx, v_sem[j]);
+        }
+    }
+    __syncthreads();
+
+    int pipe_idx = K::stages - 1;
+
+    if (warpgroupid == NUM_WARPGROUPS - 1) {
+        warpgroup::decrease_registers<32>();
+        int kv_iters = kv_blocks - 2;
+        if (warpid == NUM_WORKERS - 4) {
+            for (int kv_idx = pipe_idx - 1; kv_idx <= kv_iters; ++kv_idx) {
+                coord<k_tile> kv_tile_idx = {blockIdx.z, kv_head_idx, kv_idx + 1, 0};
+                int s = (kv_idx + 1) % K::stages;
+                warp::tma::expect_bytes(k_sem[s], sizeof(k_tile));
+                warp::tma::load_async(k_smem[s], g.k, kv_tile_idx, k_sem[s]);
+                warp::tma::expect_bytes(v_sem[s], sizeof(v_tile));
+                warp::tma::load_async(v_smem[s], g.v, kv_tile_idx, v_sem[s]);
+                wait(done_sem[kv_idx % K::stages], (kv_idx / K::stages) % 2);
+            }
+        }
+        return;
+    }
+
+    warpgroup::increase_registers<160>();
+
+    rt<int, 16, K::kv_height>  att_block_i32;
+    rt_fl<16, K::kv_height>    att_block;
+    rt_bf<16, K::kv_height>    p_bf;
+    rt_fl<16, K::tile_width>   o_reg;
+
+    col_vec<rt_fl<16, K::kv_height>> max_vec, norm_vec, max_vec_last_scaled, max_vec_scaled;
+
+    warp::neg_infty(max_vec);
+    warp::zero(norm_vec);
+    warp::zero(o_reg);
+
+    int kv_iters = kv_blocks - 1;
+
+    wait(qsmem_sem, 0);
+
+    constexpr float inv_sqrt_d =
+        (D == 128) ? 0.08838834764f : 0.125f;
+
+    for (int kv_idx = 0; kv_idx <= kv_iters; ++kv_idx) {
+        // ---- QK^T : int8 wgmma into int32 -----------------------------------
+        wait(k_sem[kv_idx % K::stages], (kv_idx / K::stages) % 2);
+        warpgroup::mm_ABt(att_block_i32, q_smem[warpgroupid], k_smem[kv_idx % K::stages]);
+
+        warp::copy(max_vec_last_scaled, max_vec);
+        warp::mul(max_vec_last_scaled, max_vec_last_scaled, LOG2E * inv_sqrt_d);
+
+        warpgroup::mma_async_wait();
+
+        // int32 -> fp32 then apply per-row Q,K scales
+        warp::copy(att_block, att_block_i32);
+        {
+            col_vec<rt_fl<16, K::kv_height>> q_scale_cv;
+            row_vec<rt_fl<16, K::kv_height>> k_scale_rv;
+            warpgroup::load(q_scale_cv, g.sq,
+                {blockIdx.z, blockIdx.y, 0, seq_idx + warpgroupid});
+            warp::load(k_scale_rv, g.sk,
+                {blockIdx.z, kv_head_idx, 0, kv_idx});
+            warp::mul_row(att_block, att_block, q_scale_cv);
+            warp::mul_col(att_block, att_block, k_scale_rv);
+        }
+
+        warp::row_max(max_vec, att_block, max_vec);
+        warp::mul(att_block,    att_block,    LOG2E * inv_sqrt_d);
+        warp::mul(max_vec_scaled, max_vec,    LOG2E * inv_sqrt_d);
+
+        warp::sub_row(att_block, att_block, max_vec_scaled);
+        warp::exp2   (att_block, att_block);
+
+        warp::sub(max_vec_last_scaled, max_vec_last_scaled, max_vec_scaled);
+        warp::exp2(max_vec_last_scaled, max_vec_last_scaled);
+
+        warp::mul(norm_vec, norm_vec, max_vec_last_scaled);
+        warp::row_sum(norm_vec, att_block, norm_vec);
+
+        warp::copy(p_bf, att_block);
+
+        warp::mul_row(o_reg, o_reg, max_vec_last_scaled);
+
+        wait(v_sem[kv_idx % K::stages], (kv_idx / K::stages) % 2);
+
+        warpgroup::mma_AB(o_reg, p_bf, v_smem[kv_idx % K::stages]);
+        warpgroup::mma_async_wait();
+
+        if (warpgroup::laneid() == 0) arrive(done_sem[kv_idx % K::stages], 1);
+    }
+
+    warp::div_row(o_reg, o_reg, norm_vec);
+
+    {
+        row_vec<rt_fl<16, K::tile_width>> v_mean_rv;
+        warp::load(v_mean_rv, g.vm, {blockIdx.z, kv_head_idx, 0, 0});
+        warp::add_col(o_reg, o_reg, v_mean_rv);
+    }
+
+    warpgroup::store(o_smem[warpgroupid], o_reg);
+    warpgroup::sync(warpgroupid + 4);
+    if (warpid % 4 == 0) {
+        coord<o_tile> o_idx = {blockIdx.z, blockIdx.y, seq_idx + warpgroupid, 0};
+        warp::tma::store_async(g.o, o_smem[warpgroupid], o_idx);
+    }
+
+    warp::mul(max_vec_scaled, max_vec_scaled, 0.69314718056f);
+    warp::log(norm_vec, norm_vec);
+    warp::add(norm_vec, norm_vec, max_vec_scaled);
+    if constexpr (D == 128) warp::mul(norm_vec, norm_vec, -11.313708499f);
+    else                    warp::mul(norm_vec, norm_vec, -8.0f);
+
+    warpgroup::store(l_smem[warpgroupid], norm_vec);
+    warpgroup::sync(warpgroupid + 4);
+    if (warpid % 4 == 0) {
+        coord<l_col_vec> l_idx = {blockIdx.z, blockIdx.y, 0, seq_idx + warpgroupid};
+        warp::tma::store_async(g.l, l_smem[warpgroupid], l_idx);
+    }
+    warp::tma::store_async_wait();
+}
+
+std::vector<at::Tensor>
+int8_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
+                       at::Tensor sq, at::Tensor sk, at::Tensor vm)
+{
+    CHECK_INPUT(q); CHECK_INPUT(k); CHECK_INPUT(v);
+    CHECK_INPUT(sq); CHECK_INPUT(sk); CHECK_INPUT(vm);
+
+    auto batch    = q.size(0);
+    auto qo_heads = q.size(1);
+    auto kv_heads = k.size(1);
+    auto seq_len  = q.size(2);
+    auto head_dim = q.size(3);
+
+    TORCH_CHECK(q.scalar_type() == at::ScalarType::Char, "Q must be int8");
+    TORCH_CHECK(k.scalar_type() == at::ScalarType::Char, "K must be int8");
+    TORCH_CHECK(v.scalar_type() == at::ScalarType::BFloat16, "V must be bf16");
+    TORCH_CHECK(vm.scalar_type() == at::ScalarType::BFloat16, "V channel-mean must be bf16");
+    TORCH_CHECK(qo_heads % kv_heads == 0, "qo_heads must be a multiple of kv_heads");
+    TORCH_CHECK(head_dim == 64 || head_dim == 128, "Only D=64 and D=128 are supported");
+    TORCH_CHECK(seq_len % 384 == 0,
+                "seq_len must be a multiple of 384 (LCM of 3*qo_height=192 and kv_height=128)");
+
+    auto hr = qo_heads / kv_heads;
+
+    kittens::int8 *d_q  = reinterpret_cast<kittens::int8*>(q.data_ptr<int8_t>());
+    kittens::int8 *d_k  = reinterpret_cast<kittens::int8*>(k.data_ptr<int8_t>());
+    bf16          *d_v  = reinterpret_cast<bf16*>(v.data_ptr<c10::BFloat16>());
+    bf16          *d_vm = reinterpret_cast<bf16*>(vm.data_ptr<c10::BFloat16>());
+    float         *d_sq = sq.data_ptr<float>();
+    float         *d_sk = sk.data_ptr<float>();
+
+    auto opts_bf = v.options().dtype(at::kBFloat16);
+    auto opts_fl = v.options().dtype(at::kFloat);
+
+    at::Tensor o = at::empty({batch, qo_heads, seq_len, head_dim}, opts_bf);
+    at::Tensor l = at::empty({batch, qo_heads, seq_len, 1}, opts_fl);
+
+    bf16  *d_o = reinterpret_cast<bf16*>(o.data_ptr<c10::BFloat16>());
+    float *d_l = l.data_ptr<float>();
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto mem_size = kittens::MAX_SHARED_MEMORY - 1024;
+
+    auto launch = [&](auto D_v) {
+        constexpr int D = decltype(D_v)::value;
+        using globals = int8_attn_globals<D>;
+        using qg = typename globals::q_gl;
+        using kg = typename globals::k_gl;
+        using vg = typename globals::v_gl;
+        using lg = typename globals::l_gl;
+        using og = typename globals::o_gl;
+        using sqg = typename globals::scale_qk_layout;
+        using vmg = typename globals::vmean_layout;
+
+        qg q_arg{d_q, (uint)batch, (uint)qo_heads, (uint)seq_len, (uint)D};
+        kg k_arg{d_k, (uint)batch, (uint)kv_heads, (uint)seq_len, (uint)D};
+        vg v_arg{d_v, (uint)batch, (uint)kv_heads, (uint)seq_len, (uint)D};
+        lg l_arg{d_l, (uint)batch, (uint)qo_heads, 1U,            (uint)seq_len};
+        og o_arg{d_o, (uint)batch, (uint)qo_heads, (uint)seq_len, (uint)D};
+        sqg sq_arg{d_sq, (size_t)batch, (size_t)qo_heads, nullptr, (size_t)seq_len};
+        sqg sk_arg{d_sk, (size_t)batch, (size_t)kv_heads, nullptr, (size_t)seq_len};
+        vmg vm_arg{d_vm, (size_t)batch, (size_t)kv_heads, nullptr, (size_t)D};
+
+        globals g{q_arg, k_arg, v_arg, l_arg, o_arg,
+                  sq_arg, sk_arg, vm_arg,
+                  static_cast<int>(seq_len), static_cast<int>(hr)};
+
+        dim3 grid(seq_len / (CONSUMER_WARPGROUPS * kittens::TILE_ROW_DIM<bf16> * 4),
+                  qo_heads, batch);
+
+        cudaFuncSetAttribute(int8_attn_fwd_ker<D>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+        int8_attn_fwd_ker<D>
+            <<<grid, 32 * NUM_WORKERS, mem_size, stream>>>(g);
+        CHECK_CUDA_ERROR(cudaGetLastError());
+    };
+
+    if (head_dim == 128) launch(std::integral_constant<int, 128>{});
+    else                 launch(std::integral_constant<int, 64>{});
+
+    return {o, l};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_quantize_per_token", fp8_quantize_per_token, "FP8 e4m3 quantization with one descale per token/row");
     m.def("fp8_quantize_per_token_out", fp8_quantize_per_token_out, "FP8 e4m3 token quantization into preallocated output tensors");
     m.def("fp8_quantize_per_channel", fp8_quantize_per_channel, "FP8 e4m3 quantization with one descale per channel");
     m.def("fp8_quantize_per_channel_out", fp8_quantize_per_channel_out, "FP8 e4m3 channel quantization into preallocated output tensors");
+    m.def("int8_quantize_per_token", int8_quantize_per_token, "INT8 symmetric per-token quantization");
+    m.def("int8_mha_forward", int8_attention_forward,
+          "INT8 GEMM1 / bf16 PV multi-head attention forward (SageBwd-style "
+          "INT8-QK ablation; PV stays bf16 like the FP8 forward). "
+          "Non-causal / bidirectional — diffusion attention only.");
     m.def("fp8_mha_forward", fp8_attention_forward, "FP8 e4m3 multi-head attention forward (SageAttention2 recipe, " "non-causal / bidirectional — diffusion attention only)");
     m.def("fp8_mha_backward", fp8_attention_backward,
           "FP8 e4m3 multi-head attention backward with actual FP8 wgmma for "

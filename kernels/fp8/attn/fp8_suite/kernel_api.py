@@ -24,6 +24,21 @@ def cuda_quantize_per_channel(x):
     return require_extension("fp8_quantize_per_channel").fp8_quantize_per_channel(x.contiguous())
 
 
+def cuda_quantize_per_token_int8(x):
+    return require_extension("int8_quantize_per_token").int8_quantize_per_token(x.contiguous())
+
+
+def int8_forward(prepared):
+    return require_extension("int8_mha_forward").int8_mha_forward(
+        prepared.Qq,
+        prepared.Kq,
+        prepared.Vbf,
+        prepared.sq.to("cuda").contiguous().to(prepared.sq.dtype),
+        prepared.sk.to("cuda").contiguous().to(prepared.sk.dtype),
+        prepared.vm,
+    )
+
+
 def cuda_quantize_per_token_out(x, xq, scale):
     require_extension("fp8_quantize_per_token_out").fp8_quantize_per_token_out(x.contiguous(), xq, scale)
 

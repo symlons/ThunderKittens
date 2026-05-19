@@ -22,76 +22,91 @@
 
 ### By granularity
 
-| granularity | n | pass | fail | min QSNR | max rel-L1 | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
-|---|---|---|---|---|---|---|---|---|---|---|
-| channel | 4023 | 4023 | 0 | 58.27 | 8.50e-06 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
-| token | 4023 | 4023 | 0 | 62.27 | 3.88e-06 | 1.00000 | 1 | 9.54e-07 | 2.98e+02 | no |
+| granularity | n | pass | fail | min QSNR | max rel-L1 | max RMSE | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| channel | 4023 | 4023 | 0 | 58.27 | 8.50e-06 | 1.84e-01 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
+| token | 4023 | 4023 | 0 | 62.27 | 3.88e-06 | 8.53e-02 | 1.00000 | 1 | 9.54e-07 | 2.98e+02 | no |
 
 ### By input distribution
 
-| kind | n | pass | fail | min QSNR | max rel-L1 | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
-|---|---|---|---|---|---|---|---|---|---|---|
-| large | 894 | 894 | 0 | 74.67 | 1.32e-06 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
-| mixed | 894 | 894 | 0 | 65.93 | 1.62e-06 | 1.00000 | 1 | 4.77e-07 | 1.33e+02 | no |
-| negative | 894 | 894 | 0 | 72.36 | 5.92e-07 | 1.00000 | 1 | 9.31e-10 | 3.57e-01 | no |
-| normal | 894 | 894 | 0 | 62.27 | 3.88e-06 | 1.00000 | 1 | 9.31e-10 | 3.24e-01 | no |
-| one_outlier_per_row | 894 | 894 | 0 | 126.15 | 1.16e-08 | 1.00000 | 1 | 1.46e-11 | 7.11e-03 | no |
-| positive | 894 | 894 | 0 | 72.36 | 5.92e-07 | 1.00000 | 1 | 9.31e-10 | 3.57e-01 | no |
-| tiny | 894 | 894 | 0 | 58.27 | 8.50e-06 | 1.00000 | 1 | 1.14e-13 | 3.14e-05 | no |
-| uniform | 894 | 894 | 0 | 72.34 | 1.14e-06 | 1.00000 | 1 | 2.33e-10 | 7.14e-02 | no |
-| zeros | 894 | 894 | 0 | nan | 0.00e+00 | nan | 0 | 9.98e-13 | 0.00e+00 | no |
+| kind | n | pass | fail | min QSNR | max rel-L1 | max RMSE | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| large | 894 | 894 | 0 | 74.67 | 1.32e-06 | 1.84e-01 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
+| mixed | 894 | 894 | 0 | 65.93 | 1.62e-06 | 5.64e-02 | 1.00000 | 1 | 4.77e-07 | 1.33e+02 | no |
+| negative | 894 | 894 | 0 | 72.36 | 5.92e-07 | 6.96e-04 | 1.00000 | 1 | 9.31e-10 | 3.57e-01 | no |
+| normal | 894 | 894 | 0 | 62.27 | 3.88e-06 | 7.68e-04 | 1.00000 | 1 | 9.31e-10 | 3.24e-01 | no |
+| one_outlier_per_row | 894 | 894 | 0 | 126.15 | 1.16e-08 | 1.31e-05 | 1.00000 | 1 | 1.46e-11 | 7.11e-03 | no |
+| positive | 894 | 894 | 0 | 72.36 | 5.92e-07 | 6.96e-04 | 1.00000 | 1 | 9.31e-10 | 3.57e-01 | no |
+| tiny | 894 | 894 | 0 | 58.27 | 8.50e-06 | 1.21e-07 | 1.00000 | 1 | 1.14e-13 | 3.14e-05 | no |
+| uniform | 894 | 894 | 0 | 72.34 | 1.14e-06 | 1.39e-04 | 1.00000 | 1 | 2.33e-10 | 7.14e-02 | no |
+| zeros | 894 | 894 | 0 | nan | 0.00e+00 | 0.00e+00 | nan | 0 | 9.98e-13 | 0.00e+00 | no |
 
 ### By head dim D
 
-| D | n | pass | fail | min QSNR | max rel-L1 | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 128 | 4158 | 4158 | 0 | 58.27 | 8.50e-06 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
-| 64 | 3888 | 3888 | 0 | 58.30 | 8.46e-06 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
+| D | n | pass | fail | min QSNR | max rel-L1 | max RMSE | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 128 | 4158 | 4158 | 0 | 58.27 | 8.50e-06 | 1.44e-01 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
+| 64 | 3888 | 3888 | 0 | 58.30 | 8.46e-06 | 1.84e-01 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
 
 ### By sequence length N
 
-| N | n | pass | fail | min QSNR | max rel-L1 | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | 648 | 648 | 0 | 139.80 | 9.89e-08 | 1.00000 | 0 | 9.54e-07 | 4.88e-04 | no |
-| 1024 | 648 | 648 | 0 | 61.33 | 4.24e-06 | 1.00000 | 1 | 9.54e-07 | 2.37e+02 | no |
-| 128 | 648 | 648 | 0 | 62.41 | 3.76e-06 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
-| 16 | 648 | 648 | 0 | 65.44 | 1.90e-06 | 1.00000 | 1 | 9.54e-07 | 4.42e+01 | no |
-| 16384 | 648 | 648 | 0 | 66.03 | 1.41e-06 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
-| 2048 | 648 | 648 | 0 | 64.36 | 2.14e-06 | 1.00000 | 1 | 9.54e-07 | 2.45e+02 | no |
-| 255 | 702 | 702 | 0 | 58.27 | 8.50e-06 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
-| 256 | 648 | 648 | 0 | 58.29 | 8.46e-06 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
-| 257 | 702 | 702 | 0 | 58.31 | 8.43e-06 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
-| 31 | 648 | 648 | 0 | 62.27 | 3.88e-06 | 1.00000 | 1 | 9.54e-07 | 8.99e+01 | no |
-| 4096 | 648 | 648 | 0 | 66.03 | 1.41e-06 | 1.00000 | 1 | 9.54e-07 | 2.70e+02 | no |
-| 4101 | 54 | 54 | 0 | 79.89 | 1.57e-07 | 1.00000 | 1 | 9.54e-07 | 1.51e+02 | no |
-| 511 | 54 | 54 | 0 | 70.38 | 6.45e-07 | 1.00000 | 1 | 9.54e-07 | 1.04e+02 | no |
-| 512 | 648 | 648 | 0 | 58.30 | 8.46e-06 | 1.00000 | 1 | 9.54e-07 | 2.23e+02 | no |
-| 513 | 54 | 54 | 0 | 70.39 | 6.43e-07 | 1.00000 | 1 | 9.54e-07 | 1.04e+02 | no |
+| N | n | pass | fail | min QSNR | max rel-L1 | max RMSE | min cos | max byte Δ | max scale err | max |Δdeq| | non-det |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 648 | 648 | 0 | 139.80 | 9.89e-08 | 9.34e-05 | 1.00000 | 0 | 9.54e-07 | 4.88e-04 | no |
+| 1024 | 648 | 648 | 0 | 61.33 | 4.24e-06 | 1.44e-01 | 1.00000 | 1 | 9.54e-07 | 2.37e+02 | no |
+| 128 | 648 | 648 | 0 | 62.41 | 3.76e-06 | 1.74e-01 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
+| 16 | 648 | 648 | 0 | 65.44 | 1.90e-06 | 8.86e-02 | 1.00000 | 1 | 9.54e-07 | 4.42e+01 | no |
+| 16384 | 648 | 648 | 0 | 66.03 | 1.41e-06 | 1.12e-01 | 1.00000 | 1 | 9.54e-07 | 3.23e+02 | no |
+| 2048 | 648 | 648 | 0 | 64.36 | 2.14e-06 | 9.90e-02 | 1.00000 | 1 | 9.54e-07 | 2.45e+02 | no |
+| 255 | 702 | 702 | 0 | 58.27 | 8.50e-06 | 1.49e-01 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
+| 256 | 648 | 648 | 0 | 58.29 | 8.46e-06 | 1.19e-01 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
+| 257 | 702 | 702 | 0 | 58.31 | 8.43e-06 | 1.13e-01 | 1.00000 | 1 | 9.54e-07 | 2.28e+02 | no |
+| 31 | 648 | 648 | 0 | 62.27 | 3.88e-06 | 8.92e-02 | 1.00000 | 1 | 9.54e-07 | 8.99e+01 | no |
+| 4096 | 648 | 648 | 0 | 66.03 | 1.41e-06 | 9.72e-02 | 1.00000 | 1 | 9.54e-07 | 2.70e+02 | no |
+| 4101 | 54 | 54 | 0 | 79.89 | 1.57e-07 | 7.38e-02 | 1.00000 | 1 | 9.54e-07 | 1.51e+02 | no |
+| 511 | 54 | 54 | 0 | 70.38 | 6.45e-07 | 1.44e-01 | 1.00000 | 1 | 9.54e-07 | 1.04e+02 | no |
+| 512 | 648 | 648 | 0 | 58.30 | 8.46e-06 | 1.84e-01 | 1.00000 | 1 | 9.54e-07 | 2.23e+02 | no |
+| 513 | 54 | 54 | 0 | 70.39 | 6.43e-07 | 1.44e-01 | 1.00000 | 1 | 9.54e-07 | 1.04e+02 | no |
 
 ## FP8 e4m3 quantization noise floor (dequant vs original fp32)
 
 Intrinsic loss from quantizing fp32 inputs to FP8 e4m3 with dynamic per-token / per-channel scales, then dequantizing. Lower is *better* (less loss). This is what downstream consumers see as input noise.
 
-| kind | granularity | mean QSNR | min QSNR | max rel-L1 | min cos |
-|---|---|---|---|---|---|
-| large | channel | 41.79 dB | 31.53 dB | 2.25e-02 | 0.99965 |
-| large | token | 31.90 dB | 30.86 dB | 2.37e-02 | 0.99960 |
-| mixed | channel | 43.56 dB | 31.54 dB | 2.25e-02 | 0.99965 |
-| mixed | token | 35.33 dB | 32.30 dB | 1.88e-02 | 0.99975 |
-| negative | channel | 41.88 dB | 31.86 dB | 2.21e-02 | 0.99967 |
-| negative | token | 32.02 dB | 31.73 dB | 2.25e-02 | 0.99966 |
-| normal | channel | 41.72 dB | 31.53 dB | 2.25e-02 | 0.99965 |
-| normal | token | 31.90 dB | 30.86 dB | 2.37e-02 | 0.99960 |
-| one_outlier_per_row | channel | 96.21 dB | 84.18 dB | 4.96e-04 | 1.00000 |
-| one_outlier_per_row | token | 85.69 dB | 83.59 dB | 5.27e-04 | 1.00000 |
-| positive | channel | 41.88 dB | 31.86 dB | 2.21e-02 | 0.99967 |
-| positive | token | 32.02 dB | 31.73 dB | 2.25e-02 | 0.99966 |
-| tiny | channel | 41.72 dB | 31.53 dB | 2.25e-02 | 0.99965 |
-| tiny | token | 31.90 dB | 30.86 dB | 2.37e-02 | 0.99960 |
-| uniform | channel | 41.73 dB | 31.86 dB | 2.21e-02 | 0.99967 |
-| uniform | token | 32.03 dB | 31.82 dB | 2.21e-02 | 0.99967 |
+| kind | granularity | mean QSNR | min QSNR | max rel-L1 | max RMSE | min cos |
+|---|---|---|---|---|---|---|
+| large | channel | 41.79 dB | 31.53 dB | 2.25e-02 | 2.65e+01 | 0.99965 |
+| large | token | 31.90 dB | 30.86 dB | 2.37e-02 | 3.06e+01 | 0.99960 |
+| mixed | channel | 43.56 dB | 31.54 dB | 2.25e-02 | 2.96e+00 | 0.99965 |
+| mixed | token | 35.33 dB | 32.30 dB | 1.88e-02 | 3.20e+00 | 0.99975 |
+| negative | channel | 41.88 dB | 31.86 dB | 2.21e-02 | 7.37e-02 | 0.99967 |
+| negative | token | 32.02 dB | 31.73 dB | 2.25e-02 | 7.61e-02 | 0.99966 |
+| normal | channel | 41.72 dB | 31.53 dB | 2.25e-02 | 2.65e-02 | 0.99965 |
+| normal | token | 31.90 dB | 30.86 dB | 2.37e-02 | 3.06e-02 | 0.99960 |
+| one_outlier_per_row | channel | 96.21 dB | 84.18 dB | 4.96e-04 | 1.64e-03 | 1.00000 |
+| one_outlier_per_row | token | 85.69 dB | 83.59 dB | 5.27e-04 | 1.93e-03 | 1.00000 |
+| positive | channel | 41.88 dB | 31.86 dB | 2.21e-02 | 7.37e-02 | 0.99967 |
+| positive | token | 32.02 dB | 31.73 dB | 2.25e-02 | 7.61e-02 | 0.99966 |
+| tiny | channel | 41.72 dB | 31.53 dB | 2.25e-02 | 2.65e-06 | 0.99965 |
+| tiny | token | 31.90 dB | 30.86 dB | 2.37e-02 | 3.06e-06 | 0.99960 |
+| uniform | channel | 41.73 dB | 31.86 dB | 2.21e-02 | 1.48e-02 | 0.99967 |
+| uniform | token | 32.03 dB | 31.82 dB | 2.21e-02 | 1.49e-02 | 0.99967 |
 
 For *normal* fp32 data, FP8 e4m3 with dynamic scaling lands at ≈ **32 dB QSNR / ~2.2% rel-L1**. This is the intrinsic 3-bit-mantissa rounding noise of e4m3 — for reference: bf16 ≈ 50 dB, fp16 ≈ 60+ dB. The downstream FP8 attention gradient QSNR (~22-26 dB end-to-end) is *below* this 32 dB noise floor, so the matmul/softmax accumulation inside the kernel — not the input quantization — is the dominant error source.
+
+## INT8 (per-token symmetric) noise floor — head-to-head with FP8
+
+Same fp32 inputs, same per-token granularity, dynamic scale = `max(amax/127, 1e-12)`. Direct comparison with the FP8 e4m3 per-token rows above. Motivated by SageBwd (arXiv:2410.02367): INT8's uniform 8-bit resolution per element can outperform FP8 e4m3 (4 exp + 3 mant bits) on roughly-symmetric, bounded-tail data even before considering backward sensitivity.
+
+| kind | n | mean QSNR | min QSNR | max rel-L1 | max RMSE | min cos |
+|---|---|---|---|---|---|---|
+| large | 447 | 44.16 dB | 42.09 dB | 8.89e-03 | 7.51e+00 | 0.99997 |
+| mixed | 447 | 49.40 dB | 47.18 dB | 7.03e-03 | 5.49e-01 | 0.99999 |
+| negative | 447 | 48.25 dB | 47.10 dB | 4.64e-03 | 1.18e-02 | 0.99999 |
+| normal | 447 | 44.16 dB | 42.09 dB | 8.89e-03 | 7.51e-03 | 0.99997 |
+| one_outlier_per_row | 447 | 54.74 dB | 53.00 dB | 2.17e-02 | 6.09e-02 | 1.00000 |
+| positive | 447 | 48.25 dB | 47.10 dB | 4.64e-03 | 1.18e-02 | 0.99999 |
+| tiny | 447 | 44.16 dB | 42.09 dB | 8.89e-03 | 7.51e-07 | 0.99997 |
+| uniform | 447 | 48.25 dB | 47.89 dB | 4.05e-03 | 2.35e-03 | 0.99999 |
 
 ## Key findings
 

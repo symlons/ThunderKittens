@@ -3,12 +3,17 @@ from dataclasses import dataclass
 
 import torch
 
-from .kernel_api import cuda_quantize_per_channel, cuda_quantize_per_token
+from .kernel_api import (
+    cuda_quantize_per_channel,
+    cuda_quantize_per_token,
+    cuda_quantize_per_token_int8,
+)
 from .quant import (
     broadcast_descale,
     quantize_per_channel_fp8,
     quantize_per_channel_fp8_sr,
     quantize_per_row_fp8,
+    quantize_per_row_int8,
     quantize_per_tensor_fp8,
     quantize_per_tensor_fp8_sr,
     quantize_with_descale_fp8_sr,
@@ -69,13 +74,25 @@ class BackwardInputs:
     sv_ch: torch.Tensor
 
 
-def prepare_forward_inputs(Q, K, V, *, smooth_k=True, smooth_v=True, use_cuda_quant=False):
+def prepare_forward_inputs(Q, K, V, *, smooth_k=True, smooth_v=True,
+                           use_cuda_quant=False, quant_dtype="fp8"):
+    """Quantize Q,K for the FP8 (default) or INT8 forward kernel.
+
+    ``quant_dtype`` selects the GEMM1 quantization:
+      - "fp8":  per-token FP8 e4m3 (SageAttention2)
+      - "int8": per-token symmetric INT8 (SageBwd-style INT8 GEMM1)
+    """
     K_mean = K.mean(dim=-2, keepdim=True) if smooth_k else torch.zeros_like(K[..., :1, :])
     V_mean = V.mean(dim=-2, keepdim=True) if smooth_v else torch.zeros_like(V[..., :1, :])
     K_s = K - K_mean
     V_s = V - V_mean
 
-    quant = cuda_quantize_per_token if use_cuda_quant else quantize_per_row_fp8
+    if quant_dtype == "fp8":
+        quant = cuda_quantize_per_token if use_cuda_quant else quantize_per_row_fp8
+    elif quant_dtype == "int8":
+        quant = cuda_quantize_per_token_int8 if use_cuda_quant else quantize_per_row_int8
+    else:
+        raise ValueError(f"unknown quant_dtype {quant_dtype!r}")
     Qq, sq = quant(Q)
     Kq, sk = quant(K_s)
     return ForwardInputs(
