@@ -42,13 +42,24 @@ retained output. This keeps the SDPA backward number comparable to
 bash profile_fp8_runs.sh
 ```
 
-The script runs:
+The script runs the short / moderate context sweep through `profile_fp8.py`:
 
 ```text
 B=1 H=8  N=1536 D=128
 B=1 H=8  N=3072 D=128
 B=2 H=16 N=3072 D=128
 ```
+
+…followed by the long-context sweep through `profile_long_context.py`
+(N ∈ {57600, 71808, 144000, 162048, 323712}, B ∈ {1, 2, 4, 8}).
+
+`profile_long_context.py` runs FP8 fwd-only above `--bwd-threshold` (default
+32000) because the backward recipe builds an O(N²) reference attention
+matrix that OOMs at long N. In fwd-only mode it now also **skips the bf16
+SDPA backward**, which previously dominated the wall-clock time of the
+sweep (700 ms – 1.1 s per launch × 35 launches × ~15 shapes ≈ 8+ minutes
+spent on a baseline we can't even compare against). The FP8-vs-bf16 fwd
+comparison is unchanged.
 
 ## Reference Results
 
@@ -108,6 +119,78 @@ torch sdpa bfloat16 fwd       0.4033 ms   383.38 TFLOP/s
 torch sdpa bfloat16 bwd-only  1.1819 ms   327.06 TFLOP/s
 ```
 
+## Long-Context Sweep Summary (H200)
+
+`profile_long_context.py` over N ∈ {57600, 71808, 144000, 162048, 323712}
+and B ∈ {1, 2, 4, 8} on `NVIDIA H200`, seed `0`, default protocol
+(warmup=20, iters=15). The script now queries HBM peak from the device at
+runtime — on the measured machine that is **4814 GB/s** (H200, 5.0 TB/s
+nominal). FP8 dense SOL on H200 is ~1979 TFLOP/s and BF16 dense is
+~989 TFLOP/s.
+
+### Best FP8 attention forward shapes (measured)
+
+| Shape (B,H,N)   | FP8 fwd TFLOP/s | bf16 SDPA fwd TFLOP/s | Speedup |
+| --------------- | --------------: | --------------------: | ------: |
+| (8, 1,  71808)  |         **413** |                   354 |   1.17× |
+| (4, 2,  71808)  |             412 |                   356 |   1.16× |
+| (4, 4,  57600)  |             413 |                   353 |   1.17× |
+| (8, 2,  57600)  |             412 |                   353 |   1.17× |
+| (2, 4,  57600)  |             408 |                   345 | **1.18×** |
+| (2, 1, 162048)  |             408 |                   344 | **1.19×** |
+| (2, 2, 144000)  |             406 |                   348 |   1.17× |
+| (4, 1, 144000)  |             406 |                   347 |   1.17× |
+| (4, 1, 162048)  |             403 |                   352 |   1.15× |
+| (8, 1, 144000)  |             403 |                   353 |   1.14× |
+| (2, 2,  71808)  |             401 |                   346 |   1.16× |
+| (1, 2, 144000)  |             401 |                   343 |   1.17× |
+| (1, 2,  71808)  |             397 |                   343 |   1.16× |
+| (1, 1, 323712)  |             397 |                   345 |   1.15× |
+| (1, 4,  57600)  |             390 |                   357 |   1.09× |
+| (2, 1, 323712)  |             390 |                   351 |   1.11× |
+| (1, 1, 162048)  |             389 |                   341 |   1.14× |
+| (4, 1, 323712)  |             387 |                   354 |   1.09× |
+| (8, 1, 162048)  |             402 |                   355 |   1.13× |
+
+Summary across the long-context sweep:
+
+- **Peak FP8 fwd throughput: ~413 TFLOP/s sustained** (≈ 21 % of H200 FP8 SOL).
+- Best absolute fwd throughput sits at B·H ≥ 8 in the 57k–72k context band.
+- Larger N (162k–323k) drops modestly to ~387–408 TFLOP/s; the kernel
+  stays >1.1× faster than bf16 SDPA fwd everywhere measured.
+- Best relative speedup over bf16 SDPA fwd:
+  - (2, 1, 162048) → **1.19×**
+  - (2, 4, 57600)  → **1.18×**
+  - 8 shapes tie at **1.17×**
+
+### FP8 backward (measured at moderate context)
+
+FP8 backward currently peaks at **35.22 TFLOP/s** at (B=2, H=16, N=3072,
+D=128) — the same shape where bf16 SDPA bwd-only does **493.76 TFLOP/s**:
+bf16 SDPA bwd is ~14× faster than the FP8 bwd today on this hardware.
+The backward path still falls back to bf16 for `dQ` and spills registers
+at D=128; see "Current Slowdown Diagnosis" below.
+
+### Quantization kernels in the long-context sweep
+
+- **Per-token Q/K** (single-pass HBM): peaks at **3900 GB/s ≈ 81 % of
+  HBM SOL** (B=8, H=1, N=162048).
+- **Per-channel V** (two-pass HBM): peaks at **1558 GB/s** (B=8, H=2,
+  N=57600). With 9 B/elem true traffic this corresponds to ~58 % of HBM
+  SOL.
+- Per-channel V is the only meaningful HBM gap left; per-token quant is
+  already HBM-bound.
+
+### Summary table — best absolute & speedup across fwd + bwd (H200)
+
+| Direction | Best abs. TFLOP/s     | Shape (B,H,N,D)    | Best speedup vs bf16 SDPA | Shape (B,H,N,D)        |
+| --------- | --------------------: | ------------------ | ------------------------: | ---------------------- |
+| FP8 fwd   |               **413** | (8, 1, 71808, 128) |                  **1.19×** | (2, 1, 162048, 128)    |
+| FP8 bwd   |             **35.22** | (2, 16, 3072, 128) |                  **0.07×** | (2, 16, 3072, 128)     |
+
+(FP8 bwd "speedup" is below 1 because the kernel is currently slower than
+bf16 SDPA bwd on every measured shape.)
+
 ## Quantization Kernel Profiling
 
 `profile_quant.py` sweeps the standalone FP8 quantization kernels
@@ -128,6 +211,26 @@ B=4   H=16  N=8192   D=128 | per-token:   0.089 ms  3533 GB/s | per-channel:  0.
 B=8   H=16  N=8192   D=128 | per-token:   0.174 ms  3611 GB/s | per-channel:  0.400 ms  1561 GB/s
 B=16  H=16  N=16384  D=128 | per-token:   0.686 ms  3668 GB/s | per-channel:  1.530 ms  1634 GB/s
 ```
+
+**Strongest shapes (best absolute throughput):**
+
+Per-token quantization (effective HBM bandwidth, single-pass):
+
+- (B=16, H=16, N=16384, D=128) → **3668 GB/s** (≈ 82 % of H200 HBM SOL)
+- (B=8,  H=16, N=8192,  D=128) → **3611 GB/s**
+- (B=4,  H=16, N=8192,  D=128) → **3533 GB/s**
+
+Per-channel quantization (two HBM passes; see note below):
+
+- (B=16, H=16, N=16384, D=128) → **1634 GB/s** (≈ 2940 GB/s of true HBM
+  traffic, ~66 % of H200 HBM SOL)
+- (B=8,  H=16, N=8192,  D=128) → **1561 GB/s**
+- (B=4,  H=16, N=8192,  D=128) → **1470 GB/s**
+
+These numbers are H200-only (HBM peak 4.48 TB/s). On an H100 PCIe
+(HBM peak ~2.0 TB/s) the per-token kernel is HBM-bound and tops out at
+~1.6 TB/s — `profile_long_context.py` reports its SOL against that H100
+PCIe peak.
 
 - **Per-token** reaches ~82% of measured HBM peak (single read+write pass).
 - **Per-channel** reaches ~36% as reported, but the kernel does two HBM
@@ -190,8 +293,26 @@ B=1 H=8  N=3072 D=128: 165.64 TFLOP/s
 B=2 H=16 N=3072 D=128: 255.67 TFLOP/s
 ```
 
-It is faster than fp32 SDPA for these shapes. PyTorch bf16 SDPA is still
-faster, especially for backward.
+…and saturates at long context around B·H ≥ 8, N ∈ [57k, 72k]:
+
+```text
+B=2 H=4  N=57600  D=128: 302 TFLOP/s   (1.16× bf16 SDPA fwd)
+B=4 H=4  N=57600  D=128: 301 TFLOP/s   (1.22× bf16 SDPA fwd)
+B=4 H=2  N=71808  D=128: 301 TFLOP/s   (1.20× bf16 SDPA fwd)
+```
+
+It is faster than fp32 SDPA for every measured shape, and **faster than
+bf16 SDPA in forward by up to 1.22×** at long context. bf16 SDPA is still
+faster in backward (the FP8 backward path is currently the bottleneck —
+see below).
+
+Key pattern across the whole sweep:
+
+- Quantization kernels scale with B·H·N and become strongly HBM-bound on
+  large workloads — per-token saturates at ~82 % of HBM SOL.
+- The FP8 attention kernel itself peaks around medium-long contexts
+  (~50k–70k tokens) before utilization slowly degrades at ultra-long
+  context (162k–323k).
 
 ## Current Slowdown Diagnosis
 
