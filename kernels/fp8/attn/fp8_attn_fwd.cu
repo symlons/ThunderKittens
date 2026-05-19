@@ -560,7 +560,6 @@ fp8_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
     if (head_dim == 128) launch(std::integral_constant<int, 128>{});
     else                 launch(std::integral_constant<int, 64>{});
 
-    cudaStreamSynchronize(stream);
     return {o, l};
 }
 
@@ -1607,7 +1606,6 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
     if (head_dim == 128) launch(std::integral_constant<int, 128>{});
     else                 launch(std::integral_constant<int, 64>{});
 
-    cudaStreamSynchronize(stream);
     return {qg, kg, vg};
 }
 

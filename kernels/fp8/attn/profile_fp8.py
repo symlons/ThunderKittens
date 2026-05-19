@@ -96,8 +96,8 @@ def main():
     print("\n[speedup: FP8 raw attention kernel vs SDPA]")
     for name, base in (("torch sdpa fp32", fp32), ("torch sdpa bf16", bf16)):
         print(f"  vs {name:<16} fwd {base['fwd_ms'] / fp8['fwd_ms']:.2f}x  bwd {base['bwd_ms'] / fp8['bwd_ms']:.2f}x")
-    fwd_with_quant = fp8["quant_q_ms"] + fp8["quant_k_ms"] + fp8["quant_v_ms"] + fp8["fwd_ms"]
-    print("\n[speedup: FP8 forward including Q/K/V quantization]")
+    fwd_with_quant = fp8["quant_q_ms"] + fp8["quant_k_ms"] + fp8["fwd_ms"]
+    print("\n[speedup: FP8 forward including Q/K token quantization]")
     for name, base in (("torch sdpa fp32", fp32), ("torch sdpa bf16", bf16)):
         print(f"  vs {name:<16} fwd {base['fwd_ms'] / fwd_with_quant:.2f}x")
 
