@@ -11,6 +11,7 @@ existing `tensor_metrics`, `kernel_attention`, and bwd `run_kernel`).
 
 import argparse
 import sys
+from pathlib import Path
 from collections import defaultdict
 
 import torch
@@ -95,7 +96,7 @@ def fmt_bwd_row(key, agg):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default="ATTN_CORRECTNESS.md")
+    p.add_argument("--out", default="docs/reports/ATTN_CORRECTNESS.md")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     p.add_argument("--quick", action="store_true")
     p.add_argument("--fp8-dS-modes", type=int, nargs="+", default=[2],
@@ -299,7 +300,7 @@ def main():
         L.append(
             "- The backward gradient QSNR (~22-26 dB end-to-end) sits "
             "*below* the 32 dB FP8 e4m3 quantization noise floor "
-            "documented in `QUANT_CORRECTNESS.md` — the matmul/softmax "
+            "documented in `docs/reports/QUANT_CORRECTNESS.md` — the matmul/softmax "
             "accumulation inside the kernel, not the input quant, is "
             "the dominant error source."
         )
@@ -319,6 +320,7 @@ def main():
                 "route it to a fallback backward."
             )
 
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
         f.write("\n".join(L) + "\n")
 

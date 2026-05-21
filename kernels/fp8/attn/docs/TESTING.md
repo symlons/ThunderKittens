@@ -16,9 +16,9 @@ report **QSNR / cosine / RMSE / rel-L1** through the same
 
 | script | what it does | output | typical runtime |
 |---|---|---|---|
-| `correctness_quant.py` | 8046-case sweep of FP8 per-token and per-channel quant kernels vs PyTorch reference; FP8 + INT8 noise-floor comparison vs original fp32 | [QUANT_CORRECTNESS.md](file:///cluster/home/kostfab1/ThunderKittens/kernels/fp8/attn/QUANT_CORRECTNESS.md) | ~20 s |
-| `correctness_attn.py` | 28-case shape sweep × 2 seeds of FP8 forward, **INT8-GEMM1 forward** (kernel-level ablation), and FP8 backward; vs fp32 SDPA, bf16 SDPA, fp8-dequant SDPA, and manual fp32 ref | [ATTN_CORRECTNESS.md](file:///cluster/home/kostfab1/ThunderKittens/kernels/fp8/attn/ATTN_CORRECTNESS.md) | ~3 min |
-| `correctness_realistic.py` | FP8 vs INT8 noise on heavy-tail / outlier synthetic distributions + real Q/K/V activations captured from a pretrained diffusion model (SD or CogVideoX) | [QUANT_REALISTIC.md](file:///cluster/home/kostfab1/ThunderKittens/kernels/fp8/attn/QUANT_REALISTIC.md), [QUANT_REALISTIC_COGVIDEOX.md](file:///cluster/home/kostfab1/ThunderKittens/kernels/fp8/attn/QUANT_REALISTIC_COGVIDEOX.md) | ~1 min synthetic, +download for the model |
+| `correctness_quant.py` | 8046-case sweep of FP8 per-token and per-channel quant kernels vs PyTorch reference; FP8 + INT8 noise-floor comparison vs original fp32 | [QUANT_CORRECTNESS.md](reports/QUANT_CORRECTNESS.md) | ~20 s |
+| `correctness_attn.py` | 28-case shape sweep × 2 seeds of FP8 forward, **INT8-GEMM1 forward** (kernel-level ablation), and FP8 backward; vs fp32 SDPA, bf16 SDPA, fp8-dequant SDPA, and manual fp32 ref | [ATTN_CORRECTNESS.md](reports/ATTN_CORRECTNESS.md) | ~3 min |
+| `correctness_realistic.py` | FP8 vs INT8 noise on heavy-tail / outlier synthetic distributions + real Q/K/V activations captured from a pretrained diffusion model (SD or CogVideoX) | [QUANT_REALISTIC.md](reports/QUANT_REALISTIC.md), [QUANT_REALISTIC_COGVIDEOX.md](reports/QUANT_REALISTIC_COGVIDEOX.md) | ~1 min synthetic, +download for the model |
 
 How to run:
 
@@ -43,7 +43,7 @@ python3 correctness_realistic.py --unet segmind/tiny-sd
 
 # add real CogVideoX-2b transformer activations (~3.4 GB cache)
 HF_HOME=/scratch python3 correctness_realistic.py --unet THUDM/CogVideoX-2b \
-    --out QUANT_REALISTIC_COGVIDEOX.md
+    --out docs/reports/QUANT_REALISTIC_COGVIDEOX.md
 ```
 
 ## Inline harnesses (print metrics, raise on regression)
@@ -75,7 +75,8 @@ flags to control quantization-mode ablations.
 
 See `BENCHMARKING.md` for `profile_fp8.py`, `profile_quant.py`,
 `profile_long_context.py`, `hbm_bandwidth`, and the `profile_fp8_runs.sh`
-sweep driver.
+sweep driver. `profile_long_context.py` also contains the unified long-context,
+backward dS-mode, and SDPA-backward-peak profiling modes.
 
 ## Shared building blocks (reused by every test above)
 

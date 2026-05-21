@@ -1,6 +1,6 @@
 """Profile FP8 attention vs bf16 SDPA at long sequence lengths.
 
-Uses the same benchmarking protocol as profile_fp8.py / BENCHMARKING.md:
+Uses the same benchmarking protocol as profile_fp8.py / docs/BENCHMARKING.md:
   - bitwise-identical uniform[-1, 1] float32 inputs (uniform_tensor)
   - automatic input groups sized to exceed 3x L2 cache when needed
   - 500 warmup launches, 100 measured launches (overridable)
@@ -77,6 +77,62 @@ LONG_SHAPES = [
 ]
 
 
+def _all_bwd_sweep_shapes():
+    """Comprehensive backward sweep. All N values are multiples of 384."""
+    shapes = []
+    short_n = (384, 768, 1536, 3072)
+    mod_n = (8064, 16128, 32256)
+    long_n = (57600, 71808, 144000)
+
+    for D in (128, 64):
+        for B in (1, 2, 4, 8):
+            for H in (1, 2, 4, 8, 16):
+                for N in short_n:
+                    shapes.append((B, H, N, D))
+        for B in (1, 2, 4):
+            for H in (1, 2, 4, 8):
+                for N in mod_n:
+                    shapes.append((B, H, N, D))
+        for B in (1, 2, 4):
+            for H in (1, 2, 4):
+                shapes.append((B, H, 57600, D))
+        for N in long_n:
+            for H in (1, 2):
+                shapes.append((1, H, N, D))
+    return shapes
+
+
+def _quick_bwd_sweep_shapes():
+    return [
+        (1, 8, 1536, 128),
+        (1, 8, 1536, 64),
+        (2, 16, 1536, 128),
+        (4, 8, 3072, 128),
+        (1, 4, 16128, 128),
+        (2, 2, 16128, 64),
+    ]
+
+
+SDPA_BWD_PEAK_SHAPES = [
+    (8, 16, 256, 128), (8, 16, 512, 128), (8, 16, 512, 256),
+    (16, 16, 256, 128), (16, 16, 512, 128), (16, 8, 512, 256),
+    (4, 16, 1024, 128), (4, 16, 1024, 256),
+    (8, 16, 1024, 128), (8, 8, 1024, 256),
+    (2, 16, 2048, 128), (2, 16, 2048, 256),
+    (4, 16, 2048, 128), (4, 8, 2048, 256),
+    (8, 16, 2048, 128), (8, 8, 2048, 256),
+    (1, 16, 4096, 128), (2, 8, 4096, 128), (2, 16, 4096, 128),
+    (4, 8, 4096, 128), (4, 16, 4096, 128), (4, 8, 4096, 256),
+    (2, 16, 8192, 128), (4, 8, 8192, 128), (4, 16, 8192, 128),
+    (2, 8, 16384, 128), (2, 16, 16384, 128), (4, 8, 16384, 128),
+]
+
+
+def parse_shapes(shapes_str):
+    """Parse 'B,H,N,D;B,H,N,D' into shape tuples."""
+    return [tuple(int(x) for x in s.split(',')) for s in shapes_str.split(';') if s]
+
+
 # HBM peak in GB/s, queried at runtime from the actual device so SOL is
 # always correct (H100 PCIe ≈ 2000, H100 SXM ≈ 3350, H200 ≈ 4480).
 def _hbm_peak_gbps():
@@ -121,7 +177,7 @@ def make_fp8_groups_fwd_only(shape, *, seed, group_count):
     return groups
 
 
-def make_fp8_groups_full(shape, *, seed, group_count):
+def make_fp8_groups_full(shape, *, seed, group_count, sdp_descale_mode="estimate"):
     """Build group_count groups of FP8-prepared fwd+bwd inputs. Only safe at
     moderate N (the recipe runs an O(N^2) reference SDPA on Q/K/V)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -134,10 +190,16 @@ def make_fp8_groups_full(shape, *, seed, group_count):
 
         fwd_inp = prepare_forward_inputs(Q, K, V, use_cuda_quant=True)
         O0, L0 = fp8_forward(fwd_inp)
-        bwd_inp = prepare_backward_inputs(fwd_inp, O0, L0, dO, sr_dO=True)
+        bwd_inp = prepare_backward_inputs(
+            fwd_inp, O0, L0, dO, sr_dO=True,
+            sdp_descale_mode=sdp_descale_mode,
+        )
         fwd_inp.Vbf = (bwd_inp.Vq_ch.to(torch.float32) * bwd_inp.sv_ch.unsqueeze(-2)).to(torch.bfloat16).contiguous()
         O, L = fp8_forward(fwd_inp)
-        bwd_inp = prepare_backward_inputs(fwd_inp, O, L, dO, sr_dO=True)
+        bwd_inp = prepare_backward_inputs(
+            fwd_inp, O, L, dO, sr_dO=True,
+            sdp_descale_mode=sdp_descale_mode,
+        )
 
         del Q, K, V, dO, O0, L0, O, L
         groups.append((fwd_inp, bwd_inp))
@@ -217,7 +279,9 @@ def profile_quant(shape, *, seed, warmup, iters, cooldown, group_count):
     return qms, kms, vms
 
 
-def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only):
+def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only,
+                bwd_modes=(2,), sdp_descale_mode="estimate",
+                include_sdpa_bwd=True):
     B, H, N, D = shape
     print(f"\n[profile B={B} H={H} N={N} D={D} seed={seed}]")
 
@@ -230,6 +294,7 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only):
     print(f"  benchmark protocol: uniform[-1,1], fp8 groups={fp8_groups_n}, "
           f"sdpa groups={sdpa_groups_n}, warmup={warmup}, iters={iters}, "
           f"cooldown={cooldown:.2f}s, mode={'fwd-only' if fwd_only else 'fwd+bwd'}, "
+          f"sdp_descale={sdp_descale_mode}, "
           f"hbm SOL={HBM_PEAK_GBPS:.0f} GB/s")
 
     # ---- Quantization overhead ----------------------------------------------
@@ -251,17 +316,23 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only):
             print_profile_line("fp8 attention fwd", fwd_ms, flops_shape=shape, kind="fwd")
             bwd_ms = None
         else:
-            fp8_groups = make_fp8_groups_full(shape, seed=seed, group_count=fp8_groups_n)
+            fp8_groups = make_fp8_groups_full(
+                shape, seed=seed, group_count=fp8_groups_n,
+                sdp_descale_mode=sdp_descale_mode,
+            )
             fwd_ms = benchmark_ms(
                 lambda i: fp8_forward(fp8_groups[i][0]), fp8_groups_n,
                 warmup=warmup, iters=iters, cooldown_s=cooldown,
             )
             print_profile_line("fp8 attention fwd", fwd_ms, flops_shape=shape, kind="fwd")
-            bwd_ms = benchmark_ms(
-                lambda i: fp8_backward(fp8_groups[i][1], fp8_dS_mode=2), fp8_groups_n,
-                warmup=warmup, iters=iters, cooldown_s=cooldown,
-            )
-            print_profile_line("fp8 attention bwd", bwd_ms, flops_shape=shape, kind="bwd")
+            bwd_ms = None
+            for mode in bwd_modes:
+                label = {0: "bf16-dS", 1: "RTNE-dS", 2: "SR-dS"}.get(mode, f"dS={mode}")
+                bwd_ms = benchmark_ms(
+                    lambda i, m=mode: fp8_backward(fp8_groups[i][1], fp8_dS_mode=m),
+                    fp8_groups_n, warmup=warmup, iters=iters, cooldown_s=cooldown,
+                )
+                print_profile_line(f"fp8 attention bwd ({label})", bwd_ms, flops_shape=shape, kind="bwd")
         del fp8_groups
         gc.collect()
         torch.cuda.empty_cache()
@@ -289,7 +360,7 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only):
                                    warmup=warmup, iters=iters, cooldown_s=cooldown)
         print_profile_line("torch sdpa bfloat16 fwd", sdpa_fwd_ms, flops_shape=shape, kind="fwd")
         sdpa_bwd_ms = None
-        if bwd_ms is not None:
+        if include_sdpa_bwd and bwd_ms is not None:
             sdpa_bwd_ms = benchmark_ms(sdpa_bwd, sdpa_groups_n,
                                        warmup=warmup, iters=iters, cooldown_s=cooldown)
             print_profile_line("torch sdpa bfloat16 bwd-only", sdpa_bwd_ms, flops_shape=shape, kind="bwd")
@@ -308,26 +379,93 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only):
     print(line)
 
 
+def profile_sdpa_bwd_peak(shapes, *, seed, warmup, iters, cooldown):
+    """Sweep bf16 SDPA backward-only throughput across baseline shapes."""
+    from fp8_suite.metrics import attention_bwd_tflops
+
+    print(f"Device: {torch.cuda.get_device_name(0)}  SMs={torch.cuda.get_device_properties(0).multi_processor_count}")
+    results = []
+    for shape in shapes:
+        B, H, N, D = shape
+        try:
+            groups = make_sdpa_groups(shape, seed=seed, group_count=1)
+            def _bwd(_):
+                Q, K, V, dO, O = groups[0]
+                return torch.autograd.grad(O, (Q, K, V), dO, retain_graph=True, create_graph=False)
+            ms = benchmark_ms(_bwd, 1, warmup=warmup, iters=iters, cooldown_s=cooldown)
+            tf = attention_bwd_tflops(B, H, N, D, ms)
+            results.append((shape, ms, tf))
+            print(f"\n[sdpa bwd B={B} H={H} N={N} D={D} seed={seed}]")
+            print_profile_line("torch sdpa bfloat16 bwd-only", ms, flops_shape=shape, kind="bwd")
+            del groups
+            gc.collect()
+            torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError:
+            print(f"  B={B} H={H} N={N} D={D} | SDPA bwd OOM")
+            torch.cuda.empty_cache()
+
+    results.sort(key=lambda r: r[2], reverse=True)
+    if results:
+        shape, ms, tf = results[0]
+        print(f"\nPeak SDPA bf16 bwd: {tf:.2f} TFLOP/s @ B={shape[0]} H={shape[1]} N={shape[2]} D={shape[3]} ({ms:.4f} ms)")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("long", "bwd-sweep", "sdpa-bwd-peak"), default="long",
+                    help="long: canonical long-context profile; bwd-sweep: backward dS-mode sweep; sdpa-bwd-peak: bf16 SDPA bwd baseline sweep")
     ap.add_argument("--seed", type=int, default=0)
-    # BENCHMARKING.md canonical protocol is warmup=500, iters=100. That is
-    # tuned for short (sub-ms) kernels where many iters are needed to reach
-    # power steady state and reduce timer noise. In this script every iter
-    # is 20–900 ms, so warmup=50, iters=30 reaches steady state and gives
-    # <1% timer noise without the 30+ minutes the canonical defaults
-    # would take at N=324k. Pass --bench-warmup 500 --bench-iters 100 to
-    # reproduce the exact canonical setting.
     ap.add_argument("--bench-warmup", type=int, default=20)
     ap.add_argument("--bench-iters", type=int, default=15)
     ap.add_argument("--bench-cooldown", type=float, default=0.2)
     ap.add_argument("--bwd-threshold", type=int, default=32000,
                     help="run fwd+bwd up to this N, fwd-only above")
+    ap.add_argument("--bwd-modes", type=int, nargs="+", default=None,
+                    help="fp8_dS modes to benchmark: 0=bf16/off, 1=RTNE, 2=SR")
+    ap.add_argument("--bwd-sdp-descale-mode", choices=("estimate", "constant"), default=None,
+                    help="constant avoids the O(N^2) Python dS range estimate; timing-only, not correctness-quality")
+    ap.add_argument("--quick", action="store_true", help="quick subset for --mode bwd-sweep")
+    ap.add_argument("--case", type=int, default=None, help="only run this shape index in the selected sweep")
+    ap.add_argument("--shapes", type=str, default=None,
+                    help="custom shapes as 'B,H,N,D;B,H,N,D'")
+    ap.add_argument("--skip-sdpa-bwd", action="store_true",
+                    help="skip bf16 SDPA backward baseline in bwd-capable modes")
     args = ap.parse_args()
 
     require_extension("fp8_mha_forward", "fp8_mha_backward")
-    for shape in LONG_SHAPES:
-        fwd_only = shape[2] > args.bwd_threshold
+    if args.shapes:
+        shapes = parse_shapes(args.shapes)
+    elif args.mode == "bwd-sweep":
+        shapes = _quick_bwd_sweep_shapes() if args.quick else _all_bwd_sweep_shapes()
+    elif args.mode == "sdpa-bwd-peak":
+        shapes = SDPA_BWD_PEAK_SHAPES
+    else:
+        shapes = LONG_SHAPES
+
+    if args.case is not None:
+        if args.case < 0 or args.case >= len(shapes):
+            raise SystemExit(f"--case must be in [0, {len(shapes) - 1}]")
+        shapes = [shapes[args.case]]
+
+    if args.mode == "sdpa-bwd-peak":
+        profile_sdpa_bwd_peak(
+            shapes,
+            seed=args.seed,
+            warmup=args.bench_warmup,
+            iters=args.bench_iters,
+            cooldown=args.bench_cooldown,
+        )
+        return
+
+    default_bwd_modes = (0, 1, 2) if args.mode == "bwd-sweep" else (2,)
+    bwd_modes = tuple(args.bwd_modes or default_bwd_modes)
+    sdp_descale_mode = args.bwd_sdp_descale_mode or ("constant" if args.mode == "bwd-sweep" else "estimate")
+    if args.mode == "bwd-sweep" and sdp_descale_mode == "constant":
+        print("[profile note] bwd-sweep uses constant sdp descale by default; "
+              "timing-only, not correctness-quality.")
+
+    for shape in shapes:
+        fwd_only = args.mode == "long" and shape[2] > args.bwd_threshold
         profile_one(
             shape,
             seed=args.seed,
@@ -335,6 +473,9 @@ def main():
             iters=args.bench_iters,
             cooldown=args.bench_cooldown,
             fwd_only=fwd_only,
+            bwd_modes=bwd_modes,
+            sdp_descale_mode=sdp_descale_mode,
+            include_sdpa_bwd=not args.skip_sdpa_bwd,
         )
 
 

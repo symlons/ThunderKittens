@@ -8,6 +8,7 @@ summary with aggregate stats, per-ablation tables, and key findings.
 
 import argparse
 import sys
+from pathlib import Path
 from collections import defaultdict
 
 import torch
@@ -289,13 +290,14 @@ def write_report(out_path, device, results, fail_cases):
         "stresses per-channel amax (5% large outliers): both pass."
     )
 
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default="QUANT_CORRECTNESS.md")
+    p.add_argument("--out", default="docs/reports/QUANT_CORRECTNESS.md")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 42])
     p.add_argument("--kinds", nargs="+", default=list(INPUT_DISTRIBUTIONS))
     p.add_argument("--quick", action="store_true")

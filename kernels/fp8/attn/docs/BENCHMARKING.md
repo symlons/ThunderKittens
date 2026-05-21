@@ -36,6 +36,37 @@ before timing, then the measured function runs `torch.autograd.grad` against the
 retained output. This keeps the SDPA backward number comparable to
 `fp8_attention_backward`, which also receives saved forward outputs.
 
+## Unified Profiling Entrypoints
+
+`profile_fp8.py` is the short/moderate-context default. `profile_long_context.py`
+now owns the longer and more specialized profiling flows that used to live in
+separate scratch scripts:
+
+```bash
+# Canonical long-context forward sweep. Runs backward only at N <= --bwd-threshold.
+python3 profile_long_context.py --mode long
+
+# Backward dS-mode sweep. Modes: 0=bf16/off, 1=FP8 RTNE, 2=FP8 SR.
+# This mode defaults to constant dS descale for timing-only long-N safety.
+python3 profile_long_context.py --mode bwd-sweep --quick --bwd-modes 0 1 2
+
+# Long-N timing-only backward sweep. The constant descale avoids the O(N^2)
+# Python dS range estimate; do not use it for correctness-quality numbers.
+python3 profile_long_context.py --mode bwd-sweep \
+  --bwd-sdp-descale-mode constant --skip-sdpa-bwd
+
+# Sweep bf16 SDPA backward-only shapes to find a baseline peak.
+python3 profile_long_context.py --mode sdpa-bwd-peak
+
+# Custom shape subset for either long or bwd-sweep modes.
+python3 profile_long_context.py --mode bwd-sweep \
+  --shapes "1,8,1536,128;2,16,3072,128" --bwd-modes 2
+```
+
+The old one-off scripts `profile_bwd_sweep.py`, `profile_bwd_extensive.py`,
+`profile_oom_squeezed.py`, and `profile_sdpa_bwd_peak.py` have been folded into
+these modes.
+
 ## Reproducing The Current Sweep
 
 ```bash
@@ -326,6 +357,20 @@ matmuls, but `dQ` still uses a bf16 shadow `K` path because the current TK FP8
 primitive/layout only exposes the needed `AB^T` form. The D=128 backward
 instantiations also spill registers heavily at compile time, which is consistent
 with the measured low backward throughput.
+
+The actionable backward bottlenecks are now tracked here rather than in a
+separate stale notes file:
+
+- `dQ = dS @ K` is the critical path and currently falls back to bf16 WGMMA.
+  Reformulating as `dQ^T = K^T @ dS^T` would make the matmul fit the FP8 `AB^T`
+  primitive and remove the bf16 shadow-K load.
+- Backward runs at one CTA per SM because shared memory is essentially full.
+  Removing bf16 shadow buffers may make two CTAs per SM possible and improve
+  latency hiding.
+- The loop quantizes intermediate `dS`, `dV`, and `dK` tiles; the scalar div,
+  clamp, and stochastic-rounding work is serialized with the matmul pipeline.
+- Consumer work is imbalanced: the consumer that owns `dQ` has more work and
+  can hold back the other consumer.
 
 Short clean check on H100 PCIe, seed `0`, `B=2 H=16 N=3072 D=128`,
 default protocol:

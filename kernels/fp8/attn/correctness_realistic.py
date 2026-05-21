@@ -13,6 +13,7 @@ kernels implement, and ``tensor_metrics`` for cos / rel-L1 / RMSE / QSNR.
 
 import argparse
 import sys
+from pathlib import Path
 from collections import defaultdict
 
 import torch
@@ -51,7 +52,7 @@ def fmt_row(label, fp8_m, int8_m, extra=""):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--out",   default="QUANT_REALISTIC.md")
+    p.add_argument("--out",   default="docs/reports/QUANT_REALISTIC.md")
     p.add_argument("--shapes", type=int, nargs="+",
                    default=[1, 8, 1536, 128],
                    help="B H N D shape for synthetic inputs")
@@ -180,6 +181,7 @@ def main():
         "enough that uniform INT8 has to spend its budget on the outliers."
     )
 
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
         f.write("\n".join(L) + "\n")
     print(f"Wrote {args.out}")
