@@ -34,12 +34,12 @@ def check_quant_kernel(label, xq, scale, xq_ref, scale_ref, *, granularity):
         )
 
 
-def build_case(Q, K, V, dO, *, sr_dO=True):
+def build_case(Q, K, V, dO, *, sr_dO=True, sdp_descale_mode="estimate"):
     fwd = prepare_forward_inputs(Q, K, V, use_cuda_quant=True)
-    bwd_seed = prepare_backward_inputs(fwd, torch.empty_like(Q, dtype=torch.bfloat16), torch.empty((*Q.shape[:-1], 1), device=Q.device), dO, sr_dO=sr_dO)
+    bwd_seed = prepare_backward_inputs(fwd, torch.empty_like(Q, dtype=torch.bfloat16), torch.empty((*Q.shape[:-1], 1), device=Q.device), dO, sr_dO=sr_dO, sdp_descale_mode=sdp_descale_mode)
     fwd.Vbf = (bwd_seed.Vq_ch.to(torch.float32) * bwd_seed.sv_ch.unsqueeze(-2)).to(torch.bfloat16).contiguous()
     O, L = fp8_forward(fwd)
-    return prepare_backward_inputs(fwd, O, L, dO, sr_dO=sr_dO), O, L
+    return prepare_backward_inputs(fwd, O, L, dO, sr_dO=sr_dO, sdp_descale_mode=sdp_descale_mode), O, L
 
 
 def run_kernel(Q, K, V, dO, *, sr_dO=True, fp8_dS_mode=0):
@@ -52,7 +52,7 @@ def print_grads(label, got, ref):
     print(" ", fmt_grad(label, *(tensor_metrics(a, b) for a, b in zip(got, ref))))
 
 
-def make_profile_groups(shape, *, seed, group_count):
+def make_profile_groups(shape, *, seed, group_count, sdp_descale_mode="estimate"):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     groups = []
     for _ in range(group_count):
@@ -62,7 +62,7 @@ def make_profile_groups(shape, *, seed, group_count):
         dO = uniform_tensor(shape, generator=generator)
         K_s = K - K.mean(dim=-2, keepdim=True)
         V_s = V - V.mean(dim=-2, keepdim=True)
-        prepared, O, _ = build_case(Q, K, V, dO, sr_dO=True)
+        prepared, O, _ = build_case(Q, K, V, dO, sr_dO=True, sdp_descale_mode=sdp_descale_mode)
         groups.append(
             {
                 "Q": Q,
@@ -81,7 +81,7 @@ def make_profile_groups(shape, *, seed, group_count):
     return groups
 
 
-def profile_kernels(Q=None, K=None, V=None, dO=None, *, shape=None, seed=0, bench_iters=100, warmup=500, group_count=None, cooldown_s=0.2):
+def profile_kernels(Q=None, K=None, V=None, dO=None, *, shape=None, seed=0, bench_iters=100, warmup=500, group_count=None, cooldown_s=0.2, profile_fwd=True, profile_bwd=True, sdp_descale_mode="estimate"):
     if shape is None:
         shape = tuple(Q.shape)
     B, H, N, D = shape
@@ -92,7 +92,7 @@ def profile_kernels(Q=None, K=None, V=None, dO=None, *, shape=None, seed=0, benc
         f"  benchmark protocol: uniform[-1,1], groups={groups_n}, "
         f"warmup={warmup}, iters={bench_iters}, cooldown={cooldown_s:.2f}s"
     )
-    groups = make_profile_groups(shape, seed=seed, group_count=groups_n)
+    groups = make_profile_groups(shape, seed=seed, group_count=groups_n, sdp_descale_mode=sdp_descale_mode)
 
     token_bytes = B * H * N * D * 5 + B * H * N * 4
     channel_bytes = B * H * N * D * 5 + B * H * D * 4
@@ -129,26 +129,29 @@ def profile_kernels(Q=None, K=None, V=None, dO=None, *, shape=None, seed=0, benc
         ),
         bytes_moved=channel_bytes,
     )
-    print_profile_line(
-        "fp8 attention fwd",
-        fwd_ms := benchmark_ms(lambda i: fp8_forward(groups[i]["prepared"].fwd), groups_n, warmup=warmup, iters=bench_iters, cooldown_s=cooldown_s),
-        flops_shape=shape,
-        kind="fwd",
-    )
-    print_profile_line(
-        "fp8 attention bwd",
-        bwd_ms := benchmark_ms(lambda i: fp8_backward(groups[i]["prepared"], fp8_dS_mode=2), groups_n, warmup=warmup, iters=bench_iters, cooldown_s=cooldown_s),
-        flops_shape=shape,
-        kind="bwd",
-    )
-    return {
+    result = {
         "groups": groups_n,
         "quant_q_ms": q_ms,
         "quant_k_ms": k_ms,
         "quant_v_ms": v_ms,
-        "fwd_ms": fwd_ms,
-        "bwd_ms": bwd_ms,
     }
+    if profile_fwd:
+        print_profile_line(
+            "fp8 attention fwd",
+            fwd_ms := benchmark_ms(lambda i: fp8_forward(groups[i]["prepared"].fwd), groups_n, warmup=warmup, iters=bench_iters, cooldown_s=cooldown_s),
+            flops_shape=shape,
+            kind="fwd",
+        )
+        result["fwd_ms"] = fwd_ms
+    if profile_bwd:
+        print_profile_line(
+            "fp8 attention bwd",
+            bwd_ms := benchmark_ms(lambda i: fp8_backward(groups[i]["prepared"], fp8_dS_mode=2), groups_n, warmup=warmup, iters=bench_iters, cooldown_s=cooldown_s),
+            flops_shape=shape,
+            kind="bwd",
+        )
+        result["bwd_ms"] = bwd_ms
+    return result
 
 
 def run_one(B, H, N, D, seed, *, bench_iters, bench_warmup=500, bench_groups=None, bench_cooldown=0.2):

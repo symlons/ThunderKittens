@@ -61,7 +61,7 @@ class BackwardInputs:
     dOq: torch.Tensor
     Qq_t: torch.Tensor
     dOq_t: torch.Tensor
-    K_bf: torch.Tensor
+    Kq_t: torch.Tensor          # FP8 K_s^T (B, H_kv, D, N) per-D-channel SR
     dO_bf: torch.Tensor
     sq: torch.Tensor
     sk: torch.Tensor
@@ -70,6 +70,7 @@ class BackwardInputs:
     sdp_row: torch.Tensor
     sq_ch: torch.Tensor
     sdo_ch: torch.Tensor
+    sk_ch: torch.Tensor         # per-D-channel scale of K_s^T (for FP8 dQ)
     Vq_ch: torch.Tensor
     sv_ch: torch.Tensor
 
@@ -128,7 +129,8 @@ def estimate_dS_descale(Qq, Kq, Vq, dOq, sq, sk, sv, sdo_descale):
     return (dS.abs().amax().clamp_min(1e-12) / 448.0).to(torch.float32)
 
 
-def prepare_backward_inputs(fwd, O_bf, L_raw, dO, *, sr_dO=True, use_cuda_quant=True):
+def prepare_backward_inputs(fwd, O_bf, L_raw, dO, *, sr_dO=True, use_cuda_quant=True,
+                            sdp_descale_mode="estimate"):
     token_quant = cuda_quantize_per_token if use_cuda_quant else quantize_per_row_fp8
     channel_quant = cuda_quantize_per_channel if use_cuda_quant else quantize_per_channel_fp8
 
@@ -138,11 +140,21 @@ def prepare_backward_inputs(fwd, O_bf, L_raw, dO, *, sr_dO=True, use_cuda_quant=
 
     Q_T = fwd.Q.transpose(-1, -2).contiguous()
     dO_T = dO.transpose(-1, -2).contiguous()
+    K_T = fwd.K_s.transpose(-1, -2).contiguous()        # smoothed K, transposed for FP8 dQ
     Qq_t, sq_ch = quantize_per_channel_fp8_sr(Q_T)
     dOq_t = quantize_with_descale_fp8_sr(dO_T, sdo_descale)
+    Kq_t, sk_ch = quantize_per_channel_fp8_sr(K_T)      # per-D-channel scale, SR token-wise
 
     sdo_row = broadcast_descale(sdo_descale, fwd.sq)
-    sdp_descale = estimate_dS_descale(fwd.Qq, fwd.Kq, Vq, dOq, fwd.sq, fwd.sk, sv, sdo_descale)
+    if sdp_descale_mode == "estimate":
+        sdp_descale = estimate_dS_descale(fwd.Qq, fwd.Kq, Vq, dOq, fwd.sq, fwd.sk, sv, sdo_descale)
+    elif sdp_descale_mode == "constant":
+        # Profile-only path: avoids the O(N^2) Python reference used to
+        # estimate dS range. This preserves kernel timing but is not a
+        # correctness-quality configuration.
+        sdp_descale = torch.ones((), device=fwd.Qq.device, dtype=torch.float32)
+    else:
+        raise ValueError(f"unknown sdp_descale_mode {sdp_descale_mode!r}")
     sdp_row = broadcast_descale(sdp_descale, fwd.sq)
 
     return BackwardInputs(
@@ -156,7 +168,7 @@ def prepare_backward_inputs(fwd, O_bf, L_raw, dO, *, sr_dO=True, use_cuda_quant=
         dOq=dOq,
         Qq_t=Qq_t,
         dOq_t=dOq_t,
-        K_bf=fwd.K_s.to(torch.bfloat16).contiguous(),
+        Kq_t=Kq_t,
         dO_bf=(dOq.to(torch.float32) * sdo_descale).to(torch.bfloat16).contiguous(),
         sq=fwd.sq,
         sk=fwd.sk,
@@ -165,6 +177,7 @@ def prepare_backward_inputs(fwd, O_bf, L_raw, dO, *, sr_dO=True, use_cuda_quant=
         sdp_row=sdp_row,
         sq_ch=sq_ch.contiguous().to(torch.float32),
         sdo_ch=broadcast_descale(sdo_descale, sq_ch),
+        sk_ch=sk_ch.contiguous().to(torch.float32),
         Vq_ch=Vq_ch,
         sv_ch=sv_ch.contiguous().to(torch.float32),
     )

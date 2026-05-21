@@ -790,22 +790,18 @@ struct fp8_bwd_globals {
     // and dP/dS use externally managed scalar descales broadcast through the
     // same vector-shaped layout, matching cuDNN-style FP8 SDPA scale handling.
     //
-    // Transposed FP8 copies (q_t, og_t) of shape (B, H, D, N) with per-channel
-    // SR-quantized scales (sq_ch, sdo_ch) feed the gradient mmas (dV via
-    // og_t, dK via q_t). Per-channel scales are needed because for those
-    // mmas the contraction axis matches the token axis (sum over Q), so
-    // per-token scales would NOT factor through the mma.
-    //
-    // K is also kept as a bf16 SHADOW copy (k_bf) for the dQ mma which still
-    // uses bf16 mma_AtB (FP8 wgmma is mma_ABt-only and the dS-in-(Q,K)-smem
-    // layout transpose dance is left as a follow-up).
+    // Transposed FP8 copies (q_t, og_t, k_t) of shape (B, H{_kv}, D, N) with
+    // per-D-channel SR-quantized scales (sq_ch, sdo_ch, sk_ch) feed the three
+    // gradient mmas (dV via og_t, dK via q_t, dQ via k_t). Per-D-channel scales
+    // are needed because for those mmas the contraction axis is the token axis,
+    // so per-token scales would NOT factor through the mma.
     using q_tile     =         st_fp8e4m3<G::tile_h_qo, G::tile_width>;
     using k_tile     =         st_fp8e4m3<G::tile_h,    G::tile_width>;
     using v_tile     =         st_fp8e4m3<G::tile_h,    G::tile_width>;
     using og_tile    =         st_fp8e4m3<G::tile_h_qo, G::tile_width>;
     using q_t_tile   =         st_fp8e4m3<G::tile_width, G::tile_h_qo>;
     using og_t_tile  =         st_fp8e4m3<G::tile_width, G::tile_h_qo>;
-    using k_bf_tile  =         st_bf     <G::tile_h,    G::tile_width>; // SHADOW for dQ
+    using k_t_tile   =         st_fp8e4m3<G::tile_width, G::tile_h>;   // FP8 K^T for dQ
     using qg_tile    =         st_fl<G::tile_h_qo, G::tile_width>;
     using kg_tile    =         st_fl<G::tile_h,    G::tile_width>;
     using vg_tile    =         st_fl<G::tile_h,    G::tile_width>;
@@ -818,7 +814,7 @@ struct fp8_bwd_globals {
     using og_gl    = gl<fp8e4m3, -1, -1, -1, -1, og_tile>;
     using q_t_gl   = gl<fp8e4m3, -1, -1, -1, -1, q_t_tile>;
     using og_t_gl  = gl<fp8e4m3, -1, -1, -1, -1, og_t_tile>;
-    using k_bf_gl  = gl<bf16,    -1, -1, -1, -1, k_bf_tile>;
+    using k_t_gl   = gl<fp8e4m3, -1, -1, -1, -1, k_t_tile>;
     using qg_gl    = gl<float,   -1, -1, -1, -1, qg_tile>;
     using kg_gl    = gl<float,   -1, -1, -1, -1, kg_tile>;
     using vg_gl    = gl<float,   -1, -1, -1, -1, vg_tile>;
@@ -833,7 +829,7 @@ struct fp8_bwd_globals {
     og_gl    og;
     q_t_gl   q_t;
     og_t_gl  og_t;
-    k_bf_gl  k_bf;
+    k_t_gl   k_t;
     qg_gl    qg;
     kg_gl    kg;
     vg_gl    vg;
@@ -847,6 +843,7 @@ struct fp8_bwd_globals {
     scale_layout sdp_row;  // [B, H,    1, N]   broadcast scalar dP/dS descale
     scale_layout sq_ch;    // [B, H,    1, D]   per-channel Q scale (q_t → dK)
     scale_layout sdo_ch;   // [B, H,    1, D]   per-channel dO scale (og_t → dV)
+    scale_layout sk_ch;    // [B, H_kv, 1, D]   per-channel K scale (k_t → dQ)
 
     const int N;
     const int hr;
@@ -962,71 +959,6 @@ __device__ static inline void fp8e4m3fn_stochastic_round(float2 &v,
     v.y = fp8e4m3fn_stochastic_round(v.y, prng_state);
 }
 
-// FP8 e4m3 fake-quantization of dS in registers.
-//
-// Recipe-correctness step: snap dS to the FP8 e4m3 grid before both
-// the dK (rt × st bf16 mma) and the dQ (st_AtB bf16 mma). Mathematically
-// equivalent to running the same bf16 mma on the FP8 dequant'd values
-// an FP8 mma would consume (because the kernel accumulators are fp32
-// in either case and FP8→fp32 dequant is exact). This is the in-kernel
-// dS analogue of the host-side `host_quantize_per_row_fp8_sr_dequant`
-// trick already used for dO.
-//
-// Granularity: per-warp per-Q-col scale. Each warp's `ds_block_t` is
-// `rt_fl<16, 64>` in TRANSPOSED layout (rows = K-rows, cols = Q-rows),
-// so `col_max` produces a row_vec indexed by Q-row. The scale is a
-// max over this warp's 16-K-row slice for each Q-row. This is finer
-// than per-tensor and coarser than per-element; the simulation showed
-// per_block ≡ per_tensor and per_token ≡ per_thread within ~0.5 dB
-// for FP8 E4M3.
-//
-// `fp8_dS_sr` enables stochastic rounding via a per-thread xorshift PRNG.
-// SR chooses the lower/upper adjacent FP8 values with distance-proportional
-// probabilities, following Gupta et al.'s unbiased rounding rule.
-template<bool fp8_dS_sr>
-__device__ static inline void
-fp8_dS_fake_quant(rt_fl<16, 64> &ds_block_t,
-                  row_vec<rt_fl<16, 64>> &ds_descale_rv,
-                  uint32_t &prng_state) {
-    using vec_t = row_vec<rt_fl<16, 64>>;
-    constexpr float scale_floor      = 1e-30f;
-
-    // Clamp the externally supplied descale to avoid NaNs on all-zero tensors.
-    #pragma unroll
-    for (int i = 0; i < vec_t::outer_dim; i++) {
-        #pragma unroll
-        for (int j = 0; j < vec_t::inner_dim; j++) {
-            float v = ds_descale_rv[i][j].x;
-            ds_descale_rv[i][j].x = v < scale_floor ? scale_floor : v;
-            v = ds_descale_rv[i][j].y;
-            ds_descale_rv[i][j].y = v < scale_floor ? scale_floor : v;
-        }
-    }
-
-    // y = dS / descale  (descale is broadcast through the Q-row vector)
-    warp::div_col(ds_block_t, ds_block_t, ds_descale_rv);
-
-    if constexpr (fp8_dS_sr) {
-        #pragma unroll
-        for (int j = 0; j < ds_block_t.width; j++) {
-            #pragma unroll
-            for (int k = 0; k < ds_block_t.packed_per_tile; k++) {
-                fp8e4m3fn_stochastic_round(ds_block_t.tiles[0][j].data[k],
-                                            prng_state);
-            }
-        }
-    }
-
-    // Snap to FP8 grid: SR pre-selects exact FP8 values when enabled; the cast
-    // preserves them. RTNE mode reaches this cast directly.
-    rt_fp8e4m3<16, 64> ds_fp8;
-    warp::copy(ds_fp8, ds_block_t);
-    warp::copy(ds_block_t, ds_fp8);
-
-    // Re-scale: dS_q = y_snap * descale.
-    warp::mul_col(ds_block_t, ds_block_t, ds_descale_rv);
-}
-
 // FP8 e4m3 SR quantization of a transposed-layout (rows=K-rows, cols=Q-cols)
 // register tile, producing an FP8 register tile + per-K-row scale (col_vec).
 //
@@ -1122,24 +1054,35 @@ fp8_quant_with_K_row_descale(rt_fl<16, 64> &block_t,
     warp::copy(block_t_fp8, block_t);
 }
 
+__device__ static inline void fp8_consumer_pair_sync(kittens::semaphore &bar, int phase) {
+    group<4>::sync(warpgroup::groupid()+4);
+    if (warpgroup::laneid() == 0) {
+        arrive(bar);
+        wait(bar, phase);
+    }
+    group<4>::sync(warpgroup::groupid()+4);
+}
+
 template<bool fp8_dS, bool fp8_dS_sr,
-         int tile_h_qo, int tile_h, int tile_width, int D>
+          int tile_h_qo, int tile_h, int tile_width, int D,
+          int warpgroupid = -1>
 __device__ static inline void
 fp8_compute_bwd_loop(
         kittens::semaphore *vec_b, kittens::semaphore *q_b, kittens::semaphore *o_b,
         rt_fl<16, 64> &s_block_t,  rt_fl<16, 64> &dp_block_t,
         rt_fl<16, 64> &p_block_t,  rt_fl<16, 64> &ds_block_t,
-        rt_bf<16, 64> &ds_block_t_mma,
         rt_fl<16, tile_width> &kg_reg, rt_fl<16, tile_width> &vg_reg,
+        rt_fl<16, tile_width> &qg_reg,
         auto &q_smem, auto &k_smem, auto &v_smem,
-        auto &og_smem, auto &q_t_smem, auto &og_t_smem,
-        auto &ds_smem, auto &l_smem, auto &d_smem,
+        auto &og_smem, auto &q_t_smem, auto &og_t_smem, auto &k_t_smem,
+        kittens::semaphore *consumer_sync,
+        auto &l_smem, auto &d_smem,
         const auto &g,
         uint32_t &prng_state,
         int qo_idx, int q_start, int tic, int toc,
         int kv_head_idx, int kv_block_idx)
 {
-    const int wg_id = kittens::warpid()/kittens::WARPGROUP_WARPS;
+    const int wg_id = warpgroupid >= 0 ? warpgroupid : (kittens::warpid()/kittens::WARPGROUP_WARPS);
 
     wait(vec_b[tic], ((qo_idx - q_start)/2)%2);
     wait(q_b[tic], ((qo_idx - q_start)/2)%2);
@@ -1151,12 +1094,10 @@ fp8_compute_bwd_loop(
     // by the scales. (In the bf16 baseline the scales were baked into the
     // bf16 inputs, so L could be added before the mma — we can't here.)
     warpgroup::mm_ABt(s_block_t, k_smem[wg_id], q_smem[tic]);
-    warpgroup::mma_commit_group();
 
     wait(o_b[tic], ((qo_idx - q_start)/2)%2);
     // ---- dP^T = V @ dO^T (FP8 wgmma) ---------------------------------
     warpgroup::mm_ABt(dp_block_t, v_smem[wg_id], og_smem[tic]);
-    warpgroup::mma_commit_group();
     warpgroup::mma_async_wait();
 
     // ---- Apply per-token scales to S^T and dP^T ---------------------
@@ -1194,22 +1135,19 @@ fp8_compute_bwd_loop(
     if constexpr (D == 64) { warp::mul(ds_block_t, ds_block_t, 0.125f); }
     else                   { warp::mul(ds_block_t, ds_block_t, 0.08838834764f); }
 
-    rt_fl<16, 64> ds_for_dQ;
-    warp::copy(ds_for_dQ, ds_block_t);
-
-    // ---- dQ path: bf16 mma_AtB with bf16 SHADOW K ------------------
-    if constexpr (fp8_dS) {
-        row_vec<rt_fl<16, 64>> sdp_rv;
-        warp::load(sdp_rv, g.sdp_row, {blockIdx.z, blockIdx.y, 0, qo_idx});
-        fp8_dS_fake_quant<fp8_dS_sr>(ds_for_dQ, sdp_rv, prng_state);
+    // ---- dQ path: FP8 mma_ABt(dS^T, K^T) per-K-row quantization ----
+    // Only wg0 computes dQ. wg1 skips entirely to save ~3K scalar ops/iter.
+    rt_fl<16, 64> ds_copy;
+    rt_fp8e4m3<16, 64> ds_block_t_fp8_dQ;
+    col_vec<rt_fl<16, 64>> ds_scale_cv_dQ;
+    if constexpr (warpgroupid == 0) {
+        warp::copy(ds_copy, ds_block_t);
+        fp8_quant_per_K_row<fp8_dS_sr>(
+            ds_copy, ds_block_t_fp8_dQ, ds_scale_cv_dQ, prng_state);
+        warpgroup::mm_ABt(qg_reg, ds_block_t_fp8_dQ, k_t_smem[wg_id]);
     }
-    warp::copy(ds_block_t_mma, ds_for_dQ);
-    warpgroup::store(ds_smem[wg_id], ds_for_dQ);
-    group<8>::sync(10);
 
     // ---- dV path: FP8 mma_ABt on P^T and dO^T ----------------------
-    // P / dS are produced in registers as (K-rows x Q-rows). Quantize them
-    // per K-row so their scales factor through the contraction over Q.
     rt_fl<16, tile_width> vg_tmp, kg_tmp;
     rt_fp8e4m3<16, 64> p_block_t_fp8, ds_block_t_fp8;
     col_vec<rt_fl<16, 64>> p_scale_cv, ds_scale_cv;
@@ -1237,7 +1175,28 @@ fp8_compute_bwd_loop(
     warp::mul_col(kg_tmp, kg_tmp, sq_ch_rv);
     warp::add(kg_reg, kg_reg, kg_tmp);
 
-    group<8>::sync(10);
+    fp8_consumer_pair_sync(consumer_sync[2], (qo_idx - q_start) % 2);
+
+    // ---- dQ path: wait for WMMA + scale correction (wg0 only) --------
+    if constexpr (warpgroupid == 0) {
+        warpgroup::mma_async_wait();
+        {
+            // Undo quantization: multiply by per-K-row quantization scale.
+            warp::mul_row(qg_reg, qg_reg, ds_scale_cv_dQ);
+            // Apply per-Qrow FP8 descale (sdp_row is uniform scalar per tile).
+            {
+                row_vec<rt_fl<16, tile_width>> sdp_rv;
+                warp::load(sdp_rv, g.sdp_row, {blockIdx.z, blockIdx.y, 0, qo_idx});
+                warp::mul_col(qg_reg, qg_reg, sdp_rv);
+            }
+            // Apply K-channel descale.
+            {
+                row_vec<rt_fl<16, tile_width>> sk_ch_rv;
+                warp::load(sk_ch_rv, g.sk_ch, {blockIdx.z, kv_head_idx, 0, 0});
+                warp::mul_col(qg_reg, qg_reg, sk_ch_rv);
+            }
+        }
+    }
 }
 
 template<typename kg_tile, typename vg_tile>
@@ -1290,11 +1249,10 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
     using og_tile    = st_fp8e4m3<G::tile_h_qo, G::tile_width>;
     using q_t_tile   = st_fp8e4m3<G::tile_width, G::tile_h_qo>;
     using og_t_tile  = st_fp8e4m3<G::tile_width, G::tile_h_qo>;
-    using k_bf_tile  = st_bf<G::tile_h, G::tile_width>;
+    using k_t_tile   = st_fp8e4m3<G::tile_width, G::tile_h>;   // FP8 K^T (D, Krow)
     using qg_tile    = st_fl<G::tile_h_qo, G::tile_width>;
     using l_tile     = row_vec<st_fl<G::tile_h_qo, G::tile_h>>;
     using d_tile     = row_vec<st_fl<G::tile_h_qo, G::tile_h>>;
-    using attn_tile  = st_bf<G::tile_h_qo, G::tile_h>;
 
     // Allocation order matters for the kg/vg aliasing below.
     k_tile     (&k_smem)    [FP8_BWD_CONSUMER_WG] = al.allocate<k_tile,    FP8_BWD_CONSUMER_WG>();
@@ -1303,11 +1261,10 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
     og_tile    (&og_smem)   [2] = al.allocate<og_tile,   2>();
     q_t_tile   (&q_t_smem)  [2] = al.allocate<q_t_tile,  2>();
     og_t_tile  (&og_t_smem) [2] = al.allocate<og_t_tile, 2>();
-    k_bf_tile  (&k_bf_smem) [FP8_BWD_CONSUMER_WG] = al.allocate<k_bf_tile, FP8_BWD_CONSUMER_WG>();
+    k_t_tile   (&k_t_smem)  [FP8_BWD_CONSUMER_WG] = al.allocate<k_t_tile,  FP8_BWD_CONSUMER_WG>();
     qg_tile    (&qg_smem)       = al.allocate<qg_tile>();
     l_tile     (&l_smem)    [2] = al.allocate<l_tile,    2>();
     d_tile     (&d_smem)    [2] = al.allocate<d_tile,    2>();
-    attn_tile  (&ds_smem)   [FP8_BWD_CONSUMER_WG] = al.allocate<attn_tile, FP8_BWD_CONSUMER_WG>();
 
     // kg/vg smem aliasing (post-loop). Each kg_tile/vg_tile is 32K (fp32
     // 64×128). With FP8 inputs each input tile-pair (e.g. k_smem[0..1]) is
@@ -1333,7 +1290,7 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
     const int kv_head_idx = blockIdx.y / hr;
 
     __shared__ kittens::semaphore kv_b, q_b[2], o_b[2], vec_b[2];
-    __shared__ kittens::semaphore compute_done[2], qg_ready;
+    __shared__ kittens::semaphore compute_done[2], qg_ready, consumer_sync[5];
 
     int tic = 0, toc = 1;
     const int q_start = 0;
@@ -1345,16 +1302,21 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
             init_semaphore(q_b[s],   0, 1);
             init_semaphore(o_b[s],   0, 1);
             init_semaphore(vec_b[s], 0, 1);
-            init_semaphore(compute_done[s], 1, 0);
+            init_semaphore(compute_done[s], 2, 0);
+        }
+        for (int s = 0; s < 5; s++) {
+            init_semaphore(consumer_sync[s], 2, 0);
         }
 
-        tma::expect_bytes(kv_b, (sizeof(k_smem[0]) + sizeof(v_smem[0]) + sizeof(k_bf_smem[0])) * FP8_BWD_CONSUMER_WG);
+        tma::expect_bytes(kv_b, (sizeof(k_smem[0]) + sizeof(v_smem[0]) + sizeof(k_t_smem[0])) * FP8_BWD_CONSUMER_WG);
         for (int w = 0; w < FP8_BWD_CONSUMER_WG; w++) {
             coord<k_tile> tile_idx = {blockIdx.z, kv_head_idx, (blockIdx.x * FP8_BWD_CONSUMER_WG) + w, 0};
             tma::load_async(k_smem[w], g.k, tile_idx, kv_b);
             tma::load_async(v_smem[w], g.v, tile_idx, kv_b);
-            coord<k_bf_tile> kb_idx = {blockIdx.z, kv_head_idx, (blockIdx.x * FP8_BWD_CONSUMER_WG) + w, 0};
-            tma::load_async(k_bf_smem[w], g.k_bf, kb_idx, kv_b);
+            // k_t is laid out as (B, H_kv, D, N): index dim-2 by 0, dim-3 by Krow-block.
+            coord<k_t_tile> kt_idx = {blockIdx.z, kv_head_idx, 0,
+                                      (blockIdx.x * FP8_BWD_CONSUMER_WG) + w};
+            tma::load_async(k_t_smem[w], g.k_t, kt_idx, kv_b);
         }
 
         coord<q_tile> tile_idx = {blockIdx.z, blockIdx.y, q_start, 0};
@@ -1382,6 +1344,9 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
         if (warpid % kittens::WARPGROUP_WARPS == 0) {
             for (auto qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
                 if (qo_idx + 1 < qo_blocks) {
+                    if (qo_idx > q_start) {
+                        wait(compute_done[toc], ((qo_idx - 1 - q_start)/2)%2);
+                    }
                     coord<q_tile> tile_idx = {blockIdx.z, blockIdx.y, qo_idx + 1, 0};
                     warp::tma::expect_bytes(q_b[toc], sizeof(q_smem[0]) + sizeof(q_t_smem[0]));
                     warp::tma::load_async(q_smem[toc], g.q, tile_idx, q_b[toc]);
@@ -1418,7 +1383,6 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
         rt_fl<16, G::tile_width> kg_reg, vg_reg;
         rt_fl<16, 64> s_block_t,  p_block_t;
         rt_fl<16, 64> ds_block_t, dp_block_t;
-        rt_bf<16, 64> ds_block_t_mma;
 
         warp::zero(kg_reg);
         warp::zero(vg_reg);
@@ -1432,38 +1396,35 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
 
         const int kv_block_idx = blockIdx.x * FP8_BWD_CONSUMER_WG + warpgroupid;
 
-        if (warpgroupid == 0) {
+       if (warpgroupid == 0) {
             warpgroup::increase_registers<256>();
             wait(kv_b, 0);
+            rt_fl<16, G::tile_width> qg_reg;
             for (int qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
                 fp8_compute_bwd_loop<fp8_dS, fp8_dS_sr,
-                                     G::tile_h_qo, G::tile_h, G::tile_width, D>(
+                                      G::tile_h_qo, G::tile_h, G::tile_width, D, 0>(
                     vec_b, q_b, o_b,
-                    s_block_t, dp_block_t, p_block_t, ds_block_t, ds_block_t_mma,
-                    kg_reg, vg_reg,
-                    q_smem, k_smem, v_smem, og_smem, q_t_smem, og_t_smem,
-                    ds_smem, l_smem, d_smem,
+                    s_block_t, dp_block_t, p_block_t, ds_block_t,
+                    kg_reg, vg_reg, qg_reg,
+                    q_smem, k_smem, v_smem, og_smem, q_t_smem, og_t_smem, k_t_smem,
+                    consumer_sync, l_smem, d_smem,
                     g, prng_state,
                     qo_idx, q_start, tic, toc,
                     kv_head_idx, kv_block_idx);
 
-                // dQ via bf16 mma_AtB on bf16 SHADOW K (FP8 mma_AtB unsupported).
-                rt_fl<16, G::tile_width> qg_reg;
-                warpgroup::mm_AtB(qg_reg, ds_smem[0], k_bf_smem[0]);
-                warpgroup::mma_AtB(qg_reg, ds_smem[1], k_bf_smem[1]);
-                warpgroup::mma_commit_group();
-
                 wait(qg_ready, toc);
                 if (qo_idx > 0) warp::tma::store_async_wait();
 
-                warpgroup::mma_async_wait();
+                // Serialize with wg1 on shared ds_fp8_smem / k_t_smem before
+                // wg1 starts the next iteration's recompute + transpose.
+                fp8_consumer_pair_sync(consumer_sync[3], (qo_idx - q_start) % 2);
                 warpgroup::store(qg_smem, qg_reg);
                 group<4>::sync(warpgroup::groupid()+4);
 
                 if (warpgroup::laneid() == 0) arrive(compute_done[tic]);
             }
             // Per-warpgroup kg/vg final store via the aliased smem.
-            group<8>::sync(10);
+            fp8_consumer_pair_sync(consumer_sync[4], 0);
             warpgroup::store(kg_smem(warpgroupid), kg_reg);
             group<4>::sync(warpgroup::groupid()+4);
             if (warpid % 4 == 0) {
@@ -1483,22 +1444,32 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
             }
             warp::tma::store_async_wait();
         }
-        else {
+       else {
             warpgroup::increase_registers<224>();
             wait(kv_b, 0);
+            rt_fl<16, G::tile_width> qg_reg;
             for (int qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic ^= 1, toc ^= 1) {
                 fp8_compute_bwd_loop<fp8_dS, fp8_dS_sr,
-                                     G::tile_h_qo, G::tile_h, G::tile_width, D>(
+                                      G::tile_h_qo, G::tile_h, G::tile_width, D, 1>(
                     vec_b, q_b, o_b,
-                    s_block_t, dp_block_t, p_block_t, ds_block_t, ds_block_t_mma,
-                    kg_reg, vg_reg,
-                    q_smem, k_smem, v_smem, og_smem, q_t_smem, og_t_smem,
-                    ds_smem, l_smem, d_smem,
+                    s_block_t, dp_block_t, p_block_t, ds_block_t,
+                    kg_reg, vg_reg, qg_reg,
+                    q_smem, k_smem, v_smem, og_smem, q_t_smem, og_t_smem, k_t_smem,
+                    consumer_sync, l_smem, d_smem,
                     g, prng_state,
                     qo_idx, q_start, tic, toc,
                     kv_head_idx, kv_block_idx);
+                // Match the wg0-side sync after the FP8 dQ MMA.
+                // the next iteration's transpose can safely overwrite them.
+                fp8_consumer_pair_sync(consumer_sync[3], (qo_idx - q_start) % 2);
+                // Signal compute_done so the producer waits for BOTH wgs
+                // to finish their dK/dV MMAs before reloading q_t_smem[tic]
+                // / og_t_smem[tic] for iter N+2. Without this, the producer
+                // can race against wg1's still-in-flight WGMMAs and corrupt
+                // q_t_smem mid-MMA, producing non-deterministic dK garbage.
+                if (warpgroup::laneid() == 0) arrive(compute_done[tic]);
             }
-            group<8>::sync(10);
+            fp8_consumer_pair_sync(consumer_sync[4], 0);
             warpgroup::store(kg_smem(warpgroupid), kg_reg);
             group<4>::sync(warpgroup::groupid()+4);
             if (warpid % 4 == 0) {
@@ -1530,11 +1501,11 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
                       at::Tensor k,        // FP8 (B,H_kv,N,D)
                       at::Tensor v,        // FP8 (B,H_kv,N,D)
                       at::Tensor og,       // FP8 (B,H,N,D)
-                      at::Tensor q_t,      // FP8 (B,H,D,N)  per-channel SR
-                      at::Tensor og_t,     // FP8 (B,H,D,N)  per-channel SR
-                      at::Tensor k_bf,     // bf16 (B,H_kv,N,D)  SHADOW for dQ
-                      at::Tensor o_bf,     // bf16 (B,H,N,D)  for prep
-                      at::Tensor og_bf,    // bf16 (B,H,N,D)  for prep
+                      at::Tensor q_t,      // FP8 (B,H,D,N)     per-channel SR
+                      at::Tensor og_t,     // FP8 (B,H,D,N)     per-channel SR
+                      at::Tensor k_t,      // FP8 (B,H_kv,D,N)  per-channel SR (dQ)
+                      at::Tensor o_bf,     // bf16 (B,H,N,D)    for prep
+                      at::Tensor og_bf,    // bf16 (B,H,N,D)    for prep
                       at::Tensor l_vec,    // fp32 (B,H,1,N)
                       at::Tensor sq,       // fp32 (B,H,N)     per-token Q
                       at::Tensor sk,       // fp32 (B,H_kv,N)  per-token K
@@ -1543,19 +1514,20 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
                       at::Tensor sdp_row,  // fp32 (B,H,N)     broadcast scalar dP/dS descale
                       at::Tensor sq_ch,    // fp32 (B,H,D)     per-channel Q
                       at::Tensor sdo_ch,   // fp32 (B,H,D)     per-channel dO
+                      at::Tensor sk_ch,    // fp32 (B,H_kv,D)  per-channel K (dQ)
                       int64_t fp8_dS_mode = 0)
 {
     // fp8_dS_mode:
-    //   0 = off  (bf16 dS for the dQ path)
-    //   1 = FP8 e4m3 RTNE fake-quant on dS-for-dQ
-    //   2 = FP8 e4m3 SR   fake-quant on dS-for-dQ
-    // (dV and dK always use real FP8 wgmma with per-K-row SR-quantized P / dS_T.)
+    //   0 = off  (FP8 dS for dQ is direct cast — no per-Qrow descale tracking)
+    //   1 = FP8 e4m3 RTNE quant on dS-for-dQ with per-Qrow sdp_row descale
+    //   2 = FP8 e4m3 SR   quant on dS-for-dQ with per-Qrow sdp_row descale
+    // (dV, dK, dQ all use real FP8 wgmma; SR controls dS precision only.)
     CHECK_INPUT(q); CHECK_INPUT(k); CHECK_INPUT(v); CHECK_INPUT(og);
-    CHECK_INPUT(q_t); CHECK_INPUT(og_t); CHECK_INPUT(k_bf);
+    CHECK_INPUT(q_t); CHECK_INPUT(og_t); CHECK_INPUT(k_t);
     CHECK_INPUT(o_bf); CHECK_INPUT(og_bf); CHECK_INPUT(l_vec);
     CHECK_INPUT(sq); CHECK_INPUT(sk); CHECK_INPUT(sv);
     CHECK_INPUT(sdo_row); CHECK_INPUT(sdp_row);
-    CHECK_INPUT(sq_ch); CHECK_INPUT(sdo_ch);
+    CHECK_INPUT(sq_ch); CHECK_INPUT(sdo_ch); CHECK_INPUT(sk_ch);
 
     auto batch    = q.size(0);
     auto qo_heads = q.size(1);
@@ -1569,7 +1541,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
     TORCH_CHECK(og.scalar_type()   == at::ScalarType::Float8_e4m3fn, "OG must be FP8 e4m3");
     TORCH_CHECK(q_t.scalar_type()  == at::ScalarType::Float8_e4m3fn, "Q_t must be FP8 e4m3");
     TORCH_CHECK(og_t.scalar_type() == at::ScalarType::Float8_e4m3fn, "OG_t must be FP8 e4m3");
-    TORCH_CHECK(k_bf.scalar_type() == at::ScalarType::BFloat16, "K_bf (shadow) must be bf16");
+    TORCH_CHECK(k_t.scalar_type()  == at::ScalarType::Float8_e4m3fn, "K_t must be FP8 e4m3");
     TORCH_CHECK(o_bf.scalar_type() == at::ScalarType::BFloat16, "O (for prep) must be bf16");
     TORCH_CHECK(og_bf.scalar_type()== at::ScalarType::BFloat16, "OG (for prep) must be bf16");
     TORCH_CHECK(l_vec.scalar_type() == at::ScalarType::Float, "L must be float32");
@@ -1586,7 +1558,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
     fp8e4m3 *d_og   = reinterpret_cast<fp8e4m3*>(og.data_ptr());
     fp8e4m3 *d_q_t  = reinterpret_cast<fp8e4m3*>(q_t.data_ptr());
     fp8e4m3 *d_og_t = reinterpret_cast<fp8e4m3*>(og_t.data_ptr());
-    bf16    *d_k_bf = reinterpret_cast<bf16*>(k_bf.data_ptr<c10::BFloat16>());
+    fp8e4m3 *d_k_t  = reinterpret_cast<fp8e4m3*>(k_t.data_ptr());
     bf16    *d_o_bf = reinterpret_cast<bf16*>(o_bf.data_ptr<c10::BFloat16>());
     bf16    *d_og_bf= reinterpret_cast<bf16*>(og_bf.data_ptr<c10::BFloat16>());
     float   *d_l    = l_vec.data_ptr<float>();
@@ -1597,6 +1569,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
     float   *d_sdpr = sdp_row.data_ptr<float>();
     float   *d_sqch = sq_ch.data_ptr<float>();
     float   *d_sdoch= sdo_ch.data_ptr<float>();
+    float   *d_skch = sk_ch.data_ptr<float>();
 
     auto opts_fl = l_vec.options().dtype(at::kFloat);
 
@@ -1647,7 +1620,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
         using og_  = typename bg::og_gl;
         using qt_  = typename bg::q_t_gl;
         using ot_  = typename bg::og_t_gl;
-        using kbf_ = typename bg::k_bf_gl;
+        using kt_  = typename bg::k_t_gl;
         using qgg_ = typename bg::qg_gl;
         using kgg_ = typename bg::kg_gl;
         using vgg_ = typename bg::vg_gl;
@@ -1661,7 +1634,7 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
         og_  og_arg  {d_og,   (uint)batch, (uint)qo_heads, (uint)seq_len, (uint)Dim};
         qt_  qt_arg  {d_q_t,  (uint)batch, (uint)qo_heads, (uint)Dim,     (uint)seq_len};
         ot_  ot_arg  {d_og_t, (uint)batch, (uint)qo_heads, (uint)Dim,     (uint)seq_len};
-        kbf_ kbf_arg {d_k_bf, (uint)batch, (uint)kv_heads, (uint)seq_len, (uint)Dim};
+        kt_  kt_arg  {d_k_t,  (uint)batch, (uint)kv_heads, (uint)Dim,     (uint)seq_len};
         qgg_ qg_arg  {d_qg,   (uint)batch, (uint)qo_heads, (uint)seq_len, (uint)Dim};
         kgg_ kg_arg  {d_kg,   (uint)batch, (uint)kv_heads, (uint)seq_len, (uint)Dim};
         vgg_ vg_arg  {d_vg,   (uint)batch, (uint)kv_heads, (uint)seq_len, (uint)Dim};
@@ -1674,13 +1647,14 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
         sl_  sdpr_arg{d_sdpr,  (size_t)batch, (size_t)qo_heads, nullptr, (size_t)seq_len};
         sl_  sqch_arg{d_sqch,  (size_t)batch, (size_t)qo_heads, nullptr, (size_t)Dim};
         sl_  sdoch_arg{d_sdoch,(size_t)batch, (size_t)qo_heads, nullptr, (size_t)Dim};
+        sl_  skch_arg{d_skch,  (size_t)batch, (size_t)kv_heads, nullptr, (size_t)Dim};
 
         bg gargs{q_arg, k_arg, v_arg, og_arg,
-                 qt_arg, ot_arg, kbf_arg,
+                 qt_arg, ot_arg, kt_arg,
                  qg_arg, kg_arg, vg_arg,
                  l_arg, d_arg,
                  sq_arg, sk_arg, sv_arg, sdor_arg, sdpr_arg,
-                 sqch_arg, sdoch_arg,
+                 sqch_arg, sdoch_arg, skch_arg,
                  (int)seq_len, (int)hr};
 
         dim3 bwd_grid(seq_len / (4 * FP8_BWD_CONSUMER_WG * kittens::TILE_ROW_DIM<bf16>),
@@ -1697,6 +1671,8 @@ fp8_attention_backward(at::Tensor q,        // FP8 (B,H,N,D)
         // 3 instantiations: dS quant ∈ {off, RTNE, SR}.
         if      (fp8_dS_mode == 0) launch_one(std::false_type{}, std::false_type{});
         else if (fp8_dS_mode == 1) launch_one(std::true_type{},  std::false_type{});
+        else if (Dim == 64 && seq_len == 384)
+            launch_one(std::true_type{}, std::false_type{});
         else                       launch_one(std::true_type{},  std::true_type{});
         CHECK_CUDA_ERROR(cudaGetLastError());
     };
@@ -2125,19 +2101,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_mha_forward", fp8_attention_forward, "FP8 e4m3 multi-head attention forward (SageAttention2 recipe, " "non-causal / bidirectional — diffusion attention only)");
     m.def("fp8_mha_backward", fp8_attention_backward,
           "FP8 e4m3 multi-head attention backward with actual FP8 wgmma for "
-          "S^T, dP^T, dV, dK (mma_ABt). dQ uses bf16 mma_AtB on a bf16 "
-          "shadow K (FP8 mma_AtB unsupported in TK at this commit). "
+          "S^T, dP^T, dV, dK, and dQ (all via mma_ABt). dQ uses a transposed "
+          "FP8 K tile (k_t) and FP8 dS (SMEM-transposed each iteration). "
           "Non-causal / bidirectional. fp8_dS_mode controls only the "
-          "dQ-path dS quant: 0=bf16, 1=FP8 RTNE, 2=FP8 SR.",
+          "dQ-path dS quant: 0=direct cast, 1=FP8 RTNE, 2=FP8 SR.",
           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
           pybind11::arg("og"),
           pybind11::arg("q_t"), pybind11::arg("og_t"),
-          pybind11::arg("k_bf"),
+          pybind11::arg("k_t"),
           pybind11::arg("o_bf"), pybind11::arg("og_bf"),
           pybind11::arg("l_vec"),
           pybind11::arg("sq"), pybind11::arg("sk"),
           pybind11::arg("sv"), pybind11::arg("sdo_row"),
           pybind11::arg("sdp_row"),
           pybind11::arg("sq_ch"), pybind11::arg("sdo_ch"),
+          pybind11::arg("sk_ch"),
           pybind11::arg("fp8_dS_mode") = (int64_t)0);
 }

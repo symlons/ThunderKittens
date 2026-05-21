@@ -66,7 +66,7 @@ def fp8_backward(prepared, *, fp8_dS_mode=0):
         prepared.dOq,
         prepared.Qq_t,
         prepared.dOq_t,
-        prepared.K_bf,
+        prepared.Kq_t,
         prepared.O_bf,
         prepared.dO_bf,
         prepared.L_raw,
@@ -77,6 +77,7 @@ def fp8_backward(prepared, *, fp8_dS_mode=0):
         prepared.sdp_row.contiguous(),
         prepared.sq_ch.contiguous(),
         prepared.sdo_ch.contiguous(),
+        prepared.sk_ch.contiguous(),
         fp8_dS_mode=fp8_dS_mode,
     )
 

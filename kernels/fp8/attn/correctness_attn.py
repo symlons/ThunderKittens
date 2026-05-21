@@ -155,6 +155,17 @@ def main():
              f"fail: **{len(bwd_rows) - n_bwd_pass}**")
     L.append(f"- Exceptions: **{len(errors)}**\n")
 
+    L.append("## Supported shape contract\n")
+    L.append("- Head dimension: **D = 64 or D = 128** only.")
+    L.append("- End-to-end sequence length: **pad N to a multiple of 384**. "
+             "The backward kernel itself is tiled at 128, but the recipe "
+             "uses the forward kernel output/LSE, and forward requires "
+             "`N % 384 == 0`.")
+    L.append("- Query heads must be divisible by KV heads.")
+    L.append("- Known excluded case in this revision: backward "
+             "`(B=1, H=8, N=384, D=64)` with `fp8_dS_mode=2`; forward and "
+             "INT8 forward pass for that shape, but dQ/dK are not reliable.\n")
+
     L.append("## Pass criteria\n")
     L.append("Same thresholds the existing `check_grad_metrics` / quant-attn "
              "harness uses. Forward must pass both `vs_fp32` and `vs_quant`. "
@@ -299,16 +310,13 @@ def main():
         )
         if any(not bwd_passed(r) for r in bwd_rows):
             L.append(
-                "- **Known fragility**: at least one backward case fails "
-                "(seed-dependent) for the smallest D=64 shape "
-                "`(1, 8, 384, 64)`. Reproduces with the original "
-                "(pre-optimization) kernel — *not* a regression from "
-                "the quantization-kernel rewrite. The failure is "
-                "state-sensitive: running the (1,8,384,64) seed=0 "
-                "case immediately before seed=1 reliably triggers it, "
-                "while running seed=1 in isolation passes. Most "
-                "likely a CUDA allocator / workspace aliasing issue in "
-                "the FP8 backward kernel (not in scope for this PR)."
+                "- **Known excluded backward case**: `(1, 8, 384, 64)` "
+                "fails for both checked seeds in `fp8_dS_mode=2`; dV stays "
+                "well behaved, while dQ/dK fail the metrics. This is not an "
+                "odd-head-dim issue: `D=64` is supported generally, and the "
+                "larger checked D=64 sequence lengths pass. For production "
+                "use, pad this short sequence case to `N=768` or higher, or "
+                "route it to a fallback backward."
             )
 
     with open(args.out, "w") as f:
