@@ -388,14 +388,16 @@ def profile_sdpa_bwd_peak(shapes, *, seed, warmup, iters, cooldown):
     for shape in shapes:
         B, H, N, D = shape
         try:
-            groups = make_sdpa_groups(shape, seed=seed, group_count=1)
-            def _bwd(_):
-                Q, K, V, dO, O = groups[0]
+            bytes_per_group = B * H * N * D * 4 * 2
+            group_count = recommended_group_count(bytes_per_group)
+            groups = make_sdpa_groups(shape, seed=seed, group_count=group_count)
+            def _bwd(i):
+                Q, K, V, dO, O = groups[i]
                 return torch.autograd.grad(O, (Q, K, V), dO, retain_graph=True, create_graph=False)
-            ms = benchmark_ms(_bwd, 1, warmup=warmup, iters=iters, cooldown_s=cooldown)
+            ms = benchmark_ms(_bwd, group_count, warmup=warmup, iters=iters, cooldown_s=cooldown)
             tf = attention_bwd_tflops(B, H, N, D, ms)
             results.append((shape, ms, tf))
-            print(f"\n[sdpa bwd B={B} H={H} N={N} D={D} seed={seed}]")
+            print(f"\n[sdpa bwd B={B} H={H} N={N} D={D} seed={seed} groups={group_count}]")
             print_profile_line("torch sdpa bfloat16 bwd-only", ms, flops_shape=shape, kind="bwd")
             del groups
             gc.collect()
@@ -415,9 +417,11 @@ def main():
     ap.add_argument("--mode", choices=("long", "bwd-sweep", "sdpa-bwd-peak"), default="long",
                     help="long: canonical long-context profile; bwd-sweep: backward dS-mode sweep; sdpa-bwd-peak: bf16 SDPA bwd baseline sweep")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--bench-warmup", type=int, default=20)
-    ap.add_argument("--bench-iters", type=int, default=15)
+    ap.add_argument("--bench-warmup", type=int, default=500)
+    ap.add_argument("--bench-iters", type=int, default=100)
     ap.add_argument("--bench-cooldown", type=float, default=0.2)
+    ap.add_argument("--quick-profile", action="store_true",
+                    help="Use low warmup/iteration counts for quick local timing; not for final reporting")
     ap.add_argument("--bwd-threshold", type=int, default=32000,
                     help="run fwd+bwd up to this N, fwd-only above")
     ap.add_argument("--bwd-modes", type=int, nargs="+", default=None,
@@ -431,6 +435,10 @@ def main():
     ap.add_argument("--skip-sdpa-bwd", action="store_true",
                     help="skip bf16 SDPA backward baseline in bwd-capable modes")
     args = ap.parse_args()
+    if args.quick_profile:
+        args.bench_warmup = 20
+        args.bench_iters = 15
+        print("[profile note] --quick-profile uses warmup=20, iters=15; not for final reported numbers.")
 
     require_extension("fp8_mha_forward", "fp8_mha_backward")
     if args.shapes:

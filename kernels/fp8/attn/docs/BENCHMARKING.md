@@ -20,6 +20,11 @@ The default protocol follows the local benchmarking convention:
 - no synchronization between measured launches
 - short cooldown between benchmarked kernels
 
+Any benchmark intended for final reported numbers should use this protocol. Lower
+warmup/iteration counts, skipped baselines, or timing-only descale shortcuts are
+acceptable for smoke tests and rough iteration, but those runs should be labeled
+quick or timing-only and should not be used as final public numbers.
+
 The defaults can be overridden:
 
 ```bash
@@ -43,29 +48,35 @@ now owns the longer and more specialized profiling flows that used to live in
 separate scratch scripts:
 
 ```bash
-# Canonical long-context forward sweep. Runs backward only at N <= --bwd-threshold.
+# Final-reporting long-context sweep. Uses 500 warmup / 100 measured launches.
 python3 profile_long_context.py --mode long
 
-# Backward dS-mode sweep. Modes: 0=bf16/off, 1=FP8 RTNE, 2=FP8 SR.
-# This mode defaults to constant dS descale for timing-only long-N safety.
-python3 profile_long_context.py --mode bwd-sweep --quick --bwd-modes 0 1 2
+# Quick long-context smoke/timing run, not for final reported numbers.
+python3 profile_long_context.py --mode long --quick-profile
+
+# Final-reporting backward dS-mode sweep on a small subset.
+# Modes: 0=bf16/off, 1=FP8 RTNE, 2=FP8 SR.
+python3 profile_long_context.py --mode bwd-sweep --quick --bwd-modes 0 1 2 \
+  --bwd-sdp-descale-mode estimate
 
 # Long-N timing-only backward sweep. The constant descale avoids the O(N^2)
-# Python dS range estimate; do not use it for correctness-quality numbers.
+# Python dS range estimate; do not use it for correctness-quality or final numbers.
 python3 profile_long_context.py --mode bwd-sweep \
-  --bwd-sdp-descale-mode constant --skip-sdpa-bwd
+  --bwd-sdp-descale-mode constant --skip-sdpa-bwd --quick-profile
 
-# Sweep bf16 SDPA backward-only shapes to find a baseline peak.
+# Final-reporting bf16 SDPA backward-only baseline peak sweep.
 python3 profile_long_context.py --mode sdpa-bwd-peak
 
-# Custom shape subset for either long or bwd-sweep modes.
+# Custom final-reporting shape subset for either long or bwd-sweep modes.
 python3 profile_long_context.py --mode bwd-sweep \
-  --shapes "1,8,1536,128;2,16,3072,128" --bwd-modes 2
+  --shapes "1,8,1536,128;2,16,3072,128" --bwd-modes 2 \
+  --bwd-sdp-descale-mode estimate
 ```
 
 The old one-off scripts `profile_bwd_sweep.py`, `profile_bwd_extensive.py`,
 `profile_oom_squeezed.py`, and `profile_sdpa_bwd_peak.py` have been folded into
-these modes.
+these modes. The unified modes default to the final-reporting launch counts; pass
+`--quick-profile` or smaller `--bench-warmup` / `--bench-iters` values only for quick local checks.
 
 ## Reproducing The Current Sweep
 
@@ -153,8 +164,10 @@ torch sdpa bfloat16 bwd-only  1.1819 ms   327.06 TFLOP/s
 ## Long-Context Sweep Summary (H200)
 
 `profile_long_context.py` over N ∈ {57600, 71808, 144000, 162048, 323712}
-and B ∈ {1, 2, 4, 8} on `NVIDIA H200`, seed `0`, default protocol
-(warmup=20, iters=15). The script now queries HBM peak from the device at
+and B ∈ {1, 2, 4, 8} on `NVIDIA H200`, seed `0`, using the long-context
+measurement setting noted at the time (warmup=20, iters=15). Treat those as
+historical sweep results; final new reports should use the protocol above
+(warmup=500, iters=100). The script now queries HBM peak from the device at
 runtime — on the measured machine that is **4814 GB/s** (H200, 5.0 TB/s
 nominal). FP8 dense SOL on H200 is ~1979 TFLOP/s and BF16 dense is
 ~989 TFLOP/s.
@@ -231,8 +244,10 @@ read 4 B/elem fp32 + write 1 B/elem fp8 + scale writes), and elements/s.
 
 ```bash
 python3 profile_quant.py --B 4 8 16 --H 16 \
-  --N 2048 4096 8192 16384 --D 128 \
-  --bench-iters 50 --bench-warmup 30
+  --N 2048 4096 8192 16384 --D 128
+
+# Quick quantization smoke/timing run, not for final reported numbers.
+python3 profile_quant.py --B 4 --H 16 --N 4096 --D 128 --quick-profile
 ```
 
 ### Optimized kernel numbers (NVIDIA H200, HBM peak ≈ 4.48 TB/s)

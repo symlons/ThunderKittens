@@ -112,11 +112,17 @@ def main():
     p.add_argument("--D", type=int, nargs="+", default=[128])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--bench-iters", type=int, default=100)
-    p.add_argument("--bench-warmup", type=int, default=50)
-    p.add_argument("--bench-cooldown", type=float, default=0.05)
+    p.add_argument("--bench-warmup", type=int, default=500)
+    p.add_argument("--bench-cooldown", type=float, default=0.2)
+    p.add_argument("--quick-profile", action="store_true",
+                   help="Use low warmup/cooldown for quick local timing; not for final reporting")
     p.add_argument("--bench-groups", type=int, default=None,
                    help="If unset, picks enough groups to exceed L2.")
     args = p.parse_args()
+    if args.quick_profile:
+        args.bench_warmup = 50
+        args.bench_cooldown = 0.05
+        print("[profile note] --quick-profile uses warmup=50 and cooldown=0.05s; not for final reported numbers.")
 
     require_extension("fp8_quantize_per_token_out", "fp8_quantize_per_channel_out")
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
