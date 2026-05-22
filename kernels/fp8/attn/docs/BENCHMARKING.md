@@ -54,6 +54,10 @@ python3 profile_long_context.py --mode long
 # Quick long-context smoke/timing run, not for final reported numbers.
 python3 profile_long_context.py --mode long --quick-profile
 
+# Broad 1K-to-300K sequence sweep. This includes short, moderate, long,
+# and near-300K shapes with B/H varied to keep the largest cases on 80 GB H100.
+python3 profile_long_context.py --mode seq-sweep --quick-profile --skip-sdpa-bwd
+
 # Final-reporting backward dS-mode sweep on a small subset.
 # Modes: 0=bf16/off, 1=FP8 RTNE, 2=FP8 SR.
 python3 profile_long_context.py --mode bwd-sweep --quick --bwd-modes 0 1 2 \
@@ -94,6 +98,18 @@ B=2 H=16 N=3072 D=128
 
 …followed by the long-context sweep through `profile_long_context.py`
 (N ∈ {57600, 71808, 144000, 162048, 323712}, B ∈ {1, 2, 4, 8}).
+
+For the current broad forward sweep from roughly 1K through 300K tokens, use:
+
+```bash
+python3 profile_long_context.py --mode seq-sweep
+```
+
+For Modal H100 timing smoke runs, use:
+
+```bash
+uvx modal run kernels/fp8/attn/modal_fp8_attn_h100.py --seq-sweep --continue-on-error
+```
 
 `profile_long_context.py` runs FP8 fwd-only above `--bwd-threshold` (default
 32000) because the backward recipe builds an O(N²) reference attention

@@ -159,6 +159,13 @@ LONG_300K_COMMANDS = (
     ),
 )
 
+SEQ_SWEEP_COMMANDS = (
+    named_command(
+        "sequence sweep 1K-300K",
+        "python3 profile_long_context.py --mode seq-sweep --quick-profile --skip-sdpa-bwd",
+    ),
+)
+
 QUANT_SMOKE_COMMANDS = (
     named_command("quant correctness quick sweep", "python3 correctness_quant.py --quick"),
     named_command(f"quant profile {shape_label((1, 8, 1536, 128))}", "python3 profile_quant.py --B 1 --H 8 --N 1536 --D 128 --quick-profile"),
@@ -259,6 +266,7 @@ def main(
     profile_large: bool = False,
     long_quick: bool = False,
     long_300k: bool = False,
+    seq_sweep: bool = False,
     quant_smoke: bool = False,
     hbm_bandwidth: bool = False,
     continue_on_error: bool = False,
@@ -273,6 +281,8 @@ def main(
         commands = list(LONG_QUICK_COMMANDS)
     elif long_300k:
         commands = list(LONG_300K_COMMANDS)
+    elif seq_sweep:
+        commands = list(SEQ_SWEEP_COMMANDS)
     elif quant_smoke:
         commands = list(QUANT_SMOKE_COMMANDS)
     elif hbm_bandwidth:

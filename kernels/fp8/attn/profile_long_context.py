@@ -77,6 +77,35 @@ LONG_SHAPES = [
 ]
 
 
+SEQ_SWEEP_SHAPES = [
+    # Broad forward-performance sweep from ~1K through ~300K tokens.
+    # N values stay multiples of 384 so they satisfy the forward tiling
+    # assertions; B/H choices keep the largest working sets under 80 GB.
+    (1, 8,   1152, 128),
+    (1, 8,   1536, 128),
+    (1, 8,   3072, 128),
+    (2, 16,  3072, 128),
+    (1, 8,   8064, 128),
+    (2, 16,  8064, 128),
+    (1, 4,  16128, 128),
+    (4, 16, 16128, 128),
+    (1, 4,  32256, 128),
+    (2, 8,  32256, 128),
+    (1, 4,  57600, 128),
+    (8, 2,  57600, 128),
+    (1, 2,  71808, 128),
+    (8, 1,  71808, 128),
+    (1, 2, 144000, 128),
+    (4, 1, 144000, 128),
+    (1, 1, 162048, 128),
+    (8, 1, 162048, 128),
+    (1, 4, 299904, 128),
+    (2, 2, 299904, 128),
+    (4, 1, 299904, 128),
+    (8, 1, 288000, 128),
+]
+
+
 def _all_bwd_sweep_shapes():
     """Comprehensive backward sweep. All N values are multiples of 384."""
     shapes = []
@@ -414,8 +443,10 @@ def profile_sdpa_bwd_peak(shapes, *, seed, warmup, iters, cooldown):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("long", "bwd-sweep", "sdpa-bwd-peak"), default="long",
-                    help="long: canonical long-context profile; bwd-sweep: backward dS-mode sweep; sdpa-bwd-peak: bf16 SDPA bwd baseline sweep")
+    ap.add_argument("--mode", choices=("long", "seq-sweep", "bwd-sweep", "sdpa-bwd-peak"), default="long",
+                    help=("long: canonical long-context profile; seq-sweep: broad 1K-to-300K "
+                          "forward-performance sweep; bwd-sweep: backward dS-mode sweep; "
+                          "sdpa-bwd-peak: bf16 SDPA bwd baseline sweep"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--bench-warmup", type=int, default=500)
     ap.add_argument("--bench-iters", type=int, default=100)
@@ -447,6 +478,8 @@ def main():
         shapes = _quick_bwd_sweep_shapes() if args.quick else _all_bwd_sweep_shapes()
     elif args.mode == "sdpa-bwd-peak":
         shapes = SDPA_BWD_PEAK_SHAPES
+    elif args.mode == "seq-sweep":
+        shapes = SEQ_SWEEP_SHAPES
     else:
         shapes = LONG_SHAPES
 
@@ -473,7 +506,7 @@ def main():
               "timing-only, not correctness-quality.")
 
     for shape in shapes:
-        fwd_only = args.mode == "long" and shape[2] > args.bwd_threshold
+        fwd_only = args.mode == "seq-sweep" or (args.mode == "long" and shape[2] > args.bwd_threshold)
         profile_one(
             shape,
             seed=args.seed,
