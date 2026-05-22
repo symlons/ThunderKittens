@@ -481,6 +481,15 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
         warp::copy(max_vec_last_scaled, max_vec);
         warp::mul(max_vec_last_scaled, max_vec_last_scaled, LOG2E * inv_sqrt_d);
 
+        // These scale loads are independent of the QK WGMMA result, so issue
+        // them before waiting and keep only this iteration's vectors live.
+        col_vec<rt_fl<16, K::kv_height>> q_scale_cv;
+        row_vec<rt_fl<16, K::kv_height>> k_scale_rv;
+        warpgroup::load(q_scale_cv, g.sq,
+            {blockIdx.z, blockIdx.y, 0, seq_idx + warpgroupid});
+        warp::load(k_scale_rv, g.sk,
+            {blockIdx.z, kv_head_idx, 0, kv_idx});
+
         warpgroup::mma_async_wait();
 
         // ---- Apply per-row Q,K scales --------------------------------------
@@ -490,16 +499,8 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
         // axis: coord.c selects the c-th vec_length-element chunk along N,
         // i.e. seq_idx + warpgroupid for q (qo_height = 64 entries) and
         // kv_idx for k (kv_height = 128 entries).
-        {
-            col_vec<rt_fl<16, K::kv_height>> q_scale_cv;
-            row_vec<rt_fl<16, K::kv_height>> k_scale_rv;
-            warpgroup::load(q_scale_cv, g.sq,
-                {blockIdx.z, blockIdx.y, 0, seq_idx + warpgroupid});
-            warp::load(k_scale_rv, g.sk,
-                {blockIdx.z, kv_head_idx, 0, kv_idx});
-            warp::mul_row(att_block, att_block, q_scale_cv);
-            warp::mul_col(att_block, att_block, k_scale_rv);
-        }
+        warp::mul_row(att_block, att_block, q_scale_cv);
+        warp::mul_col(att_block, att_block, k_scale_rv);
 
         // ---- Online softmax (fp32) -----------------------------------------
         warp::row_max(max_vec, att_block, max_vec);
