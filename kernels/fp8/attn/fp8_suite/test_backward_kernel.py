@@ -5,6 +5,7 @@ import torch
 from .cases import backward_kernel_cases
 from .kernel_api import (
     cuda_quantize_per_channel_out,
+    cuda_quantize_per_token_int8,
     cuda_quantize_per_token_out,
     fp8_backward,
     fp8_forward,
@@ -12,7 +13,7 @@ from .kernel_api import (
 )
 from .metrics import check_grad_metrics, fmt_grad, tensor_metrics
 from .profiling import benchmark_ms, print_profile_line, recommended_group_count, uniform_tensor
-from .quant import quantize_per_channel_fp8, quantize_per_row_fp8
+from .quant import quantize_per_channel_fp8, quantize_per_row_fp8, quantize_per_row_int8
 from .recipe import prepare_backward_inputs, prepare_forward_inputs
 from .references import reference_backward, sdpa_backward
 
@@ -175,6 +176,9 @@ def run_one(B, H, N, D, seed, *, bench_iters, bench_warmup=500, bench_groups=Non
     check_quant_kernel("Q token quant CUDA", prepared.Qq, prepared.sq, Qq_ref, sq_ref, granularity="token")
     check_quant_kernel("K token quant CUDA", prepared.Kq, prepared.sk, Kq_ref, sk_ref, granularity="token")
     check_quant_kernel("V channel quant CUDA", prepared.Vq_ch, prepared.sv_ch, Vq_ref, sv_ref, granularity="channel")
+    Qq_i8, sq_i8 = cuda_quantize_per_token_int8(Q)
+    Qq_i8_ref, sq_i8_ref = quantize_per_row_int8(Q)
+    check_quant_kernel("Q token INT8 quant CUDA", Qq_i8, sq_i8, Qq_i8_ref, sq_i8_ref, granularity="token")
 
     _, _, _, rtne = run_kernel(Q, K, V, dO, sr_dO=True, fp8_dS_mode=1)
     _, _, _, sr_dO_only = run_kernel(Q, K, V, dO, sr_dO=True, fp8_dS_mode=0)
@@ -222,7 +226,7 @@ def main():
     parser.add_argument("--bench-cooldown", type=float, default=0.2)
     args = parser.parse_args()
 
-    require_extension("fp8_mha_forward", "fp8_mha_backward")
+    require_extension("fp8_mha_forward", "fp8_mha_backward", "int8_quantize_per_token")
     for cfg in backward_kernel_cases(args.quick):
         run_one(
             *cfg,

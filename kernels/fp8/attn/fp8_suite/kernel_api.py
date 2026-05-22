@@ -43,6 +43,10 @@ def cuda_quantize_per_token_out(x, xq, scale):
     require_extension("fp8_quantize_per_token_out").fp8_quantize_per_token_out(x.contiguous(), xq, scale)
 
 
+def cuda_quantize_per_token_int8_out(x, xq, scale):
+    require_extension("int8_quantize_per_token_out").int8_quantize_per_token_out(x.contiguous(), xq, scale)
+
+
 def cuda_quantize_per_channel_out(x, xq, scale):
     require_extension("fp8_quantize_per_channel_out").fp8_quantize_per_channel_out(x.contiguous(), xq, scale)
 

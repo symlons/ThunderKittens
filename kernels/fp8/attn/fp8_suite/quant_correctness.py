@@ -1,10 +1,10 @@
-"""Reusable building blocks for FP8 quantization correctness sweeps.
+"""Reusable building blocks for FP8 and INT8 quantization correctness sweeps.
 
 Provides:
   - INPUT_DISTRIBUTIONS / make_input: synthetic inputs that stress
     different aspects of dynamic per-row / per-channel quantization.
   - correctness_cases: shape sweep with chunk-boundary stress.
-  - quant_kernel_metrics: scale + dequant + fp8-byte metrics for a
+  - quant_kernel_metrics: scale + dequant + quantized-code metrics for a
     single (xq, scale, xq_ref, scale_ref) tuple, built on top of the
     existing `tensor_metrics`.
   - CRITERIA / passed: shared pass/fail thresholds (same bounds as
@@ -121,7 +121,7 @@ CRITERIA = {
     "deq_qsnr_dB": 50.0,
     "deq_rel_L1": 1e-4,
     "deq_cos": 0.99999,
-    "fp8_byte_delta": 1,
+    "code_byte_delta": 1,
 }
 
 
@@ -134,13 +134,12 @@ def _dequant(xq, scale, granularity):
 
 
 def quant_kernel_metrics(xq, scale, xq_ref, scale_ref, *, granularity, x_fp32=None):
-    """Return {scale, dequant, fp8_byte[, vs_fp32]} metric dicts for one case.
+    """Return {scale, dequant, code byte[, vs_fp32]} metrics for one case.
 
     Mirrors check_quant_kernel: compares (a) the fp32 scale tensors and
-    (b) the dequantized values xq*scale. Also reports fp8 byte agreement.
-    If `x_fp32` is provided, additionally reports the intrinsic FP8
-    quantization noise — `tensor_metrics(dequant_kernel, x_fp32)` —
-    which is what shows up downstream as quantization error.
+    (b) the dequantized values xq*scale. Also reports quantized-code byte
+    agreement. If `x_fp32` is provided, additionally reports intrinsic
+    quantization noise via `tensor_metrics(dequant_kernel, x_fp32)`.
     """
     deq_got = _dequant(xq, scale, granularity)
     deq_ref = _dequant(xq_ref, scale_ref, granularity)
@@ -149,9 +148,9 @@ def quant_kernel_metrics(xq, scale, xq_ref, scale_ref, *, granularity, x_fp32=No
     out = {
         "scale": tensor_metrics(scale, scale_ref),
         "dequant": tensor_metrics(deq_got, deq_ref),
-        "fp8_byte_exact_frac": (a == b).float().mean().item(),
-        "fp8_byte_max_delta": (a.to(torch.int16) - b.to(torch.int16))
-                              .abs().max().item(),
+        "code_byte_exact_frac": (a == b).float().mean().item(),
+        "code_byte_max_delta": (a.to(torch.int16) - b.to(torch.int16))
+                               .abs().max().item(),
     }
     if x_fp32 is not None:
         out["vs_fp32"] = tensor_metrics(deq_got, x_fp32)
@@ -165,7 +164,7 @@ def passed(m):
     # This covers the zero-input edge case where the kernel's floor
     # (clamp scale >= 1e-12) differs from the reference's floor
     # (clamp amax >= 1e-12 then divide by 448).
-    if d["max"] == 0.0 and m["fp8_byte_max_delta"] == 0:
+    if d["max"] == 0.0 and m["code_byte_max_delta"] == 0:
         return True
     deq_ok = (
         d["rel_L1"] <= CRITERIA["deq_rel_L1"]
@@ -176,5 +175,5 @@ def passed(m):
         s["max"] <= CRITERIA["scale_max"]
         and s["rel_L1"] <= CRITERIA["scale_rel_L1"]
         and deq_ok
-        and m["fp8_byte_max_delta"] <= CRITERIA["fp8_byte_delta"]
+        and m["code_byte_max_delta"] <= CRITERIA["code_byte_delta"]
     )

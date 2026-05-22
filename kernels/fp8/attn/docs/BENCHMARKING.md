@@ -237,10 +237,11 @@ bf16 SDPA bwd on every measured shape.)
 
 ## Quantization Kernel Profiling
 
-`profile_quant.py` sweeps the standalone FP8 quantization kernels
-(`fp8_quantize_per_token_out`, `fp8_quantize_per_channel_out`) across batch
-and sequence length, reporting per-launch ms, GB/s (logical traffic =
-read 4 B/elem fp32 + write 1 B/elem fp8 + scale writes), and elements/s.
+`profile_quant.py` sweeps the standalone allocation-free quantization kernels
+(`fp8_quantize_per_token_out`, `fp8_quantize_per_channel_out`, and
+`int8_quantize_per_token_out`) across batch and sequence length, reporting
+per-launch ms, GB/s (logical traffic = read 4 B/elem fp32 + write 1 B/elem
+quantized code + scale writes), and elements/s.
 
 ```bash
 python3 profile_quant.py --B 4 8 16 --H 16 \
@@ -249,6 +250,9 @@ python3 profile_quant.py --B 4 8 16 --H 16 \
 # Quick quantization smoke/timing run, not for final reported numbers.
 python3 profile_quant.py --B 4 --H 16 --N 4096 --D 128 --quick-profile
 ```
+
+The profiler uses the final-reporting benchmark recipe by default. Pass
+`--quick-profile` only for local smoke/timing runs.
 
 ### Optimized kernel numbers (NVIDIA H200, HBM peak ≈ 4.48 TB/s)
 
@@ -260,13 +264,13 @@ B=16  H=16  N=16384  D=128 | per-token:   0.686 ms  3668 GB/s | per-channel:  1.
 
 **Strongest shapes (best absolute throughput):**
 
-Per-token quantization (effective HBM bandwidth, single-pass):
+FP8 per-token quantization (effective HBM bandwidth, single-pass):
 
 - (B=16, H=16, N=16384, D=128) → **3668 GB/s** (≈ 82 % of H200 HBM SOL)
 - (B=8,  H=16, N=8192,  D=128) → **3611 GB/s**
 - (B=4,  H=16, N=8192,  D=128) → **3533 GB/s**
 
-Per-channel quantization (two HBM passes; see note below):
+FP8 per-channel quantization (two HBM passes; see note below):
 
 - (B=16, H=16, N=16384, D=128) → **1634 GB/s** (≈ 2940 GB/s of true HBM
   traffic, ~66 % of H200 HBM SOL)
@@ -278,8 +282,10 @@ These numbers are H200-only (HBM peak 4.48 TB/s). On an H100 PCIe
 ~1.6 TB/s — `profile_long_context.py` reports its SOL against that H100
 PCIe peak.
 
-- **Per-token** reaches ~82% of measured HBM peak (single read+write pass).
-- **Per-channel** reaches ~36% as reported, but the kernel does two HBM
+- **FP8 per-token** reaches ~82% of measured HBM peak (single read+write pass).
+- **INT8 per-token** uses the same one-warp-per-row structure and is reported
+  beside FP8 per-token by `profile_quant.py`.
+- **FP8 per-channel** reaches ~36% as reported, but the kernel does two HBM
   passes (amax + quantize); the true HBM traffic per element is ~9 B
   (4 read in pass 1 + 4 read in pass 2 + 1 write), so the realized
   bandwidth is ≈ 1634 × 9/5 ≈ 2940 GB/s, i.e. ~66% of HBM peak. The

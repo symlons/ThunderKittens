@@ -1,4 +1,4 @@
-"""Profile the standalone FP8 quantization CUDA kernels.
+"""Profile the standalone FP8 and INT8 quantization CUDA kernels.
 
 Sweeps over batch sizes and (longer) sequence lengths and reports
 achieved bandwidth (GB/s) and elements/s for both the per-token (row)
@@ -6,6 +6,7 @@ and per-channel quantization paths exposed via the `_C` extension:
 
   - fp8_quantize_per_token_out (rowwise amax + scale)
   - fp8_quantize_per_channel_out (channelwise amax + scale)
+  - int8_quantize_per_token_out (rowwise symmetric int8 amax + scale)
 
 Usage:
   python3 profile_quant.py
@@ -22,6 +23,7 @@ sys.path.insert(0, ".")  # for the in-tree _C extension
 
 from fp8_suite.kernel_api import (
     cuda_quantize_per_channel_out,
+    cuda_quantize_per_token_int8_out,
     cuda_quantize_per_token_out,
     require_extension,
 )
@@ -35,9 +37,11 @@ def make_groups(shape, *, seed, group_count, channel_scale_shape):
     for _ in range(group_count):
         x = uniform_tensor(shape, generator=gen)  # fp32
         xq = torch.empty(shape, device="cuda", dtype=torch.float8_e4m3fn)
+        xq_i8 = torch.empty(shape, device="cuda", dtype=torch.int8)
         s_row = torch.empty((B, H, N), device="cuda", dtype=torch.float32)
+        s_i8 = torch.empty((B, H, N), device="cuda", dtype=torch.float32)
         s_ch = torch.empty(channel_scale_shape, device="cuda", dtype=torch.float32)
-        groups.append((x, xq, s_row, s_ch))
+        groups.append((x, xq, xq_i8, s_row, s_i8, s_ch))
     torch.cuda.synchronize()
     return groups
 
@@ -62,6 +66,7 @@ def profile_one(shape, *, seed, warmup, iters, cooldown_s, group_count):
     bytes_per_token_scale = 4 * (B * H * N)
     bytes_per_channel_scale = 4 * (B * H * D)
     token_bytes = 4 * elems + elems + bytes_per_token_scale
+    int8_token_bytes = token_bytes
     channel_bytes = 4 * elems + elems + bytes_per_channel_scale
 
     groups = make_groups(
@@ -72,26 +77,34 @@ def profile_one(shape, *, seed, warmup, iters, cooldown_s, group_count):
     )
 
     def run_token(i):
-        x, xq, s_row, _ = groups[i]
+        x, xq, _, s_row, _, _ = groups[i]
         cuda_quantize_per_token_out(x, xq, s_row)
 
+    def run_int8_token(i):
+        x, _, xq_i8, _, s_i8, _ = groups[i]
+        cuda_quantize_per_token_int8_out(x, xq_i8, s_i8)
+
     def run_channel(i):
-        x, xq, _, s_ch = groups[i]
+        x, xq, _, _, _, s_ch = groups[i]
         cuda_quantize_per_channel_out(x, xq, s_ch)
 
     tok_ms = benchmark_ms(run_token, group_count, warmup=warmup, iters=iters, cooldown_s=cooldown_s)
+    i8_ms = benchmark_ms(run_int8_token, group_count, warmup=warmup, iters=iters, cooldown_s=cooldown_s)
     ch_ms = benchmark_ms(run_channel, group_count, warmup=warmup, iters=iters, cooldown_s=cooldown_s)
 
     tok_gbps = token_bytes / (tok_ms * 1e-3) / (1024 ** 3)
+    i8_gbps = int8_token_bytes / (i8_ms * 1e-3) / (1024 ** 3)
     ch_gbps = channel_bytes / (ch_ms * 1e-3) / (1024 ** 3)
     tok_eps = elems / (tok_ms * 1e-3)
+    i8_eps = elems / (i8_ms * 1e-3)
     ch_eps = elems / (ch_ms * 1e-3)
 
     print(
         f"  B={B:<3} H={H:<3} N={N:<6} D={D:<4} "
         f"elems={fmt_n(elems)} "
-        f"| per-token: {tok_ms:7.4f} ms  {tok_gbps:7.1f} GB/s  {fmt_n(tok_eps)}elem/s "
-        f"| per-channel: {ch_ms:7.4f} ms  {ch_gbps:7.1f} GB/s  {fmt_n(ch_eps)}elem/s"
+        f"| fp8-token: {tok_ms:7.4f} ms  {tok_gbps:7.1f} GB/s  {fmt_n(tok_eps)}elem/s "
+        f"| int8-token: {i8_ms:7.4f} ms  {i8_gbps:7.1f} GB/s  {fmt_n(i8_eps)}elem/s "
+        f"| fp8-channel: {ch_ms:7.4f} ms  {ch_gbps:7.1f} GB/s  {fmt_n(ch_eps)}elem/s"
     )
 
     # Free for next config.
@@ -99,8 +112,8 @@ def profile_one(shape, *, seed, warmup, iters, cooldown_s, group_count):
     gc.collect()
     torch.cuda.empty_cache()
     return {
-        "token_ms": tok_ms, "channel_ms": ch_ms,
-        "token_gbps": tok_gbps, "channel_gbps": ch_gbps,
+        "fp8_token_ms": tok_ms, "int8_token_ms": i8_ms, "fp8_channel_ms": ch_ms,
+        "fp8_token_gbps": tok_gbps, "int8_token_gbps": i8_gbps, "fp8_channel_gbps": ch_gbps,
     }
 
 
@@ -124,13 +137,13 @@ def main():
         args.bench_cooldown = 0.05
         print("[profile note] --quick-profile uses warmup=50 and cooldown=0.05s; not for final reported numbers.")
 
-    require_extension("fp8_quantize_per_token_out", "fp8_quantize_per_channel_out")
+    require_extension("fp8_quantize_per_token_out", "fp8_quantize_per_channel_out", "int8_quantize_per_token_out")
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     print(f"Device: {props.name}  ({props.multi_processor_count} SMs, "
           f"L2={getattr(props, 'l2_cache_size', 0) // (1024*1024)} MB)")
     print(f"Iters per measurement: {args.bench_iters}  (warmup {args.bench_warmup})\n")
 
-    print("[FP8 quantization throughput] (input fp32 -> fp8 + fp32 scale)")
+    print("[quantization throughput] (input fp32 -> quantized code + fp32 scale)")
     for D in args.D:
         if D not in (64, 128):
             print(f"  skipping D={D} (kernel supports 64 or 128 only)")

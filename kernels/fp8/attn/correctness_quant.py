@@ -1,4 +1,4 @@
-"""Extensive correctness sweep for the FP8 quantization CUDA kernels.
+"""Extensive correctness sweep for the FP8 and INT8 quantization CUDA kernels.
 
 Iterates over (shape, distribution, seed, granularity), uses the
 helpers in `fp8_suite.quant_correctness` (built on the existing
@@ -18,6 +18,7 @@ sys.path.insert(0, ".")
 from fp8_suite.kernel_api import (
     cuda_quantize_per_channel,
     cuda_quantize_per_token,
+    cuda_quantize_per_token_int8,
     require_extension,
 )
 from fp8_suite.metrics import tensor_metrics
@@ -39,19 +40,26 @@ from fp8_suite.quant_correctness import (
 def run_case(shape, kind, seed, granularity):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     x = make_input(kind, shape, generator=gen)
-    if granularity == "token":
+    if granularity == "fp8_token":
         xq, scale = cuda_quantize_per_token(x)
         xq_ref, scale_ref = quantize_per_row_fp8(x)
-    else:
+        dequant_granularity = "token"
+        xq2, scale2 = cuda_quantize_per_token(x)
+    elif granularity == "fp8_channel":
         xq, scale = cuda_quantize_per_channel(x)
         xq_ref, scale_ref = quantize_per_channel_fp8(x)
-    m = quant_kernel_metrics(xq, scale, xq_ref, scale_ref,
-                             granularity=granularity, x_fp32=x)
-    # Determinism: re-quantize and check bit-identical fp8 + scale.
-    if granularity == "token":
-        xq2, scale2 = cuda_quantize_per_token(x)
-    else:
+        dequant_granularity = "channel"
         xq2, scale2 = cuda_quantize_per_channel(x)
+    elif granularity == "int8_token":
+        xq, scale = cuda_quantize_per_token_int8(x)
+        xq_ref, scale_ref = quantize_per_row_int8(x)
+        dequant_granularity = "token"
+        xq2, scale2 = cuda_quantize_per_token_int8(x)
+    else:
+        raise ValueError(f"unknown granularity {granularity!r}")
+    m = quant_kernel_metrics(xq, scale, xq_ref, scale_ref,
+                             granularity=dequant_granularity, x_fp32=x)
+    # Determinism: re-quantize and check bit-identical quantized codes + scale.
     m["deterministic"] = bool(
         (xq.view(torch.uint8) == xq2.view(torch.uint8)).all().item()
         and (scale == scale2).all().item()
@@ -87,7 +95,7 @@ def aggregate(rows, key_fn):
             "max_rel_L1": max((d["rel_L1"] for d in m_deq), default=0.0),
             "max_rmse": max((d["rmse"] for d in m_deq), default=0.0),
             "min_cos": min((d["cos"] for d in m_deq), default=float("nan")),
-            "max_byte_delta": max(r["fp8_byte_max_delta"] for r in rs),
+            "max_byte_delta": max(r["code_byte_max_delta"] for r in rs),
             "max_scale_err": max(r["scale"]["max"] for r in rs),
             "max_deq_max": max(d["max"] for r in rs for d in [r["dequant"]]),
             "any_nondet": any(not r["deterministic"] for r in rs),
@@ -127,15 +135,15 @@ def write_report(out_path, device, results, fail_cases):
     m_deq = [r["dequant"] for r in meaningful]
 
     lines = []
-    lines.append("# FP8 Quantization Kernel Correctness Report\n")
+    lines.append("# Quantization Kernel Correctness Report\n")
     lines.append(f"- Device: **{device.name}** "
                  f"(SM {device.major}.{device.minor}, {device.multi_processor_count} SMs)")
     lines.append(f"- Total cases: **{len(results)}**, pass: **{n_pass}**, "
                  f"fail: **{n_fail}**, exceptions: **{len(fail_cases)}**")
     lines.append("- Reference: `fp8_suite.quant.quantize_per_row_fp8` / "
-                 "`quantize_per_channel_fp8` (PyTorch fp32 → fp8 e4m3)")
+                 "`quantize_per_channel_fp8`, and `quantize_per_row_int8` references")
     lines.append("- Metrics: `fp8_suite.metrics.tensor_metrics` "
-                 "(QSNR, rel-L1, cos), plus fp8-byte exact match.\n")
+                 "(QSNR, rel-L1, cos), plus quantized-code byte exact match.\n")
 
     lines.append("## Pass criteria\n")
     lines.append("| metric | bound |")
@@ -145,7 +153,7 @@ def write_report(out_path, device, results, fail_cases):
     lines.append(f"| dequant QSNR | ≥ {CRITERIA['deq_qsnr_dB']:.1f} dB |")
     lines.append(f"| dequant rel-L1 | ≤ {CRITERIA['deq_rel_L1']:.0e} |")
     lines.append(f"| dequant cosine | ≥ {CRITERIA['deq_cos']:.5f} |")
-    lines.append(f"| fp8-byte max distance | ≤ {CRITERIA['fp8_byte_delta']} (1 quantum) |")
+    lines.append(f"| quantized-code byte max distance | ≤ {CRITERIA['code_byte_delta']} (1 quantum) |")
     lines.append("| determinism (rerun bit-identical) | required |")
     lines.append("| zero-input shortcut | dequant bit-identical → pass |\n")
 
@@ -161,7 +169,7 @@ def write_report(out_path, device, results, fail_cases):
         if "vs_fp32" in r:
             noise[(r["kind"], r["granularity"])].append(r["vs_fp32"])
     if noise:
-        lines.append("## FP8 e4m3 quantization noise floor (dequant vs original fp32)\n")
+        lines.append("## Quantization noise floor (dequant vs original fp32)\n")
         lines.append("Intrinsic loss from quantizing fp32 inputs to FP8 e4m3 with "
                      "dynamic per-token / per-channel scales, then dequantizing. "
                      "Lower is *better* (less loss). This is what downstream consumers "
@@ -192,8 +200,8 @@ def write_report(out_path, device, results, fail_cases):
     # ---- INT8 quantization noise floor (same meaningful inputs) ----
     int8_noise = defaultdict(list)
     for r in meaningful:
-        if r["granularity"] != "token":
-            continue  # INT8 implementation is per-token only
+        if r["granularity"] != "fp8_token":
+            continue  # compare INT8 noise against FP8 per-token rows
         gen = torch.Generator(device="cuda").manual_seed(r["seed"])
         x = make_input(r["kind"], r["shape"], generator=gen).to(torch.float32)
         xq_i8, s_i8 = quantize_per_row_int8(x)
@@ -232,7 +240,7 @@ def write_report(out_path, device, results, fail_cases):
                     f"- {r['granularity']} shape={r['shape']} kind={r['kind']} "
                     f"seed={r['seed']}: QSNR={d['qsnr_dB']:.2f} dB, "
                     f"rel-L1={d['rel_L1']:.2e}, cos={d['cos']:.5f}, "
-                    f"byte Δ max={r['fp8_byte_max_delta']}, "
+                    f"byte Δ max={r['code_byte_max_delta']}, "
                     f"|s−s_ref|={s['max']:.2e}, det={r['deterministic']}"
                 )
         for fc in fail_cases:
@@ -246,7 +254,7 @@ def write_report(out_path, device, results, fail_cases):
         f"min QSNR **{min(d['qsnr_dB'] for d in m_deq):.2f} dB**, "
         f"max dequant rel-L1 **{max(d['rel_L1'] for d in m_deq):.2e}**, "
         f"min cos **{min(d['cos'] for d in m_deq):.5f}**, "
-        f"max fp8-byte distance **{max(r['fp8_byte_max_delta'] for r in results)}**, "
+        f"max quantized-code byte distance **{max(r['code_byte_max_delta'] for r in results)}**, "
         f"max scale err **{max(r['scale']['max'] for r in results):.2e}**, "
         f"non-deterministic: "
         f"**{'yes' if any(not r['deterministic'] for r in results) else 'no'}**."
@@ -261,7 +269,7 @@ def write_report(out_path, device, results, fail_cases):
         "is unaffected — the test treats this as a pass."
     )
     lines.append(
-        "- **FP8 byte agreement** is within 1 quantum vs the reference. "
+        "- **Quantized-code byte agreement** is within 1 quantum vs the reference. "
         "The remaining single-quantum discrepancies trace to "
         "`--use_fast_math` altering `x/s` rounding; the kernel uses "
         "`__fdiv_rn` to keep IEEE rounding for the division itself, "
@@ -304,7 +312,7 @@ def main():
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
-    require_extension("fp8_quantize_per_token", "fp8_quantize_per_channel")
+    require_extension("fp8_quantize_per_token", "fp8_quantize_per_channel", "int8_quantize_per_token")
     device = torch.cuda.get_device_properties(torch.cuda.current_device())
 
     shapes = correctness_cases(quick=args.quick)
@@ -312,7 +320,7 @@ def main():
     for shape in shapes:
         for kind in args.kinds:
             for seed in args.seeds:
-                for granularity in ("token", "channel"):
+                for granularity in ("fp8_token", "fp8_channel", "int8_token"):
                     try:
                         r = run_case(shape, kind, seed, granularity)
                     except Exception as exc:
@@ -325,7 +333,7 @@ def main():
                         d, s = r["dequant"], r["scale"]
                         print(f"FAIL {granularity} {shape} kind={kind} seed={seed}: "
                               f"QSNR={d['qsnr_dB']:.2f} relL1={d['rel_L1']:.2e} "
-                              f"byteΔ={r['fp8_byte_max_delta']} "
+                              f"byteΔ={r['code_byte_max_delta']} "
                               f"|s−sref|={s['max']:.2e}")
 
     write_report(args.out, device, results, fail_cases)

@@ -1800,6 +1800,28 @@ std::vector<at::Tensor> int8_quantize_per_token(at::Tensor x) {
     return {xq, s};
 }
 
+void int8_quantize_per_token_out(at::Tensor x, at::Tensor xq, at::Tensor s) {
+    CHECK_INPUT(x); CHECK_INPUT(xq); CHECK_INPUT(s);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Float, "input must be float32");
+    TORCH_CHECK(xq.scalar_type() == at::ScalarType::Char, "xq must be int8");
+    TORCH_CHECK(s.scalar_type() == at::ScalarType::Float, "scale must be float32");
+    TORCH_CHECK(x.dim() == 4, "input must have shape (B,H,N,D)");
+    TORCH_CHECK(xq.sizes() == x.sizes(), "xq shape must match input");
+    TORCH_CHECK(s.size(0) == x.size(0) && s.size(1) == x.size(1) && s.size(2) == x.size(2),
+                "scale must have shape (B,H,N)");
+    auto xc = x.contiguous();
+    int64_t B = xc.size(0), H = xc.size(1), N = xc.size(2), D = xc.size(3);
+    TORCH_CHECK(D == 64 || D == 128, "Only D=64 or D=128 are supported");
+    int rows = (int)(B * H * N);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    launch_int8_quantize_per_token(
+        xc.data_ptr<float>(),
+        xq.data_ptr<int8_t>(),
+        s.data_ptr<float>(),
+        rows, (int)D, stream);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+}
+
 // ---- INT8 forward kernel (GEMM1 in int8, softmax / PV unchanged) -----------
 
 template<int D> struct int8_attn_globals {
@@ -2094,6 +2116,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_quantize_per_channel", fp8_quantize_per_channel, "FP8 e4m3 quantization with one descale per channel");
     m.def("fp8_quantize_per_channel_out", fp8_quantize_per_channel_out, "FP8 e4m3 channel quantization into preallocated output tensors");
     m.def("int8_quantize_per_token", int8_quantize_per_token, "INT8 symmetric per-token quantization");
+    m.def("int8_quantize_per_token_out", int8_quantize_per_token_out, "INT8 symmetric per-token quantization into preallocated output tensors");
     m.def("int8_mha_forward", int8_attention_forward,
           "INT8 GEMM1 / bf16 PV multi-head attention forward (SageBwd-style "
           "INT8-QK ablation; PV stays bf16 like the FP8 forward). "
