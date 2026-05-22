@@ -29,6 +29,9 @@ cuda_image = (
 
 ATTN_DIR = Path("/ThunderKittens/kernels/fp8/attn")
 ARTIFACT_DIR = Path("/data/fp8_attn_cuda13")
+HBM_BW_ARTIFACT = "hbm_bandwidth"
+HBM_BW_SOURCE = ATTN_DIR / "hbm_bandwidth.cu"
+HBM_BW_BINARY = ARTIFACT_DIR / HBM_BW_ARTIFACT
 
 
 def named_command(label: str, command: str) -> tuple[str, str]:
@@ -101,8 +104,17 @@ def build():
         dst = ARTIFACT_DIR / artifact.name
         shutil.copy2(artifact, dst)
         print(f"saved artifact: {dst} ({dst.stat().st_size} bytes)", flush=True)
+
+    hbm_cmd = (
+        f"nvcc -O3 -arch=sm_90a -std=c++17 {HBM_BW_SOURCE} -o {HBM_BW_BINARY}"
+    )
+    run(hbm_cmd, cwd="/ThunderKittens")
+    if not HBM_BW_BINARY.exists():
+        raise RuntimeError("HBM bandwidth benchmark did not produce a binary")
+    print(f"saved artifact: {HBM_BW_BINARY} ({HBM_BW_BINARY.stat().st_size} bytes)", flush=True)
+
     artifact_volume.commit()
-    return [artifact.name for artifact in artifacts]
+    return [artifact.name for artifact in artifacts] + [HBM_BW_ARTIFACT]
 
 
 DEFAULT_COMMANDS = (
@@ -153,6 +165,10 @@ QUANT_SMOKE_COMMANDS = (
     named_command(f"quant profile {shape_label((2, 16, 3072, 128))}", "python3 profile_quant.py --B 2 --H 16 --N 3072 --D 128 --quick-profile"),
     named_command(f"quant profile {shape_label((4, 16, 8192, 128))}", "python3 profile_quant.py --B 4 --H 16 --N 8192 --D 128 --quick-profile"),
     named_command(f"quant profile {shape_label((8, 16, 16384, 128))}", "python3 profile_quant.py --B 8 --H 16 --N 16384 --D 128 --quick-profile"),
+)
+
+HBM_BANDWIDTH_COMMANDS = (
+    named_command("HBM bandwidth microbenchmark", f"./{HBM_BW_ARTIFACT} 0 512 20"),
 )
 
 DIAG_BWD_COMMAND = r"""python3 - <<'PY'
@@ -244,6 +260,7 @@ def main(
     long_quick: bool = False,
     long_300k: bool = False,
     quant_smoke: bool = False,
+    hbm_bandwidth: bool = False,
     continue_on_error: bool = False,
 ):
     if diagnose_bwd:
@@ -258,6 +275,8 @@ def main(
         commands = list(LONG_300K_COMMANDS)
     elif quant_smoke:
         commands = list(QUANT_SMOKE_COMMANDS)
+    elif hbm_bandwidth:
+        commands = list(HBM_BANDWIDTH_COMMANDS)
     elif quick:
         commands = list(QUICK_COMMANDS)
     else:
