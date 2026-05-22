@@ -6,6 +6,7 @@ script reports:
 - quantization kernels as effective bandwidth in GB/s
 - FP8 attention forward/backward as TFLOP/s
 - PyTorch SDPA fp32 and bf16 baselines
+- FlashAttention-3 bf16 forward baseline when `flash_attn_interface` is installed
 - FP8 speedups against those baselines
 
 ## Protocol
@@ -57,6 +58,9 @@ python3 profile_long_context.py --mode long --quick-profile
 # Broad 1K-to-300K sequence sweep. This includes short, moderate, long,
 # and near-300K shapes with B/H varied to keep the largest cases on 80 GB H100.
 python3 profile_long_context.py --mode seq-sweep --quick-profile --skip-sdpa-bwd
+
+# Disable FlashAttention-3 if it is not installed or you only need SDPA.
+python3 profile_long_context.py --mode seq-sweep --no-fa3
 
 # Final-reporting backward dS-mode sweep on a small subset.
 # Modes: 0=bf16/off, 1=FP8 RTNE, 2=FP8 SR.

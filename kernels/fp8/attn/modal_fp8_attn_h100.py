@@ -22,7 +22,24 @@ cuda_image = (
         "update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11",
         "apt update",
         "DEBIAN_FRONTEND=noninteractive apt install -y clang-11 python3.10-dev",
-        "pip install torch tqdm einops numpy pybind11 matplotlib seaborn packaging ninja",
+        "pip install torch tqdm einops numpy pybind11 matplotlib seaborn packaging psutil ninja",
+        "git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git /opt/flash-attention",
+        (
+            "cd /opt/flash-attention/hopper && "
+            "CC=/usr/bin/gcc-11 CXX=/usr/bin/g++-11 MAX_JOBS=20 "
+            "FLASH_ATTENTION_DISABLE_BACKWARD=TRUE "
+            "FLASH_ATTENTION_DISABLE_SM80=TRUE "
+            "FLASH_ATTENTION_DISABLE_FP8=TRUE "
+            "FLASH_ATTENTION_DISABLE_HDIM64=TRUE "
+            "FLASH_ATTENTION_DISABLE_HDIM96=TRUE "
+            "FLASH_ATTENTION_DISABLE_HDIM192=TRUE "
+            "FLASH_ATTENTION_DISABLE_HDIM256=TRUE "
+            "FLASH_ATTENTION_DISABLE_LOCAL=TRUE "
+            "FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE "
+            "FLASH_ATTENTION_DISABLE_APPENDKV=TRUE "
+            "FLASH_ATTENTION_DISABLE_VARLEN=TRUE "
+            "python setup.py install"
+        ),
     )
     .add_local_dir("/Users/sfkost/research/ThunderKittens", "/ThunderKittens")
 )
@@ -84,7 +101,7 @@ def print_env() -> None:
 def build():
     os.environ["THUNDERKITTENS_ROOT"] = "/ThunderKittens"
     os.environ["TORCH_PYBIND11"] = "/usr/local/lib/python3.10/site-packages/pybind11/include"
-    os.environ["PYTHONPATH"] = "/ThunderKittens/kernels/fp8:/ThunderKittens/kernels/fp8/attn"
+    os.environ["PYTHONPATH"] = "/opt/flash-attention/hopper:/ThunderKittens/kernels/fp8:/ThunderKittens/kernels/fp8/attn"
     print_env()
 
     for old in ATTN_DIR.glob("_C*.so"):
@@ -222,7 +239,7 @@ def run_tests_and_profiles(artifact_names: list[str], commands: list[tuple[str, 
     artifact_volume.reload()
     os.environ["THUNDERKITTENS_ROOT"] = "/ThunderKittens"
     os.environ["TORCH_PYBIND11"] = "/usr/local/lib/python3.10/site-packages/pybind11/include"
-    os.environ["PYTHONPATH"] = "/ThunderKittens/kernels/fp8:/ThunderKittens/kernels/fp8/attn"
+    os.environ["PYTHONPATH"] = "/opt/flash-attention/hopper:/ThunderKittens/kernels/fp8:/ThunderKittens/kernels/fp8/attn"
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     print_env()
     run("nvidia-smi", cwd="/ThunderKittens")

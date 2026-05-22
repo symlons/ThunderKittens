@@ -255,6 +255,30 @@ def make_sdpa_groups(shape, *, seed, group_count):
     return groups
 
 
+def make_fa3_groups(shape, *, seed, group_count):
+    """Build BF16 groups in FlashAttention-3's (B, N, H, D) layout."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    groups = []
+    for _ in range(group_count):
+        Q = uniform_tensor(shape, generator=gen).permute(0, 2, 1, 3).contiguous().to(torch.bfloat16)
+        K = uniform_tensor(shape, generator=gen).permute(0, 2, 1, 3).contiguous().to(torch.bfloat16)
+        V = uniform_tensor(shape, generator=gen).permute(0, 2, 1, 3).contiguous().to(torch.bfloat16)
+        groups.append((Q, K, V))
+    torch.cuda.synchronize()
+    return groups
+
+
+def import_fa3_func():
+    try:
+        import flash_attn_interface
+    except Exception as exc:
+        return None, str(exc)
+    func = getattr(flash_attn_interface, "flash_attn_func", None)
+    if func is None:
+        return None, "flash_attn_interface.flash_attn_func is missing"
+    return func, None
+
+
 # ---------------------------------------------------------------------------
 # Top-level profile.
 # ---------------------------------------------------------------------------
@@ -310,7 +334,7 @@ def profile_quant(shape, *, seed, warmup, iters, cooldown, group_count):
 
 def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only,
                 bwd_modes=(2,), sdp_descale_mode="estimate",
-                include_sdpa_bwd=True):
+                include_sdpa_bwd=True, fa3_func=None, fa3_unavailable=None):
     B, H, N, D = shape
     print(f"\n[profile B={B} H={H} N={N} D={D} seed={seed}]")
 
@@ -407,6 +431,34 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only,
         line += f"  bwd {sdpa_bwd_ms / bwd_ms:.2f}x"
     print(line)
 
+    # ---- FlashAttention-3 bf16 baseline ------------------------------------
+    # FA3 uses the public Hopper beta interface with tensors in (B, N, H, D).
+    if fa3_func is None:
+        if fa3_unavailable:
+            print(f"  flash-attn-3 bfloat16 fwd unavailable: {fa3_unavailable}")
+        return
+
+    try:
+        fa3_groups = make_fa3_groups(shape, seed=seed, group_count=sdpa_groups_n)
+
+        def fa3_fwd(i):
+            Q, K, V = fa3_groups[i]
+            return fa3_func(Q, K, V, causal=False)
+
+        fa3_fwd_ms = benchmark_ms(fa3_fwd, sdpa_groups_n,
+                                  warmup=warmup, iters=iters, cooldown_s=cooldown)
+        print_profile_line("flash-attn-3 bfloat16 fwd", fa3_fwd_ms, flops_shape=shape, kind="fwd")
+        print(f"  speedup vs FlashAttention-3: fwd {fa3_fwd_ms / fwd_ms:.2f}x")
+        del fa3_groups
+        gc.collect()
+        torch.cuda.empty_cache()
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"  FlashAttention-3 bf16 OOM: {str(e).splitlines()[0]}")
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"  FlashAttention-3 bf16 failed: {type(e).__name__}: {e}")
+        torch.cuda.empty_cache()
+
 
 def profile_sdpa_bwd_peak(shapes, *, seed, warmup, iters, cooldown):
     """Sweep bf16 SDPA backward-only throughput across baseline shapes."""
@@ -465,6 +517,8 @@ def main():
                     help="custom shapes as 'B,H,N,D;B,H,N,D'")
     ap.add_argument("--skip-sdpa-bwd", action="store_true",
                     help="skip bf16 SDPA backward baseline in bwd-capable modes")
+    ap.add_argument("--no-fa3", action="store_true",
+                    help="skip FlashAttention-3 bf16 forward baseline")
     args = ap.parse_args()
     if args.quick_profile:
         args.bench_warmup = 20
@@ -504,6 +558,9 @@ def main():
     if args.mode == "bwd-sweep" and sdp_descale_mode == "constant":
         print("[profile note] bwd-sweep uses constant sdp descale by default; "
               "timing-only, not correctness-quality.")
+    fa3_func, fa3_unavailable = (None, None) if args.no_fa3 else import_fa3_func()
+    if args.no_fa3:
+        print("[profile note] FlashAttention-3 baseline disabled by --no-fa3.")
 
     for shape in shapes:
         fwd_only = args.mode == "seq-sweep" or (args.mode == "long" and shape[2] > args.bwd_threshold)
@@ -517,6 +574,8 @@ def main():
             bwd_modes=bwd_modes,
             sdp_descale_mode=sdp_descale_mode,
             include_sdpa_bwd=not args.skip_sdpa_bwd,
+            fa3_func=fa3_func,
+            fa3_unavailable=fa3_unavailable,
         )
 
 
