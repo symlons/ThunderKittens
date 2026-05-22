@@ -33,7 +33,7 @@ from fp8_suite.kernel_api import (
     fp8_forward,
     require_extension,
 )
-from fp8_suite.metrics import gbps
+from fp8_suite.metrics import gbps, tensor_metrics
 from fp8_suite.profiling import (
     benchmark_ms,
     print_profile_line,
@@ -268,6 +268,42 @@ def make_fa3_groups(shape, *, seed, group_count):
     return groups
 
 
+def _fa3_layout(x):
+    return x.permute(0, 2, 1, 3).contiguous()
+
+
+def _bh_scale(x):
+    return (x.float().abs().amax(dim=(-2, -1)).clamp_min(1.0e-12) / 448.0).contiguous()
+
+
+def quantize_fa3_fp8(x):
+    """Quantize a (B, H, N, D) tensor for FA3 FP8.
+
+    FA3's public FP8 path takes FP8 tensors in (B, N, H, D) and separate
+    per-(batch, head) descale factors.
+    """
+    scale = _bh_scale(x)
+    xq = (x.float() / scale[:, :, None, None]).to(torch.float8_e4m3fn)
+    return _fa3_layout(xq), scale
+
+
+def make_fa3_fp8_groups(shape, *, seed, group_count):
+    """Build FP8 groups in FlashAttention-3's (B, N, H, D) layout."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    groups = []
+    for _ in range(group_count):
+        Q = uniform_tensor(shape, generator=gen)
+        K = uniform_tensor(shape, generator=gen)
+        V = uniform_tensor(shape, generator=gen)
+        Qq, sq = quantize_fa3_fp8(Q)
+        Kq, sk = quantize_fa3_fp8(K)
+        Vq, sv = quantize_fa3_fp8(V)
+        groups.append((Qq, Kq, Vq, sq, sk, sv))
+        del Q, K, V
+    torch.cuda.synchronize()
+    return groups
+
+
 def import_fa3_func():
     try:
         import flash_attn_interface
@@ -277,6 +313,90 @@ def import_fa3_func():
     if func is None:
         return None, "flash_attn_interface.flash_attn_func is missing"
     return func, None
+
+
+def _metrics_line(label, out, ref):
+    metrics = tensor_metrics(out, ref)
+    out_f = out.detach().to(torch.float32)
+    finite = int(torch.isfinite(out_f).sum().item())
+    total = out.numel()
+    finite_note = "" if finite == total else f"  finite={finite}/{total}"
+    print(
+        f"    {label:<26} QSNR={metrics['qsnr_dB']:6.2f} dB  "
+        f"relL1={metrics['rel_L1']:.3e}  RMSE={metrics['rmse']:.3e}  "
+        f"cos={metrics['cos']:.6f}  max={metrics['max']:.3e}{finite_note}",
+        flush=True,
+    )
+
+
+def profile_correctness(shape, *, seed, fa3_func=None, fa3_unavailable=None):
+    """Report fwd correctness of each profiled implementation vs bf16 SDPA."""
+    print("  correctness vs torch sdpa bfloat16 fwd:")
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    Q = uniform_tensor(shape, generator=gen)
+    K = uniform_tensor(shape, generator=gen)
+    V = uniform_tensor(shape, generator=gen)
+
+    Qbf = Q.to(torch.bfloat16)
+    Kbf = K.to(torch.bfloat16)
+    Vbf = V.to(torch.bfloat16)
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        ref = F.scaled_dot_product_attention(Qbf, Kbf, Vbf, is_causal=False)
+    torch.cuda.synchronize()
+
+    try:
+        fwd_inp = prepare_forward_inputs(Q, K, V, use_cuda_quant=True)
+        out, _ = fp8_forward(fwd_inp)
+        torch.cuda.synchronize()
+        _metrics_line("fp8 tk fwd", out, ref)
+        del fwd_inp, out
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"    fp8 tk fwd                OOM: {str(e).splitlines()[0]}")
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"    fp8 tk fwd                failed: {type(e).__name__}: {e}")
+        torch.cuda.empty_cache()
+
+    if fa3_func is None:
+        if fa3_unavailable:
+            print(f"    flash-attn-3              unavailable: {fa3_unavailable}")
+        del Q, K, V, Qbf, Kbf, Vbf, ref
+        gc.collect()
+        torch.cuda.empty_cache()
+        return
+
+    try:
+        out = fa3_func(_fa3_layout(Qbf), _fa3_layout(Kbf), _fa3_layout(Vbf), causal=False)
+        out = out.permute(0, 2, 1, 3).contiguous()
+        torch.cuda.synchronize()
+        _metrics_line("flash-attn-3 bf16 fwd", out, ref)
+        del out
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"    flash-attn-3 bf16 fwd     OOM: {str(e).splitlines()[0]}")
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"    flash-attn-3 bf16 fwd     failed: {type(e).__name__}: {e}")
+        torch.cuda.empty_cache()
+
+    try:
+        Qq, sq = quantize_fa3_fp8(Q)
+        Kq, sk = quantize_fa3_fp8(K)
+        Vq, sv = quantize_fa3_fp8(V)
+        out = fa3_func(Qq, Kq, Vq, causal=False, q_descale=sq, k_descale=sk, v_descale=sv)
+        out = out.permute(0, 2, 1, 3).contiguous()
+        torch.cuda.synchronize()
+        _metrics_line("flash-attn-3 fp8 fwd", out, ref)
+        del Qq, Kq, Vq, sq, sk, sv, out
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"    flash-attn-3 fp8 fwd      OOM: {str(e).splitlines()[0]}")
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"    flash-attn-3 fp8 fwd      failed: {type(e).__name__}: {e}")
+        torch.cuda.empty_cache()
+
+    del Q, K, V, Qbf, Kbf, Vbf, ref
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +454,8 @@ def profile_quant(shape, *, seed, warmup, iters, cooldown, group_count):
 
 def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only,
                 bwd_modes=(2,), sdp_descale_mode="estimate",
-                include_sdpa_bwd=True, fa3_func=None, fa3_unavailable=None):
+                include_sdpa_bwd=True, fa3_func=None, fa3_unavailable=None,
+                include_correctness=True):
     B, H, N, D = shape
     print(f"\n[profile B={B} H={H} N={N} D={D} seed={seed}]")
 
@@ -431,11 +552,15 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only,
         line += f"  bwd {sdpa_bwd_ms / bwd_ms:.2f}x"
     print(line)
 
-    # ---- FlashAttention-3 bf16 baseline ------------------------------------
+    # ---- FlashAttention-3 baselines ----------------------------------------
     # FA3 uses the public Hopper beta interface with tensors in (B, N, H, D).
+    fa3_bf16_ms = None
+    fa3_fp8_ms = None
     if fa3_func is None:
         if fa3_unavailable:
-            print(f"  flash-attn-3 bfloat16 fwd unavailable: {fa3_unavailable}")
+            print(f"  flash-attn-3 fwd unavailable: {fa3_unavailable}")
+        if include_correctness:
+            profile_correctness(shape, seed=seed, fa3_func=None, fa3_unavailable=fa3_unavailable)
         return
 
     try:
@@ -447,8 +572,9 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only,
 
         fa3_fwd_ms = benchmark_ms(fa3_fwd, sdpa_groups_n,
                                   warmup=warmup, iters=iters, cooldown_s=cooldown)
-        print_profile_line("flash-attn-3 bfloat16 fwd", fa3_fwd_ms, flops_shape=shape, kind="fwd")
-        print(f"  speedup vs FlashAttention-3: fwd {fa3_fwd_ms / fwd_ms:.2f}x")
+        fa3_bf16_ms = fa3_fwd_ms
+        print_profile_line("flash-attn-3 bfloat16 fwd", fa3_bf16_ms, flops_shape=shape, kind="fwd")
+        print(f"  speedup vs FlashAttention-3 bf16: fwd {fa3_bf16_ms / fwd_ms:.2f}x")
         del fa3_groups
         gc.collect()
         torch.cuda.empty_cache()
@@ -458,6 +584,30 @@ def profile_one(shape, *, seed, warmup, iters, cooldown, fwd_only,
     except Exception as e:
         print(f"  FlashAttention-3 bf16 failed: {type(e).__name__}: {e}")
         torch.cuda.empty_cache()
+
+    try:
+        fa3_fp8_groups = make_fa3_fp8_groups(shape, seed=seed, group_count=sdpa_groups_n)
+
+        def fa3_fp8_fwd(i):
+            Q, K, V, sq, sk, sv = fa3_fp8_groups[i]
+            return fa3_func(Q, K, V, causal=False, q_descale=sq, k_descale=sk, v_descale=sv)
+
+        fa3_fp8_ms = benchmark_ms(fa3_fp8_fwd, sdpa_groups_n,
+                                  warmup=warmup, iters=iters, cooldown_s=cooldown)
+        print_profile_line("flash-attn-3 fp8 fwd", fa3_fp8_ms, flops_shape=shape, kind="fwd")
+        print(f"  speedup vs FlashAttention-3 fp8: fwd {fa3_fp8_ms / fwd_ms:.2f}x")
+        del fa3_fp8_groups
+        gc.collect()
+        torch.cuda.empty_cache()
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"  FlashAttention-3 fp8 OOM: {str(e).splitlines()[0]}")
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"  FlashAttention-3 fp8 failed: {type(e).__name__}: {e}")
+        torch.cuda.empty_cache()
+
+    if include_correctness:
+        profile_correctness(shape, seed=seed, fa3_func=fa3_func, fa3_unavailable=fa3_unavailable)
 
 
 def profile_sdpa_bwd_peak(shapes, *, seed, warmup, iters, cooldown):
@@ -518,7 +668,9 @@ def main():
     ap.add_argument("--skip-sdpa-bwd", action="store_true",
                     help="skip bf16 SDPA backward baseline in bwd-capable modes")
     ap.add_argument("--no-fa3", action="store_true",
-                    help="skip FlashAttention-3 bf16 forward baseline")
+                    help="skip FlashAttention-3 bf16/fp8 forward baselines")
+    ap.add_argument("--skip-correctness", action="store_true",
+                    help="skip per-shape correctness metrics vs torch SDPA bf16")
     args = ap.parse_args()
     if args.quick_profile:
         args.bench_warmup = 20
@@ -576,6 +728,7 @@ def main():
             include_sdpa_bwd=not args.skip_sdpa_bwd,
             fa3_func=fa3_func,
             fa3_unavailable=fa3_unavailable,
+            include_correctness=not args.skip_correctness,
         )
 
 

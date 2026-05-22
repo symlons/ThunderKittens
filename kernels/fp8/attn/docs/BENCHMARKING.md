@@ -6,7 +6,8 @@ script reports:
 - quantization kernels as effective bandwidth in GB/s
 - FP8 attention forward/backward as TFLOP/s
 - PyTorch SDPA fp32 and bf16 baselines
-- FlashAttention-3 bf16 forward baseline when `flash_attn_interface` is installed
+- FlashAttention-3 bf16 and FP8 forward baselines when `flash_attn_interface` is installed
+- forward correctness metrics for FP8 TK, FA3 bf16, and FA3 FP8 against torch bf16 SDPA
 - FP8 speedups against those baselines
 
 ## Protocol
@@ -62,6 +63,9 @@ python3 profile_long_context.py --mode seq-sweep --quick-profile --skip-sdpa-bwd
 # Disable FlashAttention-3 if it is not installed or you only need SDPA.
 python3 profile_long_context.py --mode seq-sweep --no-fa3
 
+# Disable correctness metrics when you only need timing.
+python3 profile_long_context.py --mode seq-sweep --skip-correctness
+
 # Final-reporting backward dS-mode sweep on a small subset.
 # Modes: 0=bf16/off, 1=FP8 RTNE, 2=FP8 SR.
 python3 profile_long_context.py --mode bwd-sweep --quick --bwd-modes 0 1 2 \
@@ -114,6 +118,11 @@ For Modal H100 timing smoke runs, use:
 ```bash
 uvx modal run kernels/fp8/attn/modal_fp8_attn_h100.py --seq-sweep --continue-on-error
 ```
+
+`profile_long_context.py` reports per-shape forward correctness against torch
+bf16 SDPA by default. The correctness lines use `fp8_suite.metrics.tensor_metrics`
+and include QSNR, rel-L1, RMSE, cosine similarity, and max absolute error for
+FP8 TK, FA3 bf16, and FA3 FP8. Pass `--skip-correctness` for timing-only runs.
 
 `profile_long_context.py` runs FP8 fwd-only above `--bwd-threshold` (default
 32000) because the backward recipe builds an O(N²) reference attention
