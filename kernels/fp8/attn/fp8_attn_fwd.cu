@@ -322,7 +322,7 @@ template<> struct fp8_attn_tile_dims<128> {
     constexpr static int tile_width = 128;
     constexpr static int qo_height  = 64;          // 4 * 16 rows
     constexpr static int kv_height  = 128;         // 8 * 16 rows
-    constexpr static int stages     = 2;
+    constexpr static int stages     = 3;
 };
 template<> struct fp8_attn_tile_dims<64> {
     constexpr static int tile_width = 64;
