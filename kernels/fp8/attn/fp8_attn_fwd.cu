@@ -1065,7 +1065,10 @@ __device__ static inline void fp8_consumer_pair_sync(kittens::semaphore &bar, in
 
 template<bool fp8_dS, bool fp8_dS_sr,
           int tile_h_qo, int tile_h, int tile_width, int D,
-          int warpgroupid = -1>
+          int WarpgroupId = -1,
+          typename QSmem, typename KSmem, typename VSmem,
+          typename OgSmem, typename QtSmem, typename OgTsmem, typename KTsmem,
+          typename LSmem, typename DSmem, typename Globals>
 __device__ static inline void
 fp8_compute_bwd_loop(
         kittens::semaphore *vec_b, kittens::semaphore *q_b, kittens::semaphore *o_b,
@@ -1073,16 +1076,16 @@ fp8_compute_bwd_loop(
         rt_fl<16, 64> &p_block_t,  rt_fl<16, 64> &ds_block_t,
         rt_fl<16, tile_width> &kg_reg, rt_fl<16, tile_width> &vg_reg,
         rt_fl<16, tile_width> &qg_reg,
-        auto &q_smem, auto &k_smem, auto &v_smem,
-        auto &og_smem, auto &q_t_smem, auto &og_t_smem, auto &k_t_smem,
+        QSmem &q_smem, KSmem &k_smem, VSmem &v_smem,
+        OgSmem &og_smem, QtSmem &q_t_smem, OgTsmem &og_t_smem, KTsmem &k_t_smem,
         kittens::semaphore *consumer_sync,
-        auto &l_smem, auto &d_smem,
-        const auto &g,
+        LSmem &l_smem, DSmem &d_smem,
+        const Globals &g,
         uint32_t &prng_state,
         int qo_idx, int q_start, int tic, int toc,
         int kv_head_idx, int kv_block_idx)
 {
-    const int wg_id = warpgroupid >= 0 ? warpgroupid : (kittens::warpid()/kittens::WARPGROUP_WARPS);
+    const int wg_id = WarpgroupId >= 0 ? WarpgroupId : (kittens::warpid()/kittens::WARPGROUP_WARPS);
 
     wait(vec_b[tic], ((qo_idx - q_start)/2)%2);
     wait(q_b[tic], ((qo_idx - q_start)/2)%2);
@@ -1136,11 +1139,11 @@ fp8_compute_bwd_loop(
     else                   { warp::mul(ds_block_t, ds_block_t, 0.08838834764f); }
 
     // ---- dQ path: FP8 mma_ABt(dS^T, K^T) per-K-row quantization ----
-    // Only wg0 computes dQ. wg1 skips entirely to save ~3K scalar ops/iter.
+    // Only wg0 computes dQ in this path.
     rt_fl<16, 64> ds_copy;
     rt_fp8e4m3<16, 64> ds_block_t_fp8_dQ;
     col_vec<rt_fl<16, 64>> ds_scale_cv_dQ;
-    if constexpr (warpgroupid == 0) {
+    if constexpr (WarpgroupId == 0) {
         warp::copy(ds_copy, ds_block_t);
         fp8_quant_per_K_row<fp8_dS_sr>(
             ds_copy, ds_block_t_fp8_dQ, ds_scale_cv_dQ, prng_state);
@@ -1178,17 +1181,11 @@ fp8_compute_bwd_loop(
     fp8_consumer_pair_sync(consumer_sync[2], (qo_idx - q_start) % 2);
 
     // ---- dQ path: wait for WMMA + scale correction (wg0 only) --------
-    if constexpr (warpgroupid == 0) {
+    if constexpr (WarpgroupId == 0) {
         warpgroup::mma_async_wait();
         {
             // Undo quantization: multiply by per-K-row quantization scale.
             warp::mul_row(qg_reg, qg_reg, ds_scale_cv_dQ);
-            // Apply per-Qrow FP8 descale (sdp_row is uniform scalar per tile).
-            {
-                row_vec<rt_fl<16, tile_width>> sdp_rv;
-                warp::load(sdp_rv, g.sdp_row, {blockIdx.z, blockIdx.y, 0, qo_idx});
-                warp::mul_col(qg_reg, qg_reg, sdp_rv);
-            }
             // Apply K-channel descale.
             {
                 row_vec<rt_fl<16, tile_width>> sk_ch_rv;
@@ -1459,8 +1456,8 @@ void fp8_bwd_attend_ker(const __grid_constant__ fp8_bwd_globals<D> g) {
                     g, prng_state,
                     qo_idx, q_start, tic, toc,
                     kv_head_idx, kv_block_idx);
-                // Match the wg0-side sync after the FP8 dQ MMA.
-                // the next iteration's transpose can safely overwrite them.
+                // Match the wg0-side sync after the FP8 dQ MMA so the next
+                // iteration's transpose can safely overwrite shared operands.
                 fp8_consumer_pair_sync(consumer_sync[3], (qo_idx - q_start) % 2);
                 // Signal compute_done so the producer waits for BOTH wgs
                 // to finish their dK/dV MMAs before reloading q_t_smem[tic]
