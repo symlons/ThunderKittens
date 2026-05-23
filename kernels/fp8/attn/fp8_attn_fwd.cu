@@ -399,14 +399,45 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
     auto      (*o_smem)                      = reinterpret_cast<o_tile(*)>(q_smem);
 
     int kv_blocks   = g.N / K::kv_height;
-    int kv_head_idx = blockIdx.y / g.hr;
-    int seq_idx     = blockIdx.x * CONSUMER_WARPGROUPS;
+    int q_blocks    = g.N / (K::qo_height * CONSUMER_WARPGROUPS);
+    int qo_heads    = gridDim.y;
+    int batch_idx   = blockIdx.z;
+    int qo_head_idx = blockIdx.y;
+    int q_block     = blockIdx.x;
+    int size_one_kv_head = g.N * K::tile_width * (int)(sizeof(fp8e4m3) + sizeof(bf16));
+    constexpr int size_l2 = 50 * 1024 * 1024;
+
+    // Keep blocks using different Q heads but the same resident K/V footprint
+    // close in launch order. For very long contexts the K/V head is larger
+    // than L2, so the original x/y/z mapping is cheaper and equivalent.
+    if (size_one_kv_head > 0 && size_l2 >= size_one_kv_head) {
+        int logical_bid = blockIdx.x + (blockIdx.y + blockIdx.z * qo_heads) * q_blocks;
+        int num_hb = qo_heads * gridDim.z;
+        int swizzle = 1 << (31 - __clz(size_l2 / size_one_kv_head));
+        swizzle = swizzle > num_hb ? num_hb : swizzle;
+
+        int l2_major = q_blocks * swizzle;
+        int hb_group = logical_bid / l2_major;
+        int l2_mod   = logical_bid - hb_group * l2_major;
+        q_block      = l2_mod / swizzle;
+        int hb_resid = l2_mod - q_block * swizzle;
+        int hb_idx   = hb_group * swizzle + hb_resid;
+        batch_idx    = hb_idx / qo_heads;
+        qo_head_idx  = hb_idx - batch_idx * qo_heads;
+    }
+    int kv_head_idx = qo_head_idx / g.hr;
+    int seq_idx     = q_block * CONSUMER_WARPGROUPS;
 
     __shared__ kittens::semaphore qsmem_sem,
                                   k_sem[K::stages], v_sem[K::stages],
                                   done_sem[K::stages];
 
     if (threadIdx.x == 0) {
+        g.q.template prefetch_tma<q_tile>();
+        g.k.template prefetch_tma<k_tile>();
+        g.v.template prefetch_tma<v_tile>();
+        g.o.template prefetch_tma<o_tile>();
+
         init_semaphore(qsmem_sem, 0, 1);
         for (int j = 0; j < K::stages; ++j) {
             init_semaphore(k_sem[j], 0, 1);
@@ -416,12 +447,12 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
 
         tma::expect_bytes(qsmem_sem, sizeof(q_smem));
         for (int wg = 0; wg < CONSUMER_WARPGROUPS; ++wg) {
-            coord<q_tile> q_idx = {blockIdx.z, blockIdx.y, seq_idx + wg, 0};
+            coord<q_tile> q_idx = {batch_idx, qo_head_idx, seq_idx + wg, 0};
             tma::load_async(q_smem[wg], g.q, q_idx, qsmem_sem);
         }
 
         for (int j = 0; j < K::stages - 1; ++j) {
-            coord<k_tile> kv_idx = {blockIdx.z, kv_head_idx, j, 0};
+            coord<k_tile> kv_idx = {batch_idx, kv_head_idx, j, 0};
             tma::expect_bytes(k_sem[j], sizeof(k_tile));
             tma::load_async(k_smem[j], g.k, kv_idx, k_sem[j]);
             tma::expect_bytes(v_sem[j], sizeof(v_tile));
@@ -440,7 +471,7 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
 
         if (warpid == NUM_WORKERS - 4) {
             for (int kv_idx = pipe_idx - 1; kv_idx <= kv_iters; ++kv_idx) {
-                coord<k_tile> kv_tile_idx = {blockIdx.z, kv_head_idx, kv_idx + 1, 0};
+                coord<k_tile> kv_tile_idx = {batch_idx, kv_head_idx, kv_idx + 1, 0};
                 int s = (kv_idx + 1) % K::stages;
                 warp::tma::expect_bytes(k_sem[s], sizeof(k_tile));
                 warp::tma::load_async(k_smem[s], g.k, kv_tile_idx, k_sem[s]);
@@ -486,9 +517,9 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
         col_vec<rt_fl<16, K::kv_height>> q_scale_cv;
         row_vec<rt_fl<16, K::kv_height>> k_scale_rv;
         warpgroup::load(q_scale_cv, g.sq,
-            {blockIdx.z, blockIdx.y, 0, seq_idx + warpgroupid});
+            {batch_idx, qo_head_idx, 0, seq_idx + warpgroupid});
         warp::load(k_scale_rv, g.sk,
-            {blockIdx.z, kv_head_idx, 0, kv_idx});
+            {batch_idx, kv_head_idx, 0, kv_idx});
 
         warpgroup::mma_async_wait();
 
@@ -537,14 +568,14 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
     // column add.
     {
         row_vec<rt_fl<16, K::tile_width>> v_mean_rv;
-        warp::load(v_mean_rv, g.vm, {blockIdx.z, kv_head_idx, 0, 0});
+        warp::load(v_mean_rv, g.vm, {batch_idx, kv_head_idx, 0, 0});
         warp::add_col(o_reg, o_reg, v_mean_rv);
     }
 
     warpgroup::store(o_smem[warpgroupid], o_reg);
     warpgroup::sync(warpgroupid + 4);
     if (warpid % 4 == 0) {
-        coord<o_tile> o_idx = {blockIdx.z, blockIdx.y, seq_idx + warpgroupid, 0};
+        coord<o_tile> o_idx = {batch_idx, qo_head_idx, seq_idx + warpgroupid, 0};
         warp::tma::store_async(g.o, o_smem[warpgroupid], o_idx);
     }
 
@@ -558,7 +589,7 @@ void fp8_attn_fwd_ker(const __grid_constant__ fp8_attn_globals<D> g) {
     warpgroup::store(l_smem[warpgroupid], norm_vec);
     warpgroup::sync(warpgroupid + 4);
     if (warpid % 4 == 0) {
-        coord<l_col_vec> l_idx = {blockIdx.z, blockIdx.y, 0, seq_idx + warpgroupid};
+        coord<l_col_vec> l_idx = {batch_idx, qo_head_idx, 0, seq_idx + warpgroupid};
         warp::tma::store_async(g.l, l_smem[warpgroupid], l_idx);
     }
     warp::tma::store_async_wait();
