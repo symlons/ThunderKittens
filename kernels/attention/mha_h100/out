@@ -1,0 +1,296 @@
+Could not import flash_attention. Please: pip install flash-attn
+Could not import flash_attn_interface. Please: clone flash-attention and install the hopper kernels
+Benchmarking the kernels...
+================================================ ATTENTION ================================================
+Method: attn_fwd_PT_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_fwd_PT_c=t -- Efficiency: 30.16 TFLOPS, Time: 1281.8080 us and FLOPS: 38654705664.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_fwd_PT_c=t -- Efficiency: 22.48 TFLOPS, Time: 6877.6991 us and FLOPS: 154618822656.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_fwd_PT_c=t -- Efficiency: 22.35 TFLOPS, Time: 27668.3647 us and FLOPS: 618475290624.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_fwd_PT_c=t -- Efficiency: 23.50 TFLOPS, Time: 105274.7169 us and FLOPS: 2473901162496.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: CUDA out of memory. Tried to allocate 72.00 GiB. GPU 0 has a total capacity of 139.80 GiB of which 61.13 GiB is free. Including non-PyTorch memory, this process has 78.66 GiB memory in use. Of the allocated memory 75.20 GiB is allocated by PyTorch, and 2.73 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+Method attn_fwd_PT_c=t -- Efficiency: -9895.60 TFLOPS, Time: -1000.0000 us and FLOPS: 9895604649984.00
+Method: attn_fwd_FA2_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_fwd_FA2_c=t -- Efficiency: 284.52 TFLOPS, Time: 135.8592 us and FLOPS: 38654705664.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_fwd_FA2_c=t -- Efficiency: 461.14 TFLOPS, Time: 335.2960 us and FLOPS: 154618822656.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_fwd_FA2_c=t -- Efficiency: 571.77 TFLOPS, Time: 1081.6928 us and FLOPS: 618475290624.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_fwd_FA2_c=t -- Efficiency: 619.04 TFLOPS, Time: 3996.3520 us and FLOPS: 2473901162496.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_fwd_FA2_c=t -- Efficiency: 598.73 TFLOPS, Time: 16527.7503 us and FLOPS: 9895604649984.00
+Method: attn_fwd_FA3_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=t -- Efficiency: -38.65 TFLOPS, Time: -1000.0000 us and FLOPS: 38654705664.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=t -- Efficiency: -154.62 TFLOPS, Time: -1000.0000 us and FLOPS: 154618822656.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=t -- Efficiency: -618.48 TFLOPS, Time: -1000.0000 us and FLOPS: 618475290624.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=t -- Efficiency: -2473.90 TFLOPS, Time: -1000.0000 us and FLOPS: 2473901162496.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=t -- Efficiency: -9895.60 TFLOPS, Time: -1000.0000 us and FLOPS: 9895604649984.00
+Method: attn_fwd_TK_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_fwd_TK_c=t -- Efficiency: 224.85 TFLOPS, Time: 171.9168 us and FLOPS: 38654705664.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_fwd_TK_c=t -- Efficiency: 376.49 TFLOPS, Time: 410.6816 us and FLOPS: 154618822656.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_fwd_TK_c=t -- Efficiency: 495.80 TFLOPS, Time: 1247.4336 us and FLOPS: 618475290624.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_fwd_TK_c=t -- Efficiency: 558.23 TFLOPS, Time: 4431.7057 us and FLOPS: 2473901162496.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_fwd_TK_c=t -- Efficiency: 561.71 TFLOPS, Time: 17616.9313 us and FLOPS: 9895604649984.00
+Method: attn_fwd_PT_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_fwd_PT_c=f -- Efficiency: 96.93 TFLOPS, Time: 797.6000 us and FLOPS: 77309411328.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_fwd_PT_c=f -- Efficiency: 108.08 TFLOPS, Time: 2861.2224 us and FLOPS: 309237645312.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_fwd_PT_c=f -- Efficiency: 90.72 TFLOPS, Time: 13635.3217 us and FLOPS: 1236950581248.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_fwd_PT_c=f -- Efficiency: 100.86 TFLOPS, Time: 49055.6858 us and FLOPS: 4947802324992.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: CUDA out of memory. Tried to allocate 72.00 GiB. GPU 0 has a total capacity of 139.80 GiB of which 61.11 GiB is free. Including non-PyTorch memory, this process has 78.68 GiB memory in use. Of the allocated memory 75.06 GiB is allocated by PyTorch, and 2.88 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+Method attn_fwd_PT_c=f -- Efficiency: -19791.21 TFLOPS, Time: -1000.0000 us and FLOPS: 19791209299968.00
+Method: attn_fwd_FA2_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_fwd_FA2_c=f -- Efficiency: 297.15 TFLOPS, Time: 260.1664 us and FLOPS: 77309411328.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_fwd_FA2_c=f -- Efficiency: 597.55 TFLOPS, Time: 517.5072 us and FLOPS: 309237645312.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_fwd_FA2_c=f -- Efficiency: 661.92 TFLOPS, Time: 1868.7392 us and FLOPS: 1236950581248.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_fwd_FA2_c=f -- Efficiency: 641.17 TFLOPS, Time: 7716.8480 us and FLOPS: 4947802324992.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_fwd_FA2_c=f -- Efficiency: 621.94 TFLOPS, Time: 31821.5424 us and FLOPS: 19791209299968.00
+Method: attn_fwd_FA3_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=f -- Efficiency: -77.31 TFLOPS, Time: -1000.0000 us and FLOPS: 77309411328.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=f -- Efficiency: -309.24 TFLOPS, Time: -1000.0000 us and FLOPS: 309237645312.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=f -- Efficiency: -1236.95 TFLOPS, Time: -1000.0000 us and FLOPS: 1236950581248.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=f -- Efficiency: -4947.80 TFLOPS, Time: -1000.0000 us and FLOPS: 4947802324992.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_fwd_FA3_c=f -- Efficiency: -19791.21 TFLOPS, Time: -1000.0000 us and FLOPS: 19791209299968.00
+Method: attn_fwd_TK_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_fwd_TK_c=f -- Efficiency: 415.06 TFLOPS, Time: 186.2592 us and FLOPS: 77309411328.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_fwd_TK_c=f -- Efficiency: 574.47 TFLOPS, Time: 538.3008 us and FLOPS: 309237645312.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_fwd_TK_c=f -- Efficiency: 652.18 TFLOPS, Time: 1896.6528 us and FLOPS: 1236950581248.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_fwd_TK_c=f -- Efficiency: 648.99 TFLOPS, Time: 7623.8175 us and FLOPS: 4947802324992.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_fwd_TK_c=f -- Efficiency: 630.51 TFLOPS, Time: 31389.0173 us and FLOPS: 19791209299968.00
+      attn_fwd_PT_c=t  attn_fwd_FA2_c=t attn_fwd_FA3_c=t  attn_fwd_TK_c=t attn_fwd_PT_c=f  attn_fwd_FA2_c=f attn_fwd_FA3_c=f  attn_fwd_TK_c=f
+768         30.156393        284.520337              OOM       224.845428       96.927547        297.153707              OOM       415.063586
+1536        22.481184        461.141274              OOM       376.493181      108.078857        597.552352              OOM       574.469971
+3072        22.353157        571.766102              OOM       495.798165       90.716641        661.917180              OOM       652.175551
+6144        23.499481        619.039851              OOM       558.227768      100.860935        641.168821              OOM       648.992752
+12288             OOM        598.726655              OOM       561.709895             OOM        621.943747              OOM       630.513823
+Method: attn_bwd_PT_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_bwd_PT_c=t -- Efficiency: 47.33 TFLOPS, Time: 2041.8816 us and FLOPS: 96636764160.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_bwd_PT_c=t -- Efficiency: 52.84 TFLOPS, Time: 7315.5424 us and FLOPS: 386547056640.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_bwd_PT_c=t -- Efficiency: 61.12 TFLOPS, Time: 25295.5936 us and FLOPS: 1546188226560.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_bwd_PT_c=t -- Efficiency: 63.35 TFLOPS, Time: 97627.6161 us and FLOPS: 6184752906240.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: CUDA out of memory. Tried to allocate 72.00 GiB. GPU 0 has a total capacity of 139.80 GiB of which 62.24 GiB is free. Including non-PyTorch memory, this process has 77.55 GiB memory in use. Of the allocated memory 75.20 GiB is allocated by PyTorch, and 1.61 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+Method attn_bwd_PT_c=t -- Efficiency: -24739.01 TFLOPS, Time: -1000.0000 us and FLOPS: 24739011624960.00
+Method: attn_bwd_FA2_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_bwd_FA2_c=t -- Efficiency: 74.98 TFLOPS, Time: 1288.8448 us and FLOPS: 96636764160.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_bwd_FA2_c=t -- Efficiency: 255.41 TFLOPS, Time: 1513.4496 us and FLOPS: 386547056640.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_bwd_FA2_c=t -- Efficiency: 445.85 TFLOPS, Time: 3467.9712 us and FLOPS: 1546188226560.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_bwd_FA2_c=t -- Efficiency: 507.08 TFLOPS, Time: 12196.7551 us and FLOPS: 6184752906240.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_bwd_FA2_c=t -- Efficiency: 502.49 TFLOPS, Time: 49232.3807 us and FLOPS: 24739011624960.00
+Method: attn_bwd_FA3_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=t -- Efficiency: -96.64 TFLOPS, Time: -1000.0000 us and FLOPS: 96636764160.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=t -- Efficiency: -386.55 TFLOPS, Time: -1000.0000 us and FLOPS: 386547056640.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=t -- Efficiency: -1546.19 TFLOPS, Time: -1000.0000 us and FLOPS: 1546188226560.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=t -- Efficiency: -6184.75 TFLOPS, Time: -1000.0000 us and FLOPS: 6184752906240.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=t -- Efficiency: -24739.01 TFLOPS, Time: -1000.0000 us and FLOPS: 24739011624960.00
+Method: attn_bwd_TK_c=t
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_bwd_TK_c=t -- Efficiency: 139.08 TFLOPS, Time: 694.8320 us and FLOPS: 96636764160.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_bwd_TK_c=t -- Efficiency: 261.93 TFLOPS, Time: 1475.7856 us and FLOPS: 386547056640.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_bwd_TK_c=t -- Efficiency: 382.93 TFLOPS, Time: 4037.7888 us and FLOPS: 1546188226560.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_bwd_TK_c=t -- Efficiency: 439.91 TFLOPS, Time: 14059.1263 us and FLOPS: 6184752906240.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_bwd_TK_c=t -- Efficiency: 449.07 TFLOPS, Time: 55089.5390 us and FLOPS: 24739011624960.00
+Method: attn_bwd_PT_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_bwd_PT_c=f -- Efficiency: 148.87 TFLOPS, Time: 1298.2336 us and FLOPS: 193273528320.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_bwd_PT_c=f -- Efficiency: 129.19 TFLOPS, Time: 5984.0800 us and FLOPS: 773094113280.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_bwd_PT_c=f -- Efficiency: 183.49 TFLOPS, Time: 16852.6655 us and FLOPS: 3092376453120.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_bwd_PT_c=f -- Efficiency: 131.66 TFLOPS, Time: 93948.2018 us and FLOPS: 12369505812480.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: CUDA out of memory. Tried to allocate 72.00 GiB. GPU 0 has a total capacity of 139.80 GiB of which 62.24 GiB is free. Including non-PyTorch memory, this process has 77.55 GiB memory in use. Of the allocated memory 75.06 GiB is allocated by PyTorch, and 1.75 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+Method attn_bwd_PT_c=f -- Efficiency: -49478.02 TFLOPS, Time: -1000.0000 us and FLOPS: 49478023249920.00
+Method: attn_bwd_FA2_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_bwd_FA2_c=f -- Efficiency: 140.91 TFLOPS, Time: 1371.6352 us and FLOPS: 193273528320.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_bwd_FA2_c=f -- Efficiency: 443.89 TFLOPS, Time: 1741.6288 us and FLOPS: 773094113280.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_bwd_FA2_c=f -- Efficiency: 540.13 TFLOPS, Time: 5725.2641 us and FLOPS: 3092376453120.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_bwd_FA2_c=f -- Efficiency: 540.06 TFLOPS, Time: 22903.8080 us and FLOPS: 12369505812480.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_bwd_FA2_c=f -- Efficiency: 525.06 TFLOPS, Time: 94233.7654 us and FLOPS: 49478023249920.00
+Method: attn_bwd_FA3_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=f -- Efficiency: -193.27 TFLOPS, Time: -1000.0000 us and FLOPS: 193273528320.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=f -- Efficiency: -773.09 TFLOPS, Time: -1000.0000 us and FLOPS: 773094113280.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=f -- Efficiency: -3092.38 TFLOPS, Time: -1000.0000 us and FLOPS: 3092376453120.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=f -- Efficiency: -12369.51 TFLOPS, Time: -1000.0000 us and FLOPS: 12369505812480.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Error: 'NoneType' object is not callable
+Method attn_bwd_FA3_c=f -- Efficiency: -49478.02 TFLOPS, Time: -1000.0000 us and FLOPS: 49478023249920.00
+Method: attn_bwd_TK_c=f
+Sequence Length: 768
+b=16, n=768, h=16, dv=128
+Method attn_bwd_TK_c=f -- Efficiency: 233.07 TFLOPS, Time: 829.2416 us and FLOPS: 193273528320.00
+Sequence Length: 1536
+b=16, n=1536, h=16, dv=128
+Method attn_bwd_TK_c=f -- Efficiency: 383.12 TFLOPS, Time: 2017.8688 us and FLOPS: 773094113280.00
+Sequence Length: 3072
+b=16, n=3072, h=16, dv=128
+Method attn_bwd_TK_c=f -- Efficiency: 497.98 TFLOPS, Time: 6209.8815 us and FLOPS: 3092376453120.00
+Sequence Length: 6144
+b=16, n=6144, h=16, dv=128
+Method attn_bwd_TK_c=f -- Efficiency: 497.92 TFLOPS, Time: 24842.3965 us and FLOPS: 12369505812480.00
+Sequence Length: 12288
+b=16, n=12288, h=16, dv=128
+Method attn_bwd_TK_c=f -- Efficiency: 499.24 TFLOPS, Time: 99106.4178 us and FLOPS: 49478023249920.00
+      attn_bwd_PT_c=t  attn_bwd_FA2_c=t attn_bwd_FA3_c=t  attn_bwd_TK_c=t attn_bwd_PT_c=f  attn_bwd_FA2_c=f attn_bwd_FA3_c=f  attn_bwd_TK_c=f
+768         47.327311         74.979364              OOM       139.079322       148.87423        140.907383              OOM       233.072640
+1536        52.839152        255.407946              OOM       261.926301      129.191807        443.891438              OOM       383.124070
+3072        61.124805        445.848061              OOM       382.929448      183.494798        540.128178              OOM       497.976722
+6144        63.350445        507.081830              OOM       439.910189       131.66304        540.063286              OOM       497.919184
+12288             OOM        502.494726              OOM       449.069135             OOM        525.056205              OOM       499.241364
