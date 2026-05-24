@@ -112,6 +112,58 @@ __device__ static inline void apply_adaln_modulation(
 }
 
 
+
+__global__ void adaln_modulate_backward_kernel(
+    bf16 *__restrict__ dx,
+    float *__restrict__ dshift,
+    float *__restrict__ dscale,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ scale,
+    int K,
+    int tokens_per_sample
+) {
+    constexpr int COLS = 16;
+    constexpr int TOK_THREADS = 16;
+    __shared__ float shift_sums[TOK_THREADS][COLS];
+    __shared__ float scale_sums[TOK_THREADS][COLS];
+
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int batch = blockIdx.y;
+    int ty = threadIdx.y;
+
+    float shift_acc = 0.0f;
+    float scale_acc = 0.0f;
+    if (col < K) {
+        float sc = __bfloat162float(scale[batch * K + col]);
+        for (int tok = ty; tok < tokens_per_sample; tok += TOK_THREADS) {
+            int row = batch * tokens_per_sample + tok;
+            size_t idx = size_t(row) * K + col;
+            float g = __bfloat162float(grad[idx]);
+            float xv = __bfloat162float(x[idx]);
+            dx[idx] = __float2bfloat16(g * (1.0f + sc));
+            shift_acc += g;
+            scale_acc += g * xv;
+        }
+    }
+
+    shift_sums[ty][threadIdx.x] = shift_acc;
+    scale_sums[ty][threadIdx.x] = scale_acc;
+    __syncthreads();
+
+    if (ty == 0 && col < K) {
+        float ds = 0.0f;
+        float dc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TOK_THREADS; i++) {
+            ds += shift_sums[i][threadIdx.x];
+            dc += scale_sums[i][threadIdx.x];
+        }
+        dshift[batch * K + col] = ds;
+        dscale[batch * K + col] = dc;
+    }
+}
+
 __global__ void adaln_modulate_kernel(
     bf16 *__restrict__ out,
     const bf16 *__restrict__ x,
@@ -535,6 +587,51 @@ void adaln_modulate_entrypoint(
     );
 }
 
+
+void adaln_modulate_backward_entrypoint(
+    const at::Tensor &grad,
+    const at::Tensor &A,
+    const at::Tensor &scale,
+    const at::Tensor &dA,
+    const at::Tensor &dshift,
+    const at::Tensor &dscale,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(grad, A, scale, dA, dshift, dscale);
+    TORCH_CHECK(grad.dtype() == torch::kBFloat16 && A.dtype() == torch::kBFloat16);
+    TORCH_CHECK(scale.dtype() == torch::kBFloat16 && dA.dtype() == torch::kBFloat16);
+    TORCH_CHECK(dshift.dtype() == torch::kFloat32 && dscale.dtype() == torch::kFloat32);
+    TORCH_CHECK(grad.is_contiguous() && A.is_contiguous() && scale.is_contiguous());
+    TORCH_CHECK(dA.is_contiguous() && dshift.is_contiguous() && dscale.is_contiguous());
+    TORCH_CHECK(grad.dim() == 2 && A.dim() == 2 && dA.dim() == 2);
+    TORCH_CHECK(scale.dim() == 2 && dshift.dim() == 2 && dscale.dim() == 2);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int batch = scale.size(0);
+    TORCH_CHECK(grad.size(0) == M && grad.size(1) == K);
+    TORCH_CHECK(dA.size(0) == M && dA.size(1) == K);
+    TORCH_CHECK(scale.size(1) == K);
+    TORCH_CHECK(dshift.size(0) == batch && dshift.size(1) == K);
+    TORCH_CHECK(dscale.size(0) == batch && dscale.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, batch);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    adaln_modulate_backward_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<bf16*>(dA.data_ptr()),
+        reinterpret_cast<float*>(dshift.data_ptr()),
+        reinterpret_cast<float*>(dscale.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
 void gemm_custom_adaln_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
@@ -596,6 +693,7 @@ void gemm_custom_adaln_entrypoint(
 PYBIND11_MODULE(_C, m) {
     m.def("gemm_custom", &gemm_custom_entrypoint);
     m.def("adaln_modulate", &adaln_modulate_entrypoint);
+    m.def("adaln_modulate_backward", &adaln_modulate_backward_entrypoint);
     m.def("gemm_custom_adaln", &gemm_custom_adaln_entrypoint);
 }
 #endif
