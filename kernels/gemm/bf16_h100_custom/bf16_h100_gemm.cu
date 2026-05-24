@@ -65,6 +65,78 @@ struct matmul_layout {
     struct common_state   { int2 coord; };
     struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> accum; };
 };
+template<int M_BLOCK, int N_BLOCK>
+struct modulated_matmul_layout {
+    using  base_tile      = st_bf<64, 64>;
+    using  bias_vec       = sv_bf<64*N_BLOCK>;
+    using  global_layout  = gl<bf16, 1, 1, -1, -1, base_tile>;
+    using  bias_global    = gl<bf16, 1, 1, 1, -1, bias_vec>;
+    struct globals        {
+        global_layout A, B, C, preact;
+        bias_global bias;
+        const bf16 *shift;
+        const bf16 *scale;
+        int tokens_per_sample;
+        int K;
+    };
+    struct input_block    { base_tile a[M_BLOCK], b[N_BLOCK]; };
+    struct scratch_block  { bias_vec bias; };
+    struct finish_block   { base_tile c[M_BLOCK][N_BLOCK]; };
+    struct common_state   { int2 coord; };
+    struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> accum; };
+};
+
+template<ducks::st::all ST>
+__device__ static inline void apply_adaln_modulation(
+    ST &tile,
+    const bf16 *__restrict__ shift,
+    const bf16 *__restrict__ scale,
+    int row_tile,
+    int k_tile,
+    int tokens_per_sample,
+    int K
+) {
+    #pragma unroll
+    for (int i = warpgroup::laneid(); i < ST::num_elements; i += 128) {
+        int row = i / ST::cols;
+        int col = i % ST::cols;
+        int global_row = row_tile * ST::rows + row;
+        int global_col = k_tile * ST::cols + col;
+        int batch = global_row / tokens_per_sample;
+        float x = __bfloat162float(tile[{row, col}]);
+        float sh = __bfloat162float(shift[batch * K + global_col]);
+        float sc = __bfloat162float(scale[batch * K + global_col]);
+        tile[{row, col}] = __float2bfloat16(x * (1.0f + sc) + sh);
+    }
+    warpgroup::sync(0);
+}
+
+
+__global__ void adaln_modulate_kernel(
+    bf16 *__restrict__ out,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ shift,
+    const bf16 *__restrict__ scale,
+    int M,
+    int K,
+    int tokens_per_sample
+) {
+    size_t idx = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    size_t total = size_t(M) * K;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        size_t i = idx + j;
+        if (i >= total) return;
+        int col = i % K;
+        int row = i / K;
+        int batch = row / tokens_per_sample;
+        float v = __bfloat162float(x[i]);
+        float sh = __bfloat162float(shift[batch * K + col]);
+        float sc = __bfloat162float(scale[batch * K + col]);
+        out[i] = __float2bfloat16(v * (1.0f + sc) + sh);
+    }
+}
+
 template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
 struct matmul_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
@@ -149,6 +221,104 @@ struct matmul_template {
                     tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
             }
             // Overlap: reinit accum while TMA reads C from smem
+            init_bias(args.state.accum, args.scratch.bias);
+            if (warpgroup::elect_leader())
+                tma::store_async_read_wait();
+            if (warp::elect_leader()) arrive(args.finish_finished);
+        }
+    };
+};
+
+
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
+struct modulated_matmul_template {
+    static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
+    using layout    = modulated_matmul_layout<M_BLOCK, N_BLOCK>;
+    using wide_tile = st_bf<64, 64*N_BLOCK>;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        return dim3(PERISISTENT_GRID ? 132 : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+    }
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        if (threadIdx.x == 0) {
+            args.globals.A.template prefetch_tma<typename layout::base_tile>();
+            args.globals.B.template prefetch_tma<typename layout::base_tile>();
+            args.globals.C.template prefetch_tma<typename layout::base_tile>();
+            args.globals.preact.template prefetch_tma<typename layout::base_tile>();
+        }
+        int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
+        int super_rows = (Rblocks/SUPER_M)*SUPER_M,
+            final_rows = Rblocks - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        if (task_id < super_rows * Cblocks)
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
+        else if (task_id < Rblocks*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        }
+        else {
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/64;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid();
+        args.common.coord = { args.common.coord.x*M_BLOCK + id, args.common.coord.y*N_BLOCK };
+    }
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::elect_leader()) {
+                tma::expect(args.inputs_arrived, args.input);
+                for(int i = 0; i < M_BLOCK; i++)
+                    tma::load_async(args.input.a[i], args.globals.A,
+                                    {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                for(int i = 0; i < N_BLOCK; i++)
+                    tma::load_async(args.input.b[i], args.globals.B,
+                                    {args.iter, args.common.coord.y+i}, args.inputs_arrived);
+            }
+        }
+    };
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>();
+            group<NUM_CONSUMER_WARPS>::load(args.scratch.bias, args.globals.bias, {args.common.coord.y / N_BLOCK});
+            group<NUM_CONSUMER_WARPS>::sync(0);
+            init_bias(args.state.accum, args.scratch.bias);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            apply_adaln_modulation(
+                args.input.a[warpgroup::groupid()],
+                args.globals.shift,
+                args.globals.scale,
+                args.common.coord.x,
+                args.iter,
+                args.globals.tokens_per_sample,
+                args.globals.K
+            );
+            warpgroup::mma_AB(args.state.accum, args.input.a[warpgroup::groupid()], reinterpret_cast<wide_tile&>(args.input.b) );
+            warpgroup::mma_async_wait();
+            if (warp::elect_leader()) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
+            warpgroup::sync(warpgroup::groupid() + 4);
+            if (warpgroup::elect_leader()) {
+                for (int i = 0; i < N_BLOCK; i++)
+                    tma::store_async(args.globals.preact, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
+            }
+            apply_gelu(args.state.accum);
+            if (warpgroup::elect_leader())
+                tma::store_async_read_wait();
+            warpgroup::sync(warpgroup::groupid() + 4);
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
+            warpgroup::sync(warpgroup::groupid() + 4);
+            if (warpgroup::elect_leader()) {
+                for (int i = 0; i < N_BLOCK; i++)
+                    tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
+            }
             init_bias(args.state.accum, args.scratch.bias);
             if (warpgroup::elect_leader())
                 tma::store_async_read_wait();
@@ -328,7 +498,104 @@ void gemm_custom_entrypoint(
     prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
 }
 
+
+
+void adaln_modulate_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &shift,
+    const at::Tensor &scale,
+    const at::Tensor &out,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(A, shift, scale, out);
+    TORCH_CHECK(A.dtype() == torch::kBFloat16 && shift.dtype() == torch::kBFloat16);
+    TORCH_CHECK(scale.dtype() == torch::kBFloat16 && out.dtype() == torch::kBFloat16);
+    TORCH_CHECK(A.is_contiguous() && shift.is_contiguous() && scale.is_contiguous() && out.is_contiguous());
+    TORCH_CHECK(A.dim() == 2 && out.dim() == 2 && shift.dim() == 2 && scale.dim() == 2);
+    TORCH_CHECK(tokens_per_sample > 0);
+    int M = A.size(0);
+    int K = A.size(1);
+    int batch = shift.size(0);
+    TORCH_CHECK(out.size(0) == M && out.size(1) == K);
+    TORCH_CHECK(scale.size(0) == batch && shift.size(1) == K && scale.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    size_t total = size_t(M) * K;
+    int threads = 256;
+    int blocks = (total + threads * 4 - 1) / (threads * 4);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    adaln_modulate_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<bf16*>(out.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const bf16*>(shift.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        M,
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
+void gemm_custom_adaln_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias,
+    const at::Tensor &preact,
+    const at::Tensor &shift,
+    const at::Tensor &scale,
+    int64_t tokens_per_sample
+) {
+    using mmt = modulated_matmul_template<2,4,8>;
+    using globals = typename mmt::layout::globals;
+    using global_layout = typename mmt::layout::global_layout;
+    using bias_global = typename mmt::layout::bias_global;
+
+    kittens::py::device_check(A, B, C, bias, preact, shift, scale);
+    TORCH_CHECK(A.dtype() == torch::kBFloat16 && B.dtype() == torch::kBFloat16);
+    TORCH_CHECK(C.dtype() == torch::kBFloat16 && bias.dtype() == torch::kBFloat16);
+    TORCH_CHECK(preact.dtype() == torch::kBFloat16 && shift.dtype() == torch::kBFloat16 && scale.dtype() == torch::kBFloat16);
+    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && C.is_contiguous() && bias.is_contiguous());
+    TORCH_CHECK(preact.is_contiguous() && shift.is_contiguous() && scale.is_contiguous());
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && C.dim() == 2 && preact.dim() == 2);
+    TORCH_CHECK(shift.dim() == 2 && scale.dim() == 2);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+    int batch = shift.size(0);
+    TORCH_CHECK(B.size(0) == K);
+    TORCH_CHECK(C.size(0) == M && C.size(1) == N);
+    TORCH_CHECK(preact.size(0) == M && preact.size(1) == N);
+    TORCH_CHECK(bias.numel() == N);
+    TORCH_CHECK(scale.size(0) == batch && shift.size(1) == K && scale.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+    TORCH_CHECK((M % 128) == 0 && (N % 256) == 0 && (K % 64) == 0);
+
+    globals G{
+        kittens::py::tensor_to_gl<global_layout>(A),
+        kittens::py::tensor_to_gl<global_layout>(B),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<global_layout>(preact),
+        kittens::py::tensor_to_gl<bias_global>(bias),
+        reinterpret_cast<const bf16*>(shift.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        static_cast<int>(tokens_per_sample),
+        K
+    };
+
+    dim3 grid = mmt::grid(M, N, K);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
 PYBIND11_MODULE(_C, m) {
     m.def("gemm_custom", &gemm_custom_entrypoint);
+    m.def("adaln_modulate", &adaln_modulate_entrypoint);
+    m.def("gemm_custom_adaln", &gemm_custom_adaln_entrypoint);
 }
 #endif
