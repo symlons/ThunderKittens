@@ -13,6 +13,7 @@ from timm.layers.attention import Attention
 from timm.layers.mlp import Mlp
 
 import _C
+import _gelu_bwd
 import _linear_bwd_fused
 from tk_bench import input_group_count, profile_groups, print_bench, uniform_bf16
 
@@ -295,6 +296,20 @@ def fused_linear_gated_residual(
     return gated_residual(residual, linear(x), gate)
 
 
+class TkGelu(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x)
+        return torch.nn.functional.gelu(x, approximate="tanh")
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (x,) = ctx.saved_tensors
+        grad_input = torch.empty_like(x)
+        _gelu_bwd.gelu_backward(grad_out.contiguous(), x.contiguous(), grad_input)
+        return grad_input
+
+
 class TkLinearGelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -368,6 +383,14 @@ class TkMlp(nn.Module):
         gate: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
+        if residual.shape[0] * residual.shape[1] >= 8192:
+            mlp_in = fused_adaln(residual, shift, scale, eps)
+            h = TkGelu.apply(torch.nn.functional.linear(mlp_in, self.fc1.weight, self.fc1.bias))
+            return gated_residual(
+                residual,
+                torch.nn.functional.linear(h, self.fc2.weight, self.fc2.bias),
+                gate,
+            )
         h = fused_adaln_linear_gelu(residual, shift, scale, self.fc1, eps)
         return fused_linear_gated_residual(h, residual, gate, self.fc2)
 
@@ -569,6 +592,7 @@ class DiTBlock(nn.Module):
         self.fused_residual_enabled = fused_residual_enabled
         self.fused_input_projection_enabled = fused_input_projection_enabled
         self.fused_output_projection_enabled = fused_output_projection_enabled
+        self.tk_mlp_enabled = tk_mlp_enabled
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         if attention_backend == "fa3":
             self.attn = FlashAttention3(hidden_size, num_heads=num_heads, qkv_bias=True)
@@ -617,6 +641,12 @@ class DiTBlock(nn.Module):
                 attn_out = self.attn(attn_in)
                 x = gated_residual(x, attn_out, gate_msa) if self.fused_residual_enabled else x + gate_msa.unsqueeze(1) * attn_out
             if (
+                self.fused_residual_enabled
+                and self.tk_mlp_enabled
+                and hasattr(self.mlp, "forward_from_adaln_residual")
+            ):
+                x = self.mlp.forward_from_adaln_residual(x, shift_mlp, scale_mlp, gate_mlp, self.norm2.eps)
+            elif (
                 self.fused_input_projection_enabled
                 and self.fused_output_projection_enabled
                 and self.fused_residual_enabled
