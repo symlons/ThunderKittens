@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 default_warmup = 500
 default_iters = 100
-cooldown_time = 0.5
+cooldown_time = 2.0
 
 @dataclass(frozen=True)
 class BenchResult:

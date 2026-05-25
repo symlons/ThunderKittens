@@ -413,6 +413,27 @@ void gelu_bwd_bias_entrypoint(
     );
 }
 
+void bias_reduce_entrypoint(
+    const at::Tensor &dz,
+    const at::Tensor &dbias
+) {
+    TORCH_CHECK(dz.is_cuda() && dbias.is_cuda());
+    TORCH_CHECK(dz.scalar_type() == at::kBFloat16);
+    TORCH_CHECK(dbias.scalar_type() == at::kFloat);
+    TORCH_CHECK(dz.dim() == 2 && dbias.dim() == 1);
+    int M = dz.size(0), N = dz.size(1);
+    TORCH_CHECK(dbias.size(0) == N);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaMemsetAsync(dbias.data_ptr(), 0, N * sizeof(float), stream);
+    dim3 grid((N + BIAS_THREADS - 1) / BIAS_THREADS, (M + BIAS_ROWS_PER_BLOCK - 1) / BIAS_ROWS_PER_BLOCK);
+    bias_reduce_kernel<<<grid, BIAS_THREADS, 0, stream>>>(
+        reinterpret_cast<float*>(dbias.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(dz.data_ptr()),
+        M, N
+    );
+}
+
 void dw_gemm_entrypoint(
     const at::Tensor &x,
     const at::Tensor &dz,
@@ -490,6 +511,7 @@ void dx_gemm_native_entrypoint(
 
 PYBIND11_MODULE(_linear_bwd_fused, m) {
     m.def("gelu_bwd_bias", &gelu_bwd_bias_entrypoint);
+    m.def("bias_reduce", &bias_reduce_entrypoint);
     m.def("dw_gemm", &dw_gemm_entrypoint);
     m.def("dx_gemm", &dx_gemm_entrypoint);
     m.def("dx_gemm_native", &dx_gemm_native_entrypoint);

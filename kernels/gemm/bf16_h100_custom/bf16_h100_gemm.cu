@@ -356,6 +356,77 @@ __global__ void adaln_modulate_kernel(
     }
 }
 
+__global__ void gated_residual_forward_kernel(
+    bf16 *__restrict__ out,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ h,
+    const bf16 *__restrict__ gate,
+    int M,
+    int K,
+    int tokens_per_sample
+) {
+    size_t idx = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    size_t total = size_t(M) * K;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        size_t i = idx + j;
+        if (i >= total) return;
+        int col = i % K;
+        int row = i / K;
+        int batch = row / tokens_per_sample;
+        float xv = __bfloat162float(x[i]);
+        float hv = __bfloat162float(h[i]);
+        float gv = __bfloat162float(gate[batch * K + col]);
+        out[i] = __float2bfloat16(xv + gv * hv);
+    }
+}
+
+__global__ void gated_residual_backward_kernel(
+    bf16 *__restrict__ dx,
+    bf16 *__restrict__ dh,
+    float *__restrict__ dgate,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ h,
+    const bf16 *__restrict__ gate,
+    int K,
+    int tokens_per_sample
+) {
+    constexpr int COLS = 16;
+    constexpr int TOK_THREADS = 16;
+    __shared__ float gate_sums[TOK_THREADS][COLS];
+
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int batch = blockIdx.y;
+    int ty = threadIdx.y;
+
+    float acc = 0.0f;
+    if (col < K) {
+        float gv = __bfloat162float(gate[batch * K + col]);
+        int row_base = batch * tokens_per_sample;
+        for (int tok = ty; tok < tokens_per_sample; tok += TOK_THREADS) {
+            int row = row_base + tok;
+            size_t idx = size_t(row) * K + col;
+            float go = __bfloat162float(grad[idx]);
+            float hv = __bfloat162float(h[idx]);
+            dx[idx] = __float2bfloat16(go);
+            dh[idx] = __float2bfloat16(go * gv);
+            acc += go * hv;
+        }
+    }
+
+    gate_sums[ty][threadIdx.x] = acc;
+    __syncthreads();
+
+    if (ty == 0 && col < K) {
+        float dg = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TOK_THREADS; i++) {
+            dg += gate_sums[i][threadIdx.x];
+        }
+        dgate[batch * K + col] = dg;
+    }
+}
+
 template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
 struct matmul_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
@@ -1038,6 +1109,86 @@ void adaln_modulate_backward_entrypoint(
     );
 }
 
+void gated_residual_entrypoint(
+    const at::Tensor &x,
+    const at::Tensor &h,
+    const at::Tensor &gate,
+    const at::Tensor &out,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(x, h, gate, out);
+    TORCH_CHECK(x.dtype() == torch::kBFloat16 && h.dtype() == torch::kBFloat16);
+    TORCH_CHECK(gate.dtype() == torch::kBFloat16 && out.dtype() == torch::kBFloat16);
+    TORCH_CHECK(x.is_contiguous() && h.is_contiguous() && gate.is_contiguous() && out.is_contiguous());
+    TORCH_CHECK(x.dim() == 2 && h.dim() == 2 && out.dim() == 2 && gate.dim() == 2);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = x.size(0);
+    int K = x.size(1);
+    int batch = gate.size(0);
+    TORCH_CHECK(h.size(0) == M && h.size(1) == K);
+    TORCH_CHECK(out.size(0) == M && out.size(1) == K);
+    TORCH_CHECK(gate.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    size_t total = size_t(M) * K;
+    int threads = 256;
+    int blocks = (total + threads * 4 - 1) / (threads * 4);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    gated_residual_forward_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<bf16*>(out.data_ptr()),
+        reinterpret_cast<const bf16*>(x.data_ptr()),
+        reinterpret_cast<const bf16*>(h.data_ptr()),
+        reinterpret_cast<const bf16*>(gate.data_ptr()),
+        M,
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
+void gated_residual_backward_entrypoint(
+    const at::Tensor &grad,
+    const at::Tensor &h,
+    const at::Tensor &gate,
+    const at::Tensor &dx,
+    const at::Tensor &dh,
+    const at::Tensor &dgate,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(grad, h, gate, dx, dh, dgate);
+    TORCH_CHECK(grad.dtype() == torch::kBFloat16 && h.dtype() == torch::kBFloat16);
+    TORCH_CHECK(gate.dtype() == torch::kBFloat16 && dx.dtype() == torch::kBFloat16 && dh.dtype() == torch::kBFloat16);
+    TORCH_CHECK(dgate.dtype() == torch::kFloat32);
+    TORCH_CHECK(grad.is_contiguous() && h.is_contiguous() && gate.is_contiguous());
+    TORCH_CHECK(dx.is_contiguous() && dh.is_contiguous() && dgate.is_contiguous());
+    TORCH_CHECK(grad.dim() == 2 && h.dim() == 2 && dx.dim() == 2 && dh.dim() == 2 && gate.dim() == 2 && dgate.dim() == 2);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = grad.size(0);
+    int K = grad.size(1);
+    int batch = gate.size(0);
+    TORCH_CHECK(h.size(0) == M && h.size(1) == K);
+    TORCH_CHECK(dx.size(0) == M && dx.size(1) == K);
+    TORCH_CHECK(dh.size(0) == M && dh.size(1) == K);
+    TORCH_CHECK(gate.size(1) == K);
+    TORCH_CHECK(dgate.size(0) == batch && dgate.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, batch);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    gated_residual_backward_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<bf16*>(dx.data_ptr()),
+        reinterpret_cast<bf16*>(dh.data_ptr()),
+        reinterpret_cast<float*>(dgate.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(h.data_ptr()),
+        reinterpret_cast<const bf16*>(gate.data_ptr()),
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
 
 void layernorm_adaln_entrypoint(
     const at::Tensor &A,
@@ -1211,6 +1362,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("gemm_linear_native", &gemm_linear_native_entrypoint);
     m.def("adaln_modulate", &adaln_modulate_entrypoint);
     m.def("adaln_modulate_backward", &adaln_modulate_backward_entrypoint);
+    m.def("gated_residual", &gated_residual_entrypoint);
+    m.def("gated_residual_backward", &gated_residual_backward_entrypoint);
     m.def("layernorm_adaln", &layernorm_adaln_entrypoint);
     m.def("layernorm_adaln_backward", &layernorm_adaln_backward_entrypoint);
     m.def("gemm_custom_adaln", &gemm_custom_adaln_entrypoint);

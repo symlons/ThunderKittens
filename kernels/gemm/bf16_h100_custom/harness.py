@@ -129,6 +129,50 @@ class FusedAdaLN(torch.autograd.Function):
         return dx, dshift, dscale, None, None
 
 
+class FusedGatedResidual(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, h: torch.Tensor, gate: torch.Tensor, tokens: int) -> torch.Tensor:
+        x_c = x.contiguous()
+        h_c = h.contiguous()
+        gate_c = gate.contiguous()
+        out = torch.empty_like(x_c)
+        _C.gated_residual(x_c, h_c, gate_c, out, tokens)
+        ctx.save_for_backward(h_c, gate_c)
+        ctx.tokens = tokens
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        h, gate = ctx.saved_tensors
+        grad = grad_out.contiguous()
+        dx = torch.empty_like(grad)
+        dh = torch.empty_like(grad)
+        dgate = torch.empty_like(gate, dtype=torch.float32)
+        _C.gated_residual_backward(grad, h, gate, dx, dh, dgate, ctx.tokens)
+        return dx, dh, dgate, None
+
+
+def gated_residual(x: torch.Tensor, h: torch.Tensor, gate: torch.Tensor, tokens: int) -> torch.Tensor:
+    if (
+        x.is_cuda
+        and h.is_cuda
+        and gate.is_cuda
+        and x.dtype == torch.bfloat16
+        and h.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+        and x.shape == h.shape
+        and x.shape[-1] == gate.shape[-1]
+        and x.numel() == gate.shape[0] * tokens * gate.shape[1]
+    ):
+        flat_x = x.reshape(-1, x.shape[-1])
+        flat_h = h.reshape(-1, h.shape[-1])
+        return FusedGatedResidual.apply(flat_x, flat_h, gate, tokens).reshape_as(x)
+
+    batch_idx = _batch_index(gate.shape[0], tokens, x.device)
+    gate_view = gate[batch_idx].to(h.dtype).reshape(x.shape)
+    return x + gate_view * h
+
+
 class TkGelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor) -> torch.Tensor:
@@ -185,8 +229,9 @@ class TkLinear(torch.autograd.Function):
         dx = torch.empty_like(x)
         _linear_bwd_fused.dw_gemm(grad_out, x, dw)
         _linear_bwd_fused.dx_gemm_native(grad_out, w.contiguous(), dx)
-        db = grad_out.float().sum(dim=0).to(grad_out.dtype)
-        return dx, dw, db
+        db = torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
+        _linear_bwd_fused.bias_reduce(grad_out, db)
+        return dx, dw, db.to(grad_out.dtype)
 
 
 def tk_mlp(x: torch.Tensor, w1: torch.Tensor, b1: torch.Tensor, w2: torch.Tensor, b2: torch.Tensor) -> torch.Tensor:
@@ -257,6 +302,7 @@ def torch_mlp_branch(
     eps: float,
     tk_gelu: bool = False,
     tk_full_mlp: bool = False,
+    fused_residual: bool = False,
 ) -> torch.Tensor:
     batch_idx = _batch_index(shift.shape[0], tokens, x.device)
     z = torch.nn.functional.layer_norm(x.float(), (x.shape[1],), None, None, eps)
@@ -267,6 +313,8 @@ def torch_mlp_branch(
         h = F.linear(z, w1, b1)
         h = TkGelu.apply(h) if tk_gelu else F.gelu(h, approximate="tanh")
         h = F.linear(h, w2, b2)
+    if fused_residual:
+        return gated_residual(x, h, gate, tokens)
     return x + gate[batch_idx].to(h.dtype) * h
 
 
@@ -283,6 +331,7 @@ def fused_mlp_branch(
     eps: float,
     tk_gelu: bool = False,
     tk_full_mlp: bool = False,
+    fused_residual: bool = True,
 ) -> torch.Tensor:
     batch_idx = _batch_index(shift.shape[0], tokens, x.device)
     z = FusedAdaLN.apply(x, shift, scale, tokens, eps)
@@ -292,6 +341,8 @@ def fused_mlp_branch(
         h = F.linear(z, w1, b1)
         h = TkGelu.apply(h) if tk_gelu else F.gelu(h, approximate="tanh")
         h = F.linear(h, w2, b2)
+    if fused_residual:
+        return gated_residual(x, h, gate, tokens)
     return x + gate[batch_idx].to(h.dtype) * h
 
 
@@ -680,10 +731,10 @@ def benchmark_mlp_branch_case(batch: int, tokens: int, dim: int, eps: float, lab
     return results
 
 
-def block_train_step_factory(heads: int, eps: float, fused_msa: bool, fused_mlp: bool, tk_gelu: bool = False, tk_full_mlp: bool = False):
+def block_train_step_factory(heads: int, eps: float, fused_msa: bool, fused_mlp: bool, tk_gelu: bool = False, tk_full_mlp: bool = False, fused_residual: bool = False):
     def step(*args):
         *inputs, grad = args
-        y = dit_block_forward(*inputs, heads, eps, fused_msa, fused_mlp, tk_gelu, tk_full_mlp, False)
+        y = dit_block_forward(*inputs, heads, eps, fused_msa, fused_mlp, tk_gelu, tk_full_mlp, False, fused_residual)
         grads = torch.autograd.grad(y, inputs, grad, allow_unused=True)
         return grads
     return step
@@ -852,13 +903,18 @@ def dit_block_forward(
     tk_gelu: bool = False,
     tk_full_mlp: bool = False,
     fa3: bool = False,
+    fused_residual: bool = False,
 ) -> torch.Tensor:
     batch, tokens, _ = x.shape
     params = F.linear(F.silu(c), adaln_w, adaln_b)
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = params.chunk(6, dim=1)
 
     attn_in = adaln_input(x, shift_msa, scale_msa, tokens, eps, fused_msa)
-    x = x + gate_msa[:, None, :].to(x.dtype) * attention_forward(attn_in, qkv_w, qkv_b, proj_w, proj_b, heads, fa3)
+    attn_out = attention_forward(attn_in, qkv_w, qkv_b, proj_w, proj_b, heads, fa3)
+    if fused_residual:
+        x = gated_residual(x, attn_out, gate_msa, tokens)
+    else:
+        x = x + gate_msa[:, None, :].to(attn_out.dtype) * attn_out
 
     mlp_in = adaln_input(x, shift_mlp, scale_mlp, tokens, eps, fused_mlp)
     flat_mlp = mlp_in.reshape(batch * tokens, -1).contiguous()
@@ -868,6 +924,8 @@ def dit_block_forward(
         h = F.linear(mlp_in, w1, b1)
         h = TkGelu.apply(h) if tk_gelu else F.gelu(h, approximate="tanh")
         h = F.linear(h, w2, b2)
+    if fused_residual:
+        return gated_residual(x, h, gate_mlp, tokens)
     return x + gate_mlp[:, None, :].to(h.dtype) * h
 
 
@@ -880,8 +938,9 @@ def block_step(
     tk_gelu: bool = False,
     tk_full_mlp: bool = False,
     fa3: bool = False,
+    fused_residual: bool = False,
 ) -> None:
-    y = dit_block_forward(*group[:-1], heads, eps, fused_msa, fused_mlp, tk_gelu, tk_full_mlp, fa3)
+    y = dit_block_forward(*group[:-1], heads, eps, fused_msa, fused_mlp, tk_gelu, tk_full_mlp, fa3, fused_residual)
     y.backward(group[-1])
     zero_block_group_grads(group)
 
@@ -890,12 +949,12 @@ def block_correctness(batch: int, tokens: int, dim: int, heads: int, eps: float)
     hidden_dim = dim * 4
     base = make_block_group(batch, tokens, dim, heads, hidden_dim, 15000)
     variants = {
-        "tk_full_mlp": (False, False, False, True, False),
-        "fused_mlp": (False, True, False, False, False),
-        "fused_msa": (True, False, False, False, False),
-        "fused_both": (True, True, False, False, False),
-        "fused_both_tk_gelu": (True, True, True, False, False),
-        "fused_both_tk_full_mlp": (True, True, False, True, False),
+        "tk_full_mlp": (False, False, False, True, False, True),
+        "fused_mlp": (False, True, False, False, False, True),
+        "fused_msa": (True, False, False, False, False, True),
+        "fused_both": (True, True, False, False, False, True),
+        "fused_both_tk_gelu": (True, True, True, False, False, True),
+        "fused_both_tk_full_mlp": (True, True, False, True, False, True),
     }
     ref_group = clone_block_group(base)
     y_ref = dit_block_forward(*ref_group[:-1], heads, eps, False, False)
@@ -948,25 +1007,25 @@ def benchmark_block_case(batch: int, tokens: int, dim: int, heads: int, eps: flo
     )
     print(f"\nDiT block ({label}): batch={batch} tokens={tokens} dim={dim} heads={heads}; input groups={groups_n}")
     specs = [
-        ("torch", False, False, False, False, False),
-        ("tk_full_mlp", False, False, False, True, False),
-        ("fused_mlp", False, True, False, False, False),
-        ("fused_msa", True, False, False, False, False),
-        ("fused_both", True, True, False, False, False),
-        ("fused_both_tk_gelu", True, True, True, False, False),
-        ("fused_both_tk_full_mlp", True, True, False, True, False),
-        ("fused_both_fa3", True, True, False, False, True),
-        ("fused_both_fa3_tk_gelu", True, True, True, False, True),
-        ("fused_both_fa3_tk_full_mlp", True, True, False, True, True),
+        ("torch", False, False, False, False, False, False),
+        ("tk_full_mlp", False, False, False, True, False, True),
+        ("fused_mlp", False, True, False, False, False, True),
+        ("fused_msa", True, False, False, False, False, True),
+        ("fused_both", True, True, False, False, False, True),
+        ("fused_both_tk_gelu", True, True, True, False, False, True),
+        ("fused_both_tk_full_mlp", True, True, False, True, False, True),
+        ("fused_both_fa3", True, True, False, False, True, True),
+        ("fused_both_fa3_tk_gelu", True, True, True, False, True, True),
+        ("fused_both_fa3_tk_full_mlp", True, True, False, True, True, True),
     ]
     results = []
     skipped = []
-    for name, fused_msa, fused_mlp, tk_gelu, tk_full_mlp, fa3 in specs:
+    for name, fused_msa, fused_mlp, tk_gelu, tk_full_mlp, fa3, fused_residual in specs:
         try:
             result = profile_groups(
                     f"{label} block {name} train",
                     groups[name],
-                    lambda g, fm=fused_msa, fp=fused_mlp, tg=tk_gelu, tm=tk_full_mlp, f3=fa3: block_step(g, heads, eps, fm, fp, tg, tm, f3),
+                    lambda g, fm=fused_msa, fp=fused_mlp, tg=tk_gelu, tm=tk_full_mlp, f3=fa3, fr=fused_residual: block_step(g, heads, eps, fm, fp, tg, tm, f3, fr),
                     warmup=500,
                     iters=100,
                     flops=flops_fwd * 3.0,
@@ -1026,6 +1085,194 @@ def benchmark_block_suite() -> list[BenchResult]:
     return results
 
 
+def benchmark_residual_sweep_case(batch: int, tokens: int, dim: int, heads: int, eps: float, label: str) -> list[BenchResult]:
+    hidden_dim = dim * 4
+    m = batch * tokens
+    param_bytes = (
+        (6 * dim * dim + 6 * dim)
+        + (3 * dim * dim + 3 * dim)
+        + (dim * dim + dim)
+        + (hidden_dim * dim + hidden_dim)
+        + (dim * hidden_dim + dim)
+    ) * 2
+    activation_bytes = (m * dim * 2 * 4) + (batch * dim * 2)
+    group_bytes = param_bytes + activation_bytes
+    groups_n = min(input_group_count(group_bytes), 4)
+    base_groups = [make_block_group(batch, tokens, dim, heads, hidden_dim, 24000 + i * 100) for i in range(groups_n)]
+    nores_groups = [clone_block_group(g) for g in base_groups]
+    res_groups = [clone_block_group(g) for g in base_groups]
+
+    flops_fwd = (
+        8.0 * m * dim * dim
+        + 4.0 * m * dim * hidden_dim
+        + 4.0 * batch * heads * tokens * tokens * (dim // heads)
+    )
+    print(f"\nResidual sweep ({label}): batch={batch} tokens={tokens} total_tokens={m} dim={dim}; input groups={groups_n}")
+    results = [
+        profile_groups(
+            f"{label} block fused_both_nores train",
+            nores_groups,
+            lambda g: block_step(g, heads, eps, True, True, False, False, False, False),
+            warmup=500,
+            iters=100,
+            flops=flops_fwd * 3.0,
+            bytes_moved=group_bytes * 3,
+        ),
+        profile_groups(
+            f"{label} block fused_both_residual train",
+            res_groups,
+            lambda g: block_step(g, heads, eps, True, True, False, False, False, True),
+            warmup=500,
+            iters=100,
+            flops=flops_fwd * 3.0,
+            bytes_moved=group_bytes * 3,
+        ),
+    ]
+    for result in results:
+        print_bench(result)
+    nores, res = results
+    print(f"  residual fusion speedup: {nores.us / res.us:.2f}x")
+    return results
+
+
+def benchmark_residual_sweep_suite() -> list[BenchResult]:
+    print(
+        "\nResidual-stream benchmark recipe: uniform BF16 inputs, natural L2 eviction via input groups, "
+        "500 warmups, 100 measured back-to-back launches, two CUDA events, 2s cooldown between kernels."
+    )
+    results: list[BenchResult] = []
+    for tokens in (1, 2, 4, 8, 16):
+        results.extend(benchmark_residual_sweep_case(1024, tokens, 1024, 16, 1e-6, f"L-D1024-B1024-T{tokens}"))
+    for tokens in (1024, 2048, 4096, 8192, 16384):
+        try:
+            results.extend(benchmark_residual_sweep_case(1, tokens, 1024, 16, 1e-6, f"L-D1024-B1-T{tokens}"))
+        except torch.cuda.OutOfMemoryError as exc:
+            print(f"\nL-D1024-B1-T{tokens}: SKIP OOM ({exc})")
+            torch.cuda.empty_cache()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(f"\nL-D1024-B1-T{tokens}: SKIP OOM ({exc})")
+                torch.cuda.empty_cache()
+            else:
+                raise
+    return results
+
+
+def benchmark_long_batch_case(batch: int, tokens: int, dim: int, heads: int, eps: float, label: str) -> list[BenchResult]:
+    hidden_dim = dim * 4
+    m = batch * tokens
+    param_bytes = (
+        (6 * dim * dim + 6 * dim)
+        + (3 * dim * dim + 3 * dim)
+        + (dim * dim + dim)
+        + (hidden_dim * dim + hidden_dim)
+        + (dim * hidden_dim + dim)
+    ) * 2
+    activation_bytes = (m * dim * 2 * 4) + (batch * dim * 2)
+    group_bytes = param_bytes + activation_bytes
+    groups_n = min(input_group_count(group_bytes), 4)
+    base_groups = [make_block_group(batch, tokens, dim, heads, hidden_dim, 28000 + i * 100) for i in range(groups_n)]
+    torch_groups = [clone_block_group(g) for g in base_groups]
+    fused_nores_groups = [clone_block_group(g) for g in base_groups]
+    fused_res_groups = [clone_block_group(g) for g in base_groups]
+
+    flops_fwd = (
+        8.0 * m * dim * dim
+        + 4.0 * m * dim * hidden_dim
+        + 4.0 * batch * heads * tokens * tokens * (dim // heads)
+    )
+    print(f"\nLong-token batch sweep ({label}): batch={batch} tokens={tokens} total_tokens={m} dim={dim}; input groups={groups_n}")
+    results = [
+        profile_groups(
+            f"{label} block torch train",
+            torch_groups,
+            lambda g: block_step(g, heads, eps, False, False, False, False, False, False),
+            warmup=500,
+            iters=100,
+            flops=flops_fwd * 3.0,
+            bytes_moved=group_bytes * 3,
+        ),
+        profile_groups(
+            f"{label} block fused_adaln_nores train",
+            fused_nores_groups,
+            lambda g: block_step(g, heads, eps, True, True, False, False, False, False),
+            warmup=500,
+            iters=100,
+            flops=flops_fwd * 3.0,
+            bytes_moved=group_bytes * 3,
+        ),
+        profile_groups(
+            f"{label} block fused_adaln_residual train",
+            fused_res_groups,
+            lambda g: block_step(g, heads, eps, True, True, False, False, False, True),
+            warmup=500,
+            iters=100,
+            flops=flops_fwd * 3.0,
+            bytes_moved=group_bytes * 3,
+        ),
+    ]
+    for result in results:
+        print_bench(result)
+    torch_result, nores, res = results
+    print(
+        f"  total AdaLN speedup: nores {torch_result.us / nores.us:.2f}x, "
+        f"with_residual {torch_result.us / res.us:.2f}x; residual-only {nores.us / res.us:.2f}x"
+    )
+    return results
+
+
+def benchmark_long_batch_suite() -> list[BenchResult]:
+    print(
+        "\nLong-token/batch benchmark recipe: uniform BF16 inputs, natural L2 eviction via input groups, "
+        "500 warmups, 100 measured back-to-back launches, two CUDA events, 2s cooldown between kernels."
+    )
+    cases = [
+        (1, 1024), (2, 1024), (4, 1024), (8, 1024), (16, 1024), (32, 1024),
+        (1, 2048), (2, 2048), (4, 2048), (8, 2048), (16, 2048),
+        (1, 4096), (2, 4096), (4, 4096), (8, 4096),
+        (1, 8192), (2, 8192), (4, 8192),
+        (1, 16384), (2, 16384),
+        (1024, 16),
+    ]
+    results: list[BenchResult] = []
+    for batch, tokens in cases:
+        label = f"L-D1024-B{batch}-T{tokens}"
+        try:
+            results.extend(benchmark_long_batch_case(batch, tokens, 1024, 16, 1e-6, label))
+        except torch.cuda.OutOfMemoryError as exc:
+            print(f"\n{label}: SKIP OOM ({exc})")
+            torch.cuda.empty_cache()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower() or "invalid configuration" in str(exc).lower():
+                print(f"\n{label}: SKIP ({exc})")
+                torch.cuda.empty_cache()
+            else:
+                raise
+    return results
+
+
+def benchmark_b1024_tokens_suite() -> list[BenchResult]:
+    print(
+        "\nB1024 token benchmark recipe: uniform BF16 inputs, natural L2 eviction via input groups, "
+        "500 warmups, 100 measured back-to-back launches, two CUDA events, 2s cooldown between kernels."
+    )
+    results: list[BenchResult] = []
+    for tokens in (1, 2, 4, 8, 16, 32, 64):
+        label = f"L-D1024-B1024-T{tokens}"
+        try:
+            results.extend(benchmark_long_batch_case(1024, tokens, 1024, 16, 1e-6, label))
+        except torch.cuda.OutOfMemoryError as exc:
+            print(f"\n{label}: SKIP OOM ({exc})")
+            torch.cuda.empty_cache()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(f"\n{label}: SKIP OOM ({exc})")
+                torch.cuda.empty_cache()
+            else:
+                raise
+    return results
+
+
 def benchmark_mlp_suite() -> list[BenchResult]:
     print(
         "\nMLP-only benchmark recipe: uniform BF16 inputs, natural L2 eviction via input groups, "
@@ -1062,7 +1309,7 @@ def write_report(path: Path, ok: bool, results: list[BenchResult]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["test", "bench", "all", "block", "mlp", "big_adaln", "compile"], nargs="?", default="all")
+    parser.add_argument("mode", choices=["test", "bench", "all", "block", "mlp", "big_adaln", "compile", "residual_sweep", "long_batch", "b1024_tokens"], nargs="?", default="all")
     parser.add_argument("--report", type=Path, default=None)
     args = parser.parse_args()
 
@@ -1080,6 +1327,15 @@ def main() -> None:
     elif args.mode == "compile":
         ok = run_block_tests()
         results = benchmark_compile_suite()
+    elif args.mode == "residual_sweep":
+        ok = run_block_tests()
+        results = benchmark_residual_sweep_suite()
+    elif args.mode == "long_batch":
+        ok = run_block_tests()
+        results = benchmark_long_batch_suite()
+    elif args.mode == "b1024_tokens":
+        ok = run_block_tests()
+        results = benchmark_b1024_tokens_suite()
     elif args.mode in ("test", "all"):
         ok = run_tests()
         if args.mode == "all":
