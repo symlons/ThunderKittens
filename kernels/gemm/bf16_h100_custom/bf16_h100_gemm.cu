@@ -113,6 +113,127 @@ __device__ static inline void apply_adaln_modulation(
 
 
 
+
+__global__ void layernorm_adaln_forward_kernel(
+    bf16 *__restrict__ out,
+    float *__restrict__ mean_out,
+    float *__restrict__ rstd_out,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ shift,
+    const bf16 *__restrict__ scale,
+    int M,
+    int K,
+    int tokens_per_sample,
+    float eps
+) {
+    extern __shared__ float smem[];
+    float *sum_s = smem;
+    float *sq_s = smem + blockDim.x;
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int batch = row / tokens_per_sample;
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+    for (int col = tid; col < K; col += blockDim.x) {
+        float v = __bfloat162float(x[size_t(row) * K + col]);
+        sum += v;
+        sq += v * v;
+    }
+    sum_s[tid] = sum;
+    sq_s[tid] = sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum_s[tid] += sum_s[tid + stride];
+            sq_s[tid] += sq_s[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float mean = sum_s[0] / K;
+    float var = sq_s[0] / K - mean * mean;
+    var = fmaxf(var, 0.0f);
+    float rstd = rsqrtf(var + eps);
+    if (tid == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
+
+    for (int col = tid; col < K; col += blockDim.x) {
+        size_t idx = size_t(row) * K + col;
+        float xhat = (__bfloat162float(x[idx]) - mean) * rstd;
+        float sh = __bfloat162float(shift[batch * K + col]);
+        float sc = __bfloat162float(scale[batch * K + col]);
+        out[idx] = __float2bfloat16(xhat * (1.0f + sc) + sh);
+    }
+}
+
+__global__ void layernorm_adaln_backward_kernel(
+    bf16 *__restrict__ dx,
+    float *__restrict__ dshift,
+    float *__restrict__ dscale,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ scale,
+    const float *__restrict__ mean,
+    const float *__restrict__ rstd,
+    int M,
+    int K,
+    int tokens_per_sample
+) {
+    extern __shared__ float smem[];
+    float *sum_dy = smem;
+    float *sum_dy_xhat = smem + blockDim.x;
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int batch = row / tokens_per_sample;
+    float m = mean[row];
+    float rs = rstd[row];
+
+    float local_sum = 0.0f;
+    float local_sum_xhat = 0.0f;
+    for (int col = tid; col < K; col += blockDim.x) {
+        size_t idx = size_t(row) * K + col;
+        float xhat = (__bfloat162float(x[idx]) - m) * rs;
+        float g = __bfloat162float(grad[idx]);
+        float sc = __bfloat162float(scale[batch * K + col]);
+        float dnorm = g * (1.0f + sc);
+        local_sum += dnorm;
+        local_sum_xhat += dnorm * xhat;
+    }
+    sum_dy[tid] = local_sum;
+    sum_dy_xhat[tid] = local_sum_xhat;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum_dy[tid] += sum_dy[tid + stride];
+            sum_dy_xhat[tid] += sum_dy_xhat[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float s1 = sum_dy[0];
+    float s2 = sum_dy_xhat[0];
+    float inv_k = 1.0f / K;
+    for (int col = tid; col < K; col += blockDim.x) {
+        size_t idx = size_t(row) * K + col;
+        float xv = __bfloat162float(x[idx]);
+        float xhat = (xv - m) * rs;
+        float g = __bfloat162float(grad[idx]);
+        float sc = __bfloat162float(scale[batch * K + col]);
+        float dnorm = g * (1.0f + sc);
+        float dxv = (dnorm - s1 * inv_k - xhat * s2 * inv_k) * rs;
+        dx[idx] = __float2bfloat16(dxv);
+        atomicAdd(&dshift[batch * K + col], g);
+        atomicAdd(&dscale[batch * K + col], g * xhat);
+    }
+}
+
 __global__ void adaln_modulate_backward_kernel(
     bf16 *__restrict__ dx,
     float *__restrict__ dshift,
@@ -632,6 +753,107 @@ void adaln_modulate_backward_entrypoint(
     );
 }
 
+
+void layernorm_adaln_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &shift,
+    const at::Tensor &scale,
+    const at::Tensor &out,
+    const at::Tensor &mean,
+    const at::Tensor &rstd,
+    int64_t tokens_per_sample,
+    double eps
+) {
+    kittens::py::device_check(A, shift, scale, out, mean, rstd);
+    TORCH_CHECK(A.dtype() == torch::kBFloat16 && shift.dtype() == torch::kBFloat16);
+    TORCH_CHECK(scale.dtype() == torch::kBFloat16 && out.dtype() == torch::kBFloat16);
+    TORCH_CHECK(mean.dtype() == torch::kFloat32 && rstd.dtype() == torch::kFloat32);
+    TORCH_CHECK(A.is_contiguous() && shift.is_contiguous() && scale.is_contiguous());
+    TORCH_CHECK(out.is_contiguous() && mean.is_contiguous() && rstd.is_contiguous());
+    TORCH_CHECK(A.dim() == 2 && out.dim() == 2 && shift.dim() == 2 && scale.dim() == 2);
+    TORCH_CHECK(mean.dim() == 1 && rstd.dim() == 1);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int batch = shift.size(0);
+    TORCH_CHECK(out.size(0) == M && out.size(1) == K);
+    TORCH_CHECK(scale.size(0) == batch && shift.size(1) == K && scale.size(1) == K);
+    TORCH_CHECK(mean.size(0) == M && rstd.size(0) == M);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    int threads = 256;
+    int smem = threads * 2 * sizeof(float);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    layernorm_adaln_forward_kernel<<<M, threads, smem, stream>>>(
+        reinterpret_cast<bf16*>(out.data_ptr()),
+        reinterpret_cast<float*>(mean.data_ptr()),
+        reinterpret_cast<float*>(rstd.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const bf16*>(shift.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        M,
+        K,
+        static_cast<int>(tokens_per_sample),
+        static_cast<float>(eps)
+    );
+}
+
+void layernorm_adaln_backward_entrypoint(
+    const at::Tensor &grad,
+    const at::Tensor &A,
+    const at::Tensor &scale,
+    const at::Tensor &mean,
+    const at::Tensor &rstd,
+    const at::Tensor &dA,
+    const at::Tensor &dshift,
+    const at::Tensor &dscale,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(grad, A, scale, mean, rstd, dA, dshift, dscale);
+    TORCH_CHECK(grad.dtype() == torch::kBFloat16 && A.dtype() == torch::kBFloat16);
+    TORCH_CHECK(scale.dtype() == torch::kBFloat16 && dA.dtype() == torch::kBFloat16);
+    TORCH_CHECK(mean.dtype() == torch::kFloat32 && rstd.dtype() == torch::kFloat32);
+    TORCH_CHECK(dshift.dtype() == torch::kFloat32 && dscale.dtype() == torch::kFloat32);
+    TORCH_CHECK(grad.is_contiguous() && A.is_contiguous() && scale.is_contiguous());
+    TORCH_CHECK(mean.is_contiguous() && rstd.is_contiguous() && dA.is_contiguous());
+    TORCH_CHECK(dshift.is_contiguous() && dscale.is_contiguous());
+    TORCH_CHECK(grad.dim() == 2 && A.dim() == 2 && dA.dim() == 2);
+    TORCH_CHECK(scale.dim() == 2 && dshift.dim() == 2 && dscale.dim() == 2);
+    TORCH_CHECK(mean.dim() == 1 && rstd.dim() == 1);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int batch = scale.size(0);
+    TORCH_CHECK(grad.size(0) == M && grad.size(1) == K);
+    TORCH_CHECK(dA.size(0) == M && dA.size(1) == K);
+    TORCH_CHECK(mean.size(0) == M && rstd.size(0) == M);
+    TORCH_CHECK(scale.size(1) == K);
+    TORCH_CHECK(dshift.size(0) == batch && dshift.size(1) == K);
+    TORCH_CHECK(dscale.size(0) == batch && dscale.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaMemsetAsync(dshift.data_ptr(), 0, dshift.numel() * sizeof(float), stream);
+    cudaMemsetAsync(dscale.data_ptr(), 0, dscale.numel() * sizeof(float), stream);
+    int threads = 256;
+    int smem = threads * 2 * sizeof(float);
+    layernorm_adaln_backward_kernel<<<M, threads, smem, stream>>>(
+        reinterpret_cast<bf16*>(dA.data_ptr()),
+        reinterpret_cast<float*>(dshift.data_ptr()),
+        reinterpret_cast<float*>(dscale.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        reinterpret_cast<const float*>(mean.data_ptr()),
+        reinterpret_cast<const float*>(rstd.data_ptr()),
+        M,
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
 void gemm_custom_adaln_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
@@ -694,6 +916,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("gemm_custom", &gemm_custom_entrypoint);
     m.def("adaln_modulate", &adaln_modulate_entrypoint);
     m.def("adaln_modulate_backward", &adaln_modulate_backward_entrypoint);
+    m.def("layernorm_adaln", &layernorm_adaln_entrypoint);
+    m.def("layernorm_adaln_backward", &layernorm_adaln_backward_entrypoint);
     m.def("gemm_custom_adaln", &gemm_custom_adaln_entrypoint);
 }
 #endif
