@@ -16,6 +16,35 @@ TOKEN_SHAPES = {
 BATCH_PARTS = ("b1", "b2", "b4", "b8", "b16", "b32", "b64", "b128", "b256", "b512", "b1024")
 
 
+def dit_command(
+    *,
+    model: str,
+    tokens: list[int] | None = None,
+    batches: list[int] | None = None,
+    spatial: tuple[int, int, int] | None = None,
+    sweep: bool = False,
+    compile_model: bool = False,
+    probe_memory: bool = False,
+    warmup: int = 5,
+    iters: int = 5,
+) -> list[str]:
+    command = ["python3", "dit3d_e2e_bench.py", "--model", model.upper()]
+    if sweep or tokens:
+        command.append("--sweep")
+        if tokens:
+            command.extend(["--tokens", *(str(t) for t in tokens)])
+    elif spatial:
+        command.extend(["--spatial", *(str(v) for v in spatial)])
+    if batches:
+        command.extend(["--batches", *(str(b) for b in batches)])
+    command.extend(["--warmup", str(warmup), "--iters", str(iters)])
+    if compile_model:
+        command.append("--compile")
+    if probe_memory:
+        command.append("--probe-memory")
+    return command
+
+
 def command_for_mode(mode: str) -> list[str]:
     if mode.startswith("dit3d"):
         parts = mode.split("_")

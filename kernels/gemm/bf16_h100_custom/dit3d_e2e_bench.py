@@ -526,18 +526,33 @@ def spatial_for_tokens(tokens: int) -> tuple[int, int, int]:
         60000: (30, 40, 50),
         65536: (32, 32, 64),
     }
-    if tokens not in shapes:
-        raise ValueError(f"no 3D spatial shape configured for token count {tokens}")
-    return shapes[tokens]
+    if tokens in shapes:
+        return shapes[tokens]
+    best = (1, 1, tokens)
+    best_score = (tokens, tokens)
+    for d in range(1, int(round(tokens ** (1 / 3))) + 3):
+        if tokens % d:
+            continue
+        plane = tokens // d
+        for h in range(d, int(math.sqrt(plane)) + 2):
+            if plane % h:
+                continue
+            w = plane // h
+            dims = tuple(sorted((d, h, w)))
+            score = (dims[-1] - dims[0], dims[-1])
+            if score < best_score:
+                best = dims
+                best_score = score
+    return best
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Benchmark full 3D DiT training variants.")
     parser.add_argument("--model", choices=["S", "L", "XL"], default="S")
     parser.add_argument("--batches", nargs="+", type=int, default=[4, 16, 64, 256, 1024])
     parser.add_argument("--spatial", nargs=3, type=int, default=[2, 2, 4])
-    parser.add_argument("--tokens", nargs="+", type=int, default=None)
-    parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--tokens", nargs="+", type=int, default=None, help="Token counts to benchmark. Arbitrary counts are mapped to an exact-product 3D shape.")
+    parser.add_argument("--sweep", action="store_true", help="Run every token count in --tokens for every batch in --batches.")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
@@ -553,7 +568,7 @@ def main():
     torch.cuda.synchronize()
     all_results = []
     cases = []
-    if args.sweep:
+    if args.sweep or args.tokens is not None:
         token_counts = args.tokens or [512, 1024, 2048, 4096, 8192, 16384, 32768, 60000]
         for tokens in token_counts:
             spatial = spatial_for_tokens(tokens)

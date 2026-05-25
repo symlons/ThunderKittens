@@ -6,7 +6,7 @@ from pathlib import Path
 
 import modal
 
-from adaln_profile_modes import command_for_mode
+from adaln_profile_modes import command_for_mode, dit_command
 
 
 APP_NAME = "thunderkittens-adaln-layernorm"
@@ -50,24 +50,54 @@ def run_checked(command: list[str], *, cwd: str | None = None) -> str:
     return ""
 
 
-def run_profile(mode: str) -> str:
+def run_profile(mode: str, command: list[str] | None = None) -> str:
     run_checked(["nvidia-smi"])
-    return run_checked(command_for_mode(mode), cwd=KERNEL_DIR)
+    return run_checked(command or command_for_mode(mode), cwd=KERNEL_DIR)
 
 
 @app.function(gpu="H100", image=image, timeout=60 * 8)
-def test_and_profile_h100(mode: str = "block") -> str:
-    return run_profile(mode)
+def test_and_profile_h100(mode: str = "block", command: list[str] | None = None) -> str:
+    return run_profile(mode, command)
 
 
 @app.function(gpu="H200", image=image, timeout=60 * 8)
-def test_and_profile_h200(mode: str = "block") -> str:
-    return run_profile(mode)
+def test_and_profile_h200(mode: str = "block", command: list[str] | None = None) -> str:
+    return run_profile(mode, command)
 
 
 @app.local_entrypoint()
-def main(mode: str = "block", gpu: str = "H100") -> None:
+def main(
+    mode: str = "block",
+    gpu: str = "H100",
+    dit: bool = False,
+    model: str = "L",
+    tokens: str = "",
+    batches: str = "1",
+    spatial: str = "",
+    sweep: bool = False,
+    compile: bool = False,
+    probe_memory: bool = False,
+    warmup: int = 5,
+    iters: int = 5,
+) -> None:
+    def parse_ints(value: str) -> list[int]:
+        return [int(part) for part in value.replace(",", " ").split() if part]
+
+    command = None
+    if dit or tokens or spatial:
+        spatial_values = parse_ints(spatial)
+        command = dit_command(
+            model=model,
+            tokens=parse_ints(tokens) or None,
+            batches=parse_ints(batches) or [1],
+            spatial=tuple(spatial_values) if spatial_values else None,
+            sweep=sweep,
+            compile_model=compile,
+            probe_memory=probe_memory,
+            warmup=warmup,
+            iters=iters,
+        )
     if gpu.upper() == "H200":
-        test_and_profile_h200.remote(mode)
+        test_and_profile_h200.remote(mode, command)
     else:
-        test_and_profile_h100.remote(mode)
+        test_and_profile_h100.remote(mode, command)
