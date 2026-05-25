@@ -18,6 +18,118 @@ import _linear_bwd_fused
 from tk_bench import input_group_count, profile_groups, print_bench, uniform_bf16
 
 
+def _is_compiling() -> bool:
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:
+        return False
+
+
+def _register_custom_op(name: str, mutates_args=()):
+    try:
+        return torch.library.custom_op(name, mutates_args=mutates_args)
+    except Exception:
+        def decorator(fn):
+            return fn
+        return decorator
+
+
+@_register_custom_op("tk_dit::layernorm_adaln", mutates_args=())
+def tk_layernorm_adaln_op(
+    flat: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    tokens: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(flat)
+    mean = torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32)
+    rstd = torch.empty_like(mean)
+    _C.layernorm_adaln(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
+    return out, mean, rstd
+
+
+@tk_layernorm_adaln_op.register_fake
+def _tk_layernorm_adaln_fake(flat, shift, scale, tokens: int, eps: float):
+    return (
+        torch.empty_like(flat),
+        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
+        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
+    )
+
+
+@_register_custom_op("tk_dit::layernorm_adaln_backward", mutates_args=())
+def tk_layernorm_adaln_backward_op(
+    grad: torch.Tensor,
+    flat: torch.Tensor,
+    scale: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dx = torch.empty_like(flat)
+    dshift = torch.empty_like(scale, dtype=torch.float32)
+    dscale = torch.empty_like(scale, dtype=torch.float32)
+    _C.layernorm_adaln_backward(grad, flat, scale, mean, rstd, dx, dshift, dscale, tokens)
+    return dx, dshift, dscale
+
+
+@tk_layernorm_adaln_backward_op.register_fake
+def _tk_layernorm_adaln_backward_fake(grad, flat, scale, mean, rstd, tokens: int):
+    return (
+        torch.empty_like(flat),
+        torch.empty_like(scale, dtype=torch.float32),
+        torch.empty_like(scale, dtype=torch.float32),
+    )
+
+
+@_register_custom_op("tk_dit::gated_residual", mutates_args=())
+def tk_gated_residual_op(
+    flat_x: torch.Tensor,
+    flat_h: torch.Tensor,
+    gate: torch.Tensor,
+    tokens: int,
+) -> torch.Tensor:
+    out = torch.empty_like(flat_x)
+    _C.gated_residual(flat_x, flat_h, gate.contiguous(), out, tokens)
+    return out
+
+
+@tk_gated_residual_op.register_fake
+def _tk_gated_residual_fake(flat_x, flat_h, gate, tokens: int):
+    return torch.empty_like(flat_x)
+
+
+@_register_custom_op("tk_dit::gated_residual_backward_no_dx", mutates_args=())
+def tk_gated_residual_backward_no_dx_op(
+    grad: torch.Tensor,
+    flat_h: torch.Tensor,
+    gate: torch.Tensor,
+    tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dh = torch.empty_like(grad)
+    dgate = torch.empty_like(gate, dtype=torch.float32)
+    _C.gated_residual_backward_no_dx(grad, flat_h, gate, dh, dgate, tokens)
+    return dh, dgate
+
+
+@tk_gated_residual_backward_no_dx_op.register_fake
+def _tk_gated_residual_backward_no_dx_fake(grad, flat_h, gate, tokens: int):
+    return torch.empty_like(grad), torch.empty_like(gate, dtype=torch.float32)
+
+
+@_register_custom_op("tk_dit::gelu_backward", mutates_args=())
+def tk_gelu_backward_op(grad_out: torch.Tensor, preact: torch.Tensor) -> torch.Tensor:
+    grad_input = torch.empty_like(preact)
+    _gelu_bwd.gelu_backward(grad_out.contiguous(), preact.contiguous(), grad_input)
+    return grad_input
+
+
+@tk_gelu_backward_op.register_fake
+def _tk_gelu_backward_fake(grad_out, preact):
+    return torch.empty_like(preact)
+
+
 _FLASH_ATTN3_FUNC = None
 
 
@@ -54,11 +166,9 @@ class FusedAdaLN(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
         batch, tokens, dim = x.shape
         flat = x.reshape(batch * tokens, dim).contiguous()
-        out = torch.empty_like(flat)
-        mean = torch.empty((flat.shape[0],), device=x.device, dtype=torch.float32)
-        rstd = torch.empty_like(mean)
-        _C.layernorm_adaln(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
-        ctx.save_for_backward(flat, scale.contiguous(), mean, rstd)
+        scale_c = scale.contiguous()
+        out, mean, rstd = tk_layernorm_adaln_op(flat, shift.contiguous(), scale_c, tokens, eps)
+        ctx.save_for_backward(flat, scale_c, mean, rstd)
         ctx.tokens = tokens
         ctx.shape = x.shape
         return out.reshape_as(x)
@@ -67,14 +177,13 @@ class FusedAdaLN(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):
         x, scale, mean, rstd = ctx.saved_tensors
         grad = grad_out.reshape_as(x).contiguous()
-        dx = torch.empty_like(x)
-        dshift = torch.empty_like(scale, dtype=torch.float32)
-        dscale = torch.empty_like(scale, dtype=torch.float32)
-        _C.layernorm_adaln_backward(grad, x, scale, mean, rstd, dx, dshift, dscale, ctx.tokens)
+        dx, dshift, dscale = tk_layernorm_adaln_backward_op(grad, x, scale, mean, rstd, ctx.tokens)
         return dx.reshape(ctx.shape), dshift.to(scale.dtype), dscale.to(scale.dtype), None
 
 
 def fused_adaln(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if _is_compiling() and x.numel() // x.shape[-1] >= 16384:
+        return modulate(torch.nn.functional.layer_norm(x, (x.shape[-1],), eps=eps), shift, scale)
     return FusedAdaLN.apply(x, shift, scale, eps)
 
 
@@ -113,10 +222,7 @@ def can_use_gated_linear(x: torch.Tensor, residual: torch.Tensor, gate: torch.Te
 
 def recompute_adaln_flat(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float, tokens: int) -> torch.Tensor:
     flat = x.reshape(-1, x.shape[-1]).contiguous()
-    out = torch.empty_like(flat)
-    mean = torch.empty((flat.shape[0],), device=x.device, dtype=torch.float32)
-    rstd = torch.empty_like(mean)
-    _C.layernorm_adaln(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
+    out, _, _ = tk_layernorm_adaln_op(flat, shift.contiguous(), scale.contiguous(), tokens, eps)
     return out
 
 
@@ -230,8 +336,7 @@ class FusedGatedResidual(torch.autograd.Function):
         flat_x = x.reshape(batch * tokens, dim).contiguous()
         flat_h = h.reshape(batch * tokens, dim).contiguous()
         gate_c = gate.contiguous()
-        out = torch.empty_like(flat_x)
-        _C.gated_residual(flat_x, flat_h, gate_c, out, tokens)
+        out = tk_gated_residual_op(flat_x, flat_h, gate_c, tokens)
         ctx.save_for_backward(flat_h, gate_c)
         ctx.tokens = tokens
         ctx.shape = x.shape
@@ -241,9 +346,7 @@ class FusedGatedResidual(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):
         h, gate = ctx.saved_tensors
         grad = grad_out.reshape_as(h).contiguous()
-        dh = torch.empty_like(grad)
-        dgate = torch.empty_like(gate, dtype=torch.float32)
-        _C.gated_residual_backward_no_dx(grad, h, gate, dh, dgate, ctx.tokens)
+        dh, dgate = tk_gated_residual_backward_no_dx_op(grad, h, gate, ctx.tokens)
         return grad_out, dh.reshape(ctx.shape), dgate.to(gate.dtype)
 
 
@@ -305,9 +408,7 @@ class TkGelu(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         (x,) = ctx.saved_tensors
-        grad_input = torch.empty_like(x)
-        _gelu_bwd.gelu_backward(grad_out.contiguous(), x.contiguous(), grad_input)
-        return grad_input
+        return tk_gelu_backward_op(grad_out.contiguous(), x.contiguous())
 
 
 class TkLinearGelu(torch.autograd.Function):
@@ -365,6 +466,10 @@ class TkMlp(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         flat = x.reshape(-1, shape[-1]).contiguous()
+        if flat.shape[0] >= 8192:
+            h = TkGelu.apply(torch.nn.functional.linear(flat, self.fc1.weight, self.fc1.bias))
+            out = torch.nn.functional.linear(h, self.fc2.weight, self.fc2.bias)
+            return out.reshape(shape)
         h = TkLinearGelu.apply(flat, self.fc1.weight, self.fc1.bias)
         out = TkLinear.apply(h, self.fc2.weight, self.fc2.bias)
         return out.reshape(shape)
