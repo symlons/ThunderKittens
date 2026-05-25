@@ -91,6 +91,25 @@ def can_use_ln_adaln_gemm(x: torch.Tensor, w: torch.Tensor) -> bool:
     )
 
 
+def can_use_gated_linear(x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor, w: torch.Tensor) -> bool:
+    rows = x.numel() // x.shape[-1]
+    in_features = x.shape[-1]
+    out_features = w.shape[0]
+    return (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and residual.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and residual.shape[:-1] == x.shape[:-1]
+        and residual.shape[-1] == out_features
+        and gate.shape == (x.shape[0], out_features)
+        and rows % 128 == 0
+        and in_features % 64 == 0
+        and out_features % 256 == 0
+    )
+
+
 def recompute_adaln_flat(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float, tokens: int) -> torch.Tensor:
     flat = x.reshape(-1, x.shape[-1]).contiguous()
     out = torch.empty_like(flat)
@@ -234,6 +253,52 @@ def gated_residual(x: torch.Tensor, h: torch.Tensor, gate: torch.Tensor) -> torc
     return x + gate.unsqueeze(1).to(h.dtype) * h
 
 
+class FusedLinearGatedResidual(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor, w: torch.Tensor, b: torch.Tensor):
+        batch, tokens, _ = x.shape
+        flat_x = x.reshape(batch * tokens, x.shape[-1]).contiguous()
+        flat_residual = residual.reshape(batch * tokens, residual.shape[-1]).contiguous()
+        gate_c = gate.contiguous()
+        w_c = w.contiguous()
+        b_c = b.contiguous()
+        out = torch.empty_like(flat_residual)
+        projected = torch.empty_like(flat_residual)
+        _C.gemm_linear_gated_residual(flat_x, w_c, flat_residual, gate_c, out, projected, b_c, tokens)
+        ctx.save_for_backward(flat_x, gate_c, w_c, projected)
+        ctx.x_shape = x.shape
+        ctx.residual_shape = residual.shape
+        ctx.tokens = tokens
+        return out.reshape_as(residual)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, gate, w, projected = ctx.saved_tensors
+        grad = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
+        dresidual = torch.empty_like(grad)
+        dprojected = torch.empty_like(grad)
+        dgate = torch.empty_like(gate, dtype=torch.float32)
+        _C.gated_residual_backward(grad, projected, gate, dresidual, dprojected, dgate, ctx.tokens)
+        dw = torch.empty_like(w)
+        dx = torch.empty_like(x)
+        db = torch.empty((grad.shape[1],), device=grad.device, dtype=torch.float32)
+        _linear_bwd_fused.dw_gemm(dprojected, x, dw)
+        _linear_bwd_fused.dx_gemm_native(dprojected, w.contiguous(), dx)
+        _linear_bwd_fused.bias_reduce(dprojected, db)
+        return dx.reshape(ctx.x_shape), dresidual.reshape(ctx.residual_shape), dgate.to(gate.dtype), dw, db.to(grad.dtype)
+
+
+def fused_linear_gated_residual(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    linear: nn.Linear,
+) -> torch.Tensor:
+    if can_use_gated_linear(x, residual, gate, linear.weight):
+        return FusedLinearGatedResidual.apply(x, residual, gate, linear.weight, linear.bias)
+    return gated_residual(residual, linear(x), gate)
+
+
 class TkLinearGelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -299,6 +364,17 @@ class TkMlp(nn.Module):
         out = TkLinear.apply(h.reshape(-1, shape[-1]).contiguous(), self.fc2.weight, self.fc2.bias)
         return out.reshape(x.shape)
 
+    def forward_from_adaln_residual(
+        self,
+        residual: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        gate: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        h = fused_adaln_linear_gelu(residual, shift, scale, self.fc1, eps)
+        return fused_linear_gated_residual(h, residual, gate, self.fc2)
+
 
 class FusedInputMlp(nn.Module):
     def __init__(self, in_features: int, hidden_features: int):
@@ -311,6 +387,17 @@ class FusedInputMlp(nn.Module):
 
     def forward_from_adaln(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
         return self.fc2(fused_adaln_linear_gelu(x, shift, scale, self.fc1, eps))
+
+    def forward_from_adaln_residual(
+        self,
+        residual: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        gate: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        h = fused_adaln_linear_gelu(residual, shift, scale, self.fc1, eps)
+        return fused_linear_gated_residual(h, residual, gate, self.fc2)
 
 
 class SdpaAttention(nn.Module):
@@ -339,6 +426,19 @@ class SdpaAttention(nn.Module):
         qkv = fused_adaln_linear(x, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
         return self.proj(self._attention_from_qkv(qkv))
 
+    def forward_from_adaln_residual(
+        self,
+        residual: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        gate: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        batch, tokens, _ = residual.shape
+        qkv = fused_adaln_linear(residual, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        attn = self._attention_from_qkv(qkv)
+        return fused_linear_gated_residual(attn, residual, gate, self.proj)
+
 
 class FlashAttention3(nn.Module):
     def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
@@ -363,6 +463,20 @@ class FlashAttention3(nn.Module):
         q, k, v = qkv.unbind(dim=2)
         out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
         return self.proj(out.reshape(batch, tokens, dim))
+
+    def forward_from_adaln_residual(
+        self,
+        residual: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        gate: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        batch, tokens, dim = residual.shape
+        qkv = fused_adaln_linear(residual, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
+        return fused_linear_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
 
 
 class PatchEmbed3D(nn.Module):
@@ -433,6 +547,7 @@ class DiTBlock(nn.Module):
         fused_residual_enabled=False,
         tk_mlp_enabled=False,
         fused_input_projection_enabled=False,
+        fused_output_projection_enabled=False,
         attention_backend="timm",
         **block_kwargs,
     ):
@@ -440,6 +555,7 @@ class DiTBlock(nn.Module):
         self.fused_adaln_enabled = fused_adaln_enabled
         self.fused_residual_enabled = fused_residual_enabled
         self.fused_input_projection_enabled = fused_input_projection_enabled
+        self.fused_output_projection_enabled = fused_output_projection_enabled
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         if attention_backend == "fa3":
             self.attn = FlashAttention3(hidden_size, num_heads=num_heads, qkv_bias=True)
@@ -470,18 +586,34 @@ class DiTBlock(nn.Module):
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         if self.fused_adaln_enabled:
-            if self.fused_input_projection_enabled and hasattr(self.attn, "forward_from_adaln"):
+            if (
+                self.fused_input_projection_enabled
+                and self.fused_output_projection_enabled
+                and self.fused_residual_enabled
+                and hasattr(self.attn, "forward_from_adaln_residual")
+            ):
+                x = self.attn.forward_from_adaln_residual(x, shift_msa, scale_msa, gate_msa, self.norm1.eps)
+            elif self.fused_input_projection_enabled and hasattr(self.attn, "forward_from_adaln"):
                 attn_out = self.attn.forward_from_adaln(x, shift_msa, scale_msa, self.norm1.eps)
+                x = gated_residual(x, attn_out, gate_msa) if self.fused_residual_enabled else x + gate_msa.unsqueeze(1) * attn_out
             else:
                 attn_in = fused_adaln(x, shift_msa, scale_msa, self.norm1.eps)
                 attn_out = self.attn(attn_in)
-            x = gated_residual(x, attn_out, gate_msa) if self.fused_residual_enabled else x + gate_msa.unsqueeze(1) * attn_out
-            if self.fused_input_projection_enabled and hasattr(self.mlp, "forward_from_adaln"):
+                x = gated_residual(x, attn_out, gate_msa) if self.fused_residual_enabled else x + gate_msa.unsqueeze(1) * attn_out
+            if (
+                self.fused_input_projection_enabled
+                and self.fused_output_projection_enabled
+                and self.fused_residual_enabled
+                and hasattr(self.mlp, "forward_from_adaln_residual")
+            ):
+                x = self.mlp.forward_from_adaln_residual(x, shift_mlp, scale_mlp, gate_mlp, self.norm2.eps)
+            elif self.fused_input_projection_enabled and hasattr(self.mlp, "forward_from_adaln"):
                 mlp_out = self.mlp.forward_from_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
+                x = gated_residual(x, mlp_out, gate_mlp) if self.fused_residual_enabled else x + gate_mlp.unsqueeze(1) * mlp_out
             else:
                 mlp_in = fused_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
                 mlp_out = self.mlp(mlp_in)
-            x = gated_residual(x, mlp_out, gate_mlp) if self.fused_residual_enabled else x + gate_mlp.unsqueeze(1) * mlp_out
+                x = gated_residual(x, mlp_out, gate_mlp) if self.fused_residual_enabled else x + gate_mlp.unsqueeze(1) * mlp_out
             return x
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -521,6 +653,7 @@ class DiT(nn.Module):
         fused_residual_enabled=False,
         tk_mlp_enabled=False,
         fused_input_projection_enabled=False,
+        fused_output_projection_enabled=False,
         attention_backend="timm",
     ):
         super().__init__()
@@ -540,6 +673,7 @@ class DiT(nn.Module):
                 fused_residual_enabled=fused_residual_enabled,
                 tk_mlp_enabled=tk_mlp_enabled,
                 fused_input_projection_enabled=fused_input_projection_enabled,
+                fused_output_projection_enabled=fused_output_projection_enabled,
                 attention_backend=attention_backend,
             )
             for _ in range(depth)
@@ -648,6 +782,7 @@ def make_model(
     fused_residual: bool = False,
     tk_mlp: bool = False,
     fused_input_projection: bool = False,
+    fused_output_projection: bool = False,
     attention_backend: str = "timm",
 ) -> DiT:
     torch.manual_seed(123)
@@ -657,6 +792,7 @@ def make_model(
         fused_residual_enabled=fused_residual,
         tk_mlp_enabled=tk_mlp,
         fused_input_projection_enabled=fused_input_projection,
+        fused_output_projection_enabled=fused_output_projection,
         attention_backend=attention_backend,
     ).cuda().to(torch.bfloat16).train()
     model.randomize_zero_init_layers()
@@ -763,7 +899,27 @@ def fused_input_projection_correctness(batch: int = 2, tokens: int = 64, dim: in
     ok = check_close("gelu output", fused_out, ref_out) and ok
     for name, actual, expected in zip(("x", "shift", "scale", "w", "b"), [t.grad for t in fused], [t.grad for t in ref]):
         ok = check_close(f"gelu d{name}", actual, expected) and ok
-    print(f"Fused LN+AdaLN+projection correctness: {'PASS' if ok else 'FAIL'}")
+
+    h_fc2 = uniform_bf16((batch, tokens, hidden_dim), 9010, -1.0, 1.0).requires_grad_(True)
+    residual = uniform_bf16((batch, tokens, dim), 9011, -1.0, 1.0).requires_grad_(True)
+    gate = uniform_bf16((batch, dim), 9012, -0.25, 0.25).requires_grad_(True)
+    w_fc2 = uniform_bf16((dim, hidden_dim), 9013, -0.02, 0.02).requires_grad_(True)
+    b_fc2 = uniform_bf16((dim,), 9014, -0.02, 0.02).requires_grad_(True)
+    grad_res = uniform_bf16((batch, tokens, dim), 9015, -1.0, 1.0)
+
+    ref = [clone(t) for t in (h_fc2, residual, gate, w_fc2, b_fc2)]
+    ref_out = ref[1] + ref[2].unsqueeze(1) * torch.nn.functional.linear(ref[0], ref[3], ref[4])
+    ref_out.backward(grad_res)
+
+    fused = [clone(t) for t in (h_fc2, residual, gate, w_fc2, b_fc2)]
+    fused_out = FusedLinearGatedResidual.apply(fused[0], fused[1], fused[2], fused[3], fused[4])
+    fused_out.backward(grad_res)
+
+    ok = check_close("linear+residual output", fused_out, ref_out) and ok
+    for name, actual, expected in zip(("x", "residual", "gate", "w", "b"), [t.grad for t in fused], [t.grad for t in ref]):
+        ok = check_close(f"linear+residual d{name}", actual, expected) and ok
+
+    print(f"Fused LN+AdaLN/projection epilogue correctness: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
@@ -775,27 +931,31 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
     groups = [make_group(batch, cfg["in_channels"], spatial, 50000 + i * 10) for i in range(groups_n)]
 
     print(f"\n3D DiT-{model_name}/1 E2E train: batch={batch} tokens={tokens} spatial={spatial} groups={groups_n}")
-    variants = [("eager", False, False, False, False, "timm", False)]
+    variants = [("eager", False, False, False, False, False, "timm", False)]
     if include_compile:
-        variants.append(("compile", False, False, False, False, "timm", True))
+        variants.append(("compile", False, False, False, False, False, "timm", True))
     variants.extend([
-        ("tk_mlp", False, False, True, False, "timm", False),
-        ("fused_adaln", True, False, False, False, "timm", False),
-        ("fused_adaln_residual", True, True, False, False, "timm", False),
-        ("fused_adaln_residual_tk_mlp", True, True, True, False, "timm", False),
-        ("fused_input_proj", True, True, False, True, "timm", False),
-        ("fused_input_proj_tk_mlp", True, True, True, True, "timm", False),
+        ("tk_mlp", False, False, True, False, False, "timm", False),
+        ("fused_adaln", True, False, False, False, False, "timm", False),
+        ("fused_adaln_residual", True, True, False, False, False, "timm", False),
+        ("fused_adaln_residual_tk_mlp", True, True, True, False, False, "timm", False),
+        ("fused_input_proj", True, True, False, True, False, "timm", False),
+        ("fused_input_output_proj", True, True, False, True, True, "timm", False),
+        ("fused_input_proj_tk_mlp", True, True, True, True, False, "timm", False),
+        ("fused_input_output_proj_tk_mlp", True, True, True, True, True, "timm", False),
     ])
     if include_fa3:
         variants.extend([
-            ("fa3_attn", False, False, False, False, "fa3", False),
-            ("fused_adaln_residual_fa3", True, True, False, False, "fa3", False),
-            ("fused_adaln_residual_fa3_tk_mlp", True, True, True, False, "fa3", False),
-            ("fused_input_proj_fa3", True, True, False, True, "fa3", False),
-            ("fused_input_proj_fa3_tk_mlp", True, True, True, True, "fa3", False),
+            ("fa3_attn", False, False, False, False, False, "fa3", False),
+            ("fused_adaln_residual_fa3", True, True, False, False, False, "fa3", False),
+            ("fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, "fa3", False),
+            ("fused_input_proj_fa3", True, True, False, True, False, "fa3", False),
+            ("fused_input_output_proj_fa3", True, True, False, True, True, "fa3", False),
+            ("fused_input_proj_fa3_tk_mlp", True, True, True, True, False, "fa3", False),
+            ("fused_input_output_proj_fa3_tk_mlp", True, True, True, True, True, "fa3", False),
         ])
     results = []
-    for variant_name, fused, fused_residual, tk_mlp, fused_input_projection, attention_backend, compiled in variants:
+    for variant_name, fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, attention_backend, compiled in variants:
         print(f"  running {variant_name}...", flush=True)
         model = make_model(
             model_name,
@@ -803,6 +963,7 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
             fused_residual=fused_residual,
             tk_mlp=tk_mlp,
             fused_input_projection=fused_input_projection,
+            fused_output_projection=fused_output_projection,
             attention_backend=attention_backend,
         )
         if compiled:
