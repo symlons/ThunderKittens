@@ -73,21 +73,14 @@ def run_profile(mode: str) -> str:
             batch_i = command.index("--batches")
             del command[batch_i:batch_i + 2]
             command.extend(["--batches", "1", "2", "4", "8", "16", "32", "64", "128"])
-        if "b256" in parts:
+        for batch_part in ("b1", "b2", "b4", "b8", "b16", "b32", "b64", "b128", "b256", "b512", "b1024"):
+            if batch_part not in parts:
+                continue
+            batch = batch_part[1:]
             if "--batches" in command:
-                command[command.index("--batches") + 1] = "256"
+                command[command.index("--batches") + 1] = batch
             else:
-                command.extend(["--batches", "256"])
-        if "b512" in parts:
-            if "--batches" in command:
-                command[command.index("--batches") + 1] = "512"
-            else:
-                command.extend(["--batches", "512"])
-        if "b1024" in parts:
-            if "--batches" in command:
-                command[command.index("--batches") + 1] = "1024"
-            else:
-                command.extend(["--batches", "1024"])
+                command.extend(["--batches", batch])
         if "mem" in parts:
             command.append("--probe-memory")
         if "sweep" in parts or "tokens" in parts:
@@ -104,12 +97,11 @@ def run_profile(mode: str) -> str:
                 batches = ["256", "512", "1024"]
                 warmup = "5"
                 iters = "10"
-            elif "b256" in parts:
-                batches = ["256"]
-            elif "b512" in parts:
-                batches = ["512"]
-            elif "b1024" in parts:
-                batches = ["1024"]
+            else:
+                for batch_part in ("b1", "b2", "b4", "b8", "b16", "b32", "b64", "b128", "b256", "b512", "b1024"):
+                    if batch_part in parts:
+                        batches = [batch_part[1:]]
+                        break
             command.extend([
                 "--sweep",
                 "--tokens", "256", "512", "1024", "2048", "4096", "8192", "16384",

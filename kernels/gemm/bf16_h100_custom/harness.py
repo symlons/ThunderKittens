@@ -547,7 +547,7 @@ def benchmark_big_adaln_suite() -> list[BenchResult]:
 
 def compile_fn(fn):
     try:
-        return torch.compile(fn, mode="max-autotune", fullgraph=False)
+        return torch.compile(fn)
     except Exception as exc:
         print(f"torch.compile unavailable for {getattr(fn, '__name__', repr(fn))}: {exc!r}")
         return None
