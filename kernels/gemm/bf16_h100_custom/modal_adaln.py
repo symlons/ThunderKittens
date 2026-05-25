@@ -25,7 +25,6 @@ image = (
     modal.Image.from_registry("pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
     .apt_install("git", "make", "ninja-build")
     .pip_install("packaging", "psutil", "pybind11", "kernels", "timm")
-    .add_local_dir(local_path=str(DEFAULT_LOCAL_TK_ROOT), remote_path=THUNDERKITTENS_ROOT, copy=True)
     .run_commands(
         "git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && "
         "cd /tmp/flash-attention/hopper && "
@@ -47,6 +46,7 @@ image = (
         "FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE "
         "MAX_JOBS=2 NVCC_THREADS=1 python setup.py install"
     )
+    .add_local_dir(local_path=str(DEFAULT_LOCAL_TK_ROOT), remote_path=THUNDERKITTENS_ROOT, copy=True)
     .run_commands(
         "cd /ThunderKittens/kernels/gemm/bf16_h100_custom && "
         "make clean && "
