@@ -13,6 +13,7 @@ from timm.layers.attention import Attention
 from timm.layers.mlp import Mlp
 
 import _C
+import _linear_bwd_fused
 from tk_bench import input_group_count, profile_groups, print_bench, uniform_bf16
 
 
@@ -80,6 +81,66 @@ def gated_residual(x: torch.Tensor, h: torch.Tensor, gate: torch.Tensor) -> torc
     return x + gate.unsqueeze(1).to(h.dtype) * h
 
 
+class TkLinearGelu(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        x_c = x.contiguous()
+        out = torch.empty((x_c.shape[0], w.shape[0]), device=x.device, dtype=x.dtype)
+        preact = torch.empty_like(out)
+        _C.gemm_custom_native(x_c, w.contiguous(), out, b.contiguous(), preact)
+        ctx.save_for_backward(x_c, w, preact)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, w, preact = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        dz = torch.empty_like(grad_out)
+        db = torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
+        _linear_bwd_fused.gelu_bwd_bias(grad_out, preact, dz, db)
+        dw = torch.empty_like(w)
+        dx = torch.empty_like(x)
+        _linear_bwd_fused.dw_gemm(dz, x, dw)
+        _linear_bwd_fused.dx_gemm_native(dz, w.contiguous(), dx)
+        return dx, dw, db.to(grad_out.dtype)
+
+
+class TkLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        x_c = x.contiguous()
+        ctx.save_for_backward(x_c, w)
+        out = torch.empty((x_c.shape[0], w.shape[0]), device=x.device, dtype=x.dtype)
+        _C.gemm_linear_native(x_c, w.contiguous(), out, b.contiguous())
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, w = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        dw = torch.empty_like(w)
+        dx = torch.empty_like(x)
+        _linear_bwd_fused.dw_gemm(grad_out, x, dw)
+        _linear_bwd_fused.dx_gemm_native(grad_out, w.contiguous(), dx)
+        db = torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
+        _linear_bwd_fused.bias_reduce(grad_out, db)
+        return dx, dw, db.to(grad_out.dtype)
+
+
+class TkMlp(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.fc2 = nn.Linear(hidden_features, in_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1]).contiguous()
+        h = TkLinearGelu.apply(flat, self.fc1.weight, self.fc1.bias)
+        out = TkLinear.apply(h, self.fc2.weight, self.fc2.bias)
+        return out.reshape(shape)
+
+
 class PatchEmbed3D(nn.Module):
     def __init__(self, patch_size, in_channels, embed_dim):
         super().__init__()
@@ -139,7 +200,7 @@ class LabelEmbedder(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, fused_adaln_enabled=False, fused_residual_enabled=False, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, fused_adaln_enabled=False, fused_residual_enabled=False, tk_mlp_enabled=False, **block_kwargs):
         super().__init__()
         self.fused_adaln_enabled = fused_adaln_enabled
         self.fused_residual_enabled = fused_residual_enabled
@@ -147,11 +208,15 @@ class DiTBlock(nn.Module):
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=hidden_size,
-            hidden_features=mlp_hidden_dim,
-            act_layer=cast(type[nn.GELU], partial(nn.GELU, approximate="tanh")),
-            drop=0,
+        self.mlp = (
+            TkMlp(hidden_size, mlp_hidden_dim)
+            if tk_mlp_enabled
+            else Mlp(
+                in_features=hidden_size,
+                hidden_features=mlp_hidden_dim,
+                act_layer=cast(type[nn.GELU], partial(nn.GELU, approximate="tanh")),
+                drop=0,
+            )
         )
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
@@ -201,9 +266,9 @@ class DiT(nn.Module):
         use_class_condition=False,
         fused_adaln_enabled=False,
         fused_residual_enabled=False,
+        tk_mlp_enabled=False,
     ):
         super().__init__()
-        assert hidden_size % 3 == 0
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.patch_size = patch_size
@@ -212,7 +277,14 @@ class DiT(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob) if use_class_condition else None
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, fused_adaln_enabled=fused_adaln_enabled, fused_residual_enabled=fused_residual_enabled)
+            DiTBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                fused_adaln_enabled=fused_adaln_enabled,
+                fused_residual_enabled=fused_residual_enabled,
+                tk_mlp_enabled=tk_mlp_enabled,
+            )
             for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, fused_adaln_enabled=fused_adaln_enabled)
@@ -280,15 +352,18 @@ class DiT(nn.Module):
 
 
 def get_3d_sincos_pos_embed(embed_dim, grid_size_dhw):
-    assert embed_dim % 3 == 0
     d, h, w = grid_size_dhw
-    dim_each = embed_dim // 3
-    emb_d = get_1d_sincos_pos_embed_from_grid(dim_each, np.arange(d, dtype=np.float32))
-    emb_h = get_1d_sincos_pos_embed_from_grid(dim_each, np.arange(h, dtype=np.float32))
-    emb_w = get_1d_sincos_pos_embed_from_grid(dim_each, np.arange(w, dtype=np.float32))
-    emb_d = np.broadcast_to(emb_d[:, None, None, :], (d, h, w, dim_each)).copy()
-    emb_h = np.broadcast_to(emb_h[None, :, None, :], (d, h, w, dim_each)).copy()
-    emb_w = np.broadcast_to(emb_w[None, None, :, :], (d, h, w, dim_each)).copy()
+    dim_each = (embed_dim // 6) * 2
+    dims = [dim_each, dim_each, dim_each]
+    for i in range((embed_dim - sum(dims)) // 2):
+        dims[i % 3] += 2
+    assert sum(dims) == embed_dim and all(dim % 2 == 0 for dim in dims)
+    emb_d = get_1d_sincos_pos_embed_from_grid(dims[0], np.arange(d, dtype=np.float32))
+    emb_h = get_1d_sincos_pos_embed_from_grid(dims[1], np.arange(h, dtype=np.float32))
+    emb_w = get_1d_sincos_pos_embed_from_grid(dims[2], np.arange(w, dtype=np.float32))
+    emb_d = np.broadcast_to(emb_d[:, None, None, :], (d, h, w, dims[0])).copy()
+    emb_h = np.broadcast_to(emb_h[None, :, None, :], (d, h, w, dims[1])).copy()
+    emb_w = np.broadcast_to(emb_w[None, None, :, :], (d, h, w, dims[2])).copy()
     return np.concatenate([emb_d, emb_h, emb_w], axis=-1).reshape(d * h * w, embed_dim)
 
 
@@ -304,15 +379,20 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 def dit_config(name: str):
     configs = {
         "S": dict(depth=12, hidden_size=384, patch_size=1, num_heads=6, in_channels=4),
-        "L": dict(depth=24, hidden_size=1056, patch_size=1, num_heads=16, in_channels=32),
+        "L": dict(depth=24, hidden_size=1024, patch_size=1, num_heads=16, in_channels=32),
         "XL": dict(depth=28, hidden_size=1152, patch_size=1, num_heads=16, in_channels=4),
     }
     return configs[name]
 
 
-def make_model(name: str, fused: bool, fused_residual: bool = False) -> DiT:
+def make_model(name: str, fused: bool, fused_residual: bool = False, tk_mlp: bool = False) -> DiT:
     torch.manual_seed(123)
-    model = DiT(**dit_config(name), fused_adaln_enabled=fused, fused_residual_enabled=fused_residual).cuda().to(torch.bfloat16).train()
+    model = DiT(
+        **dit_config(name),
+        fused_adaln_enabled=fused,
+        fused_residual_enabled=fused_residual,
+        tk_mlp_enabled=tk_mlp,
+    ).cuda().to(torch.bfloat16).train()
     model.randomize_zero_init_layers()
     return model
 
@@ -367,17 +447,19 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
     groups = [make_group(batch, cfg["in_channels"], spatial, 50000 + i * 10) for i in range(groups_n)]
 
     print(f"\n3D DiT-{model_name}/1 E2E train: batch={batch} tokens={tokens} spatial={spatial} groups={groups_n}")
-    variants = [("eager", False, False, False)]
+    variants = [("eager", False, False, False, False)]
     if include_compile:
-        variants.append(("compile", False, False, True))
+        variants.append(("compile", False, False, False, True))
     variants.extend([
-        ("fused_adaln", True, False, False),
-        ("fused_adaln_residual", True, True, False),
+        ("tk_mlp", False, False, True, False),
+        ("fused_adaln", True, False, False, False),
+        ("fused_adaln_residual", True, True, False, False),
+        ("fused_adaln_residual_tk_mlp", True, True, True, False),
     ])
     results = []
-    for variant_name, fused, fused_residual, compiled in variants:
+    for variant_name, fused, fused_residual, tk_mlp, compiled in variants:
         print(f"  running {variant_name}...", flush=True)
-        model = make_model(model_name, fused=fused, fused_residual=fused_residual)
+        model = make_model(model_name, fused=fused, fused_residual=fused_residual, tk_mlp=tk_mlp)
         if compiled:
             model = torch.compile(model)
         try:
@@ -416,6 +498,14 @@ def probe_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
         memory_probe(model, group, f"DiT-{model_name} B{batch} {label} train")
         del model
         torch.cuda.empty_cache()
+    model = make_model(model_name, fused=False, fused_residual=False, tk_mlp=True)
+    memory_probe(model, group, f"DiT-{model_name} B{batch} tk_mlp train")
+    del model
+    torch.cuda.empty_cache()
+    model = make_model(model_name, fused=True, fused_residual=True, tk_mlp=True)
+    memory_probe(model, group, f"DiT-{model_name} B{batch} fused_adaln_residual_tk_mlp train")
+    del model
+    torch.cuda.empty_cache()
     if include_compile:
         model = torch.compile(make_model(model_name, fused=False))
         memory_probe(model, group, f"DiT-{model_name} B{batch} compile train")

@@ -1273,14 +1273,27 @@ def benchmark_b1024_tokens_suite() -> list[BenchResult]:
     return results
 
 
-def benchmark_mlp_suite() -> list[BenchResult]:
+def benchmark_mlp_suite(tokens_filter: int | None = None) -> list[BenchResult]:
     print(
         "\nMLP-only benchmark recipe: uniform BF16 inputs, natural L2 eviction via input groups, "
         "500 warmups, 100 measured back-to-back launches, two CUDA events, cooldown between kernels."
     )
-    results = benchmark_mlp_branch_case(4, 1024, 1024, 1e-6, "L-D1024-base")
-    for batch in (4, 16, 64, 256, 1024):
-        results.extend(benchmark_mlp_branch_case(batch, 16, 1024, 1e-6, f"L-D1024-batch{batch}"))
+    results = []
+    token_cases = (tokens_filter,) if tokens_filter is not None else (256, 512, 1024, 2048, 4096, 8192, 16384)
+    for tokens in token_cases:
+        for batch in (1, 2, 4, 8, 16, 32, 64, 128):
+            label = f"L-D1024-B{batch}-T{tokens}"
+            try:
+                results.extend(benchmark_mlp_branch_case(batch, tokens, 1024, 1e-6, label))
+            except torch.cuda.OutOfMemoryError as exc:
+                print(f"\n{label}: SKIP OOM ({exc})")
+                torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    print(f"\n{label}: SKIP OOM ({exc})")
+                    torch.cuda.empty_cache()
+                else:
+                    raise
     return results
 
 
@@ -1309,7 +1322,11 @@ def write_report(path: Path, ok: bool, results: list[BenchResult]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["test", "bench", "all", "block", "mlp", "big_adaln", "compile", "residual_sweep", "long_batch", "b1024_tokens"], nargs="?", default="all")
+    parser.add_argument("mode", choices=[
+        "test", "bench", "all", "block", "mlp", "mlp_t256", "mlp_t512", "mlp_t1024",
+        "mlp_t2048", "mlp_t4096", "mlp_t8192", "mlp_t16384", "big_adaln",
+        "compile", "residual_sweep", "long_batch", "b1024_tokens"
+    ], nargs="?", default="all")
     parser.add_argument("--report", type=Path, default=None)
     args = parser.parse_args()
 
@@ -1318,10 +1335,11 @@ def main() -> None:
     if args.mode == "block":
         ok = run_block_tests()
         results = benchmark_block_suite()
-    elif args.mode == "mlp":
+    elif args.mode.startswith("mlp"):
         ok = mlp_branch_correctness(4, 128, 1024, 1e-6)
         ok = mlp_branch_correctness(64, 16, 1024, 1e-6) and ok
-        results = benchmark_mlp_suite()
+        token_filter = int(args.mode.split("_t", 1)[1]) if "_t" in args.mode else None
+        results = benchmark_mlp_suite(token_filter)
     elif args.mode == "big_adaln":
         results = benchmark_big_adaln_suite()
     elif args.mode == "compile":
