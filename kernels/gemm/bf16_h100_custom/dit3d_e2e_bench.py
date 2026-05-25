@@ -1082,6 +1082,11 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
         ("fused_input_proj_tk_mlp", True, True, True, True, False, "timm", False),
         ("fused_input_output_proj_tk_mlp", True, True, True, True, True, "timm", False),
     ])
+    if include_compile:
+        variants.extend([
+            ("compile_fused_adaln_residual", True, True, False, False, False, "timm", True),
+            ("compile_fused_adaln_residual_tk_mlp", True, True, True, False, False, "timm", True),
+        ])
     if include_fa3:
         variants.extend([
             ("fa3_attn", False, False, False, False, False, "fa3", False),
