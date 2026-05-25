@@ -17,6 +17,33 @@ import _linear_bwd_fused
 from tk_bench import input_group_count, profile_groups, print_bench, uniform_bf16
 
 
+_FLASH_ATTN3_FUNC = None
+
+
+def flash_attn3_func():
+    global _FLASH_ATTN3_FUNC
+    if _FLASH_ATTN3_FUNC is not None:
+        return _FLASH_ATTN3_FUNC
+    try:
+        import flash_attn_interface
+
+        _FLASH_ATTN3_FUNC = flash_attn_interface.flash_attn_func
+        return _FLASH_ATTN3_FUNC
+    except ImportError:
+        pass
+    try:
+        from kernels import get_kernel
+
+        fa3_module = get_kernel("kernels-community/flash-attn3", version=1)
+        _FLASH_ATTN3_FUNC = fa3_module.flash_attn_func
+        return _FLASH_ATTN3_FUNC
+    except Exception as exc:
+        raise RuntimeError(
+            "FlashAttention-3 is unavailable. Install Dao-AILab flash-attention hopper package "
+            "or the Hugging Face kernels package with kernels-community/flash-attn3."
+        ) from exc
+
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -141,6 +168,24 @@ class TkMlp(nn.Module):
         return out.reshape(shape)
 
 
+class FlashAttention3(nn.Module):
+    def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, dim = x.shape
+        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
+        return self.proj(out.reshape(batch, tokens, dim))
+
+
 class PatchEmbed3D(nn.Module):
     def __init__(self, patch_size, in_channels, embed_dim):
         super().__init__()
@@ -200,12 +245,27 @@ class LabelEmbedder(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, fused_adaln_enabled=False, fused_residual_enabled=False, tk_mlp_enabled=False, **block_kwargs):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        mlp_ratio=4.0,
+        fused_adaln_enabled=False,
+        fused_residual_enabled=False,
+        tk_mlp_enabled=False,
+        attention_backend="timm",
+        **block_kwargs,
+    ):
         super().__init__()
         self.fused_adaln_enabled = fused_adaln_enabled
         self.fused_residual_enabled = fused_residual_enabled
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        if attention_backend == "fa3":
+            self.attn = FlashAttention3(hidden_size, num_heads=num_heads, qkv_bias=True)
+        elif attention_backend == "timm":
+            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        else:
+            raise ValueError(f"unknown attention backend: {attention_backend}")
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = (
@@ -267,6 +327,7 @@ class DiT(nn.Module):
         fused_adaln_enabled=False,
         fused_residual_enabled=False,
         tk_mlp_enabled=False,
+        attention_backend="timm",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -284,6 +345,7 @@ class DiT(nn.Module):
                 fused_adaln_enabled=fused_adaln_enabled,
                 fused_residual_enabled=fused_residual_enabled,
                 tk_mlp_enabled=tk_mlp_enabled,
+                attention_backend=attention_backend,
             )
             for _ in range(depth)
         ])
@@ -385,13 +447,14 @@ def dit_config(name: str):
     return configs[name]
 
 
-def make_model(name: str, fused: bool, fused_residual: bool = False, tk_mlp: bool = False) -> DiT:
+def make_model(name: str, fused: bool, fused_residual: bool = False, tk_mlp: bool = False, attention_backend: str = "timm") -> DiT:
     torch.manual_seed(123)
     model = DiT(
         **dit_config(name),
         fused_adaln_enabled=fused,
         fused_residual_enabled=fused_residual,
         tk_mlp_enabled=tk_mlp,
+        attention_backend=attention_backend,
     ).cuda().to(torch.bfloat16).train()
     model.randomize_zero_init_layers()
     return model
@@ -439,7 +502,7 @@ def train_step_grad(model: nn.Module, x: torch.Tensor, t: torch.Tensor, grad: to
     return grads
 
 
-def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], include_compile: bool, warmup: int, iters: int):
+def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], include_compile: bool, warmup: int, iters: int, include_fa3: bool):
     cfg = dit_config(model_name)
     tokens = spatial[0] * spatial[1] * spatial[2]
     input_bytes = batch * cfg["in_channels"] * tokens * 2
@@ -447,19 +510,25 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
     groups = [make_group(batch, cfg["in_channels"], spatial, 50000 + i * 10) for i in range(groups_n)]
 
     print(f"\n3D DiT-{model_name}/1 E2E train: batch={batch} tokens={tokens} spatial={spatial} groups={groups_n}")
-    variants = [("eager", False, False, False, False)]
+    variants = [("eager", False, False, False, "timm", False)]
     if include_compile:
-        variants.append(("compile", False, False, False, True))
+        variants.append(("compile", False, False, False, "timm", True))
     variants.extend([
-        ("tk_mlp", False, False, True, False),
-        ("fused_adaln", True, False, False, False),
-        ("fused_adaln_residual", True, True, False, False),
-        ("fused_adaln_residual_tk_mlp", True, True, True, False),
+        ("tk_mlp", False, False, True, "timm", False),
+        ("fused_adaln", True, False, False, "timm", False),
+        ("fused_adaln_residual", True, True, False, "timm", False),
+        ("fused_adaln_residual_tk_mlp", True, True, True, "timm", False),
     ])
+    if include_fa3:
+        variants.extend([
+            ("fa3_attn", False, False, False, "fa3", False),
+            ("fused_adaln_residual_fa3", True, True, False, "fa3", False),
+            ("fused_adaln_residual_fa3_tk_mlp", True, True, True, "fa3", False),
+        ])
     results = []
-    for variant_name, fused, fused_residual, tk_mlp, compiled in variants:
+    for variant_name, fused, fused_residual, tk_mlp, attention_backend, compiled in variants:
         print(f"  running {variant_name}...", flush=True)
-        model = make_model(model_name, fused=fused, fused_residual=fused_residual, tk_mlp=tk_mlp)
+        model = make_model(model_name, fused=fused, fused_residual=fused_residual, tk_mlp=tk_mlp, attention_backend=attention_backend)
         if compiled:
             model = torch.compile(model)
         try:
@@ -484,7 +553,7 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
     return results
 
 
-def probe_case(model_name: str, batch: int, spatial: tuple[int, int, int], include_compile: bool = False):
+def probe_case(model_name: str, batch: int, spatial: tuple[int, int, int], include_compile: bool = False, include_fa3: bool = False):
     cfg = dit_config(model_name)
     tokens = spatial[0] * spatial[1] * spatial[2]
     print(f"\n3D DiT-{model_name}/1 memory probe: batch={batch} tokens={tokens} spatial={spatial}")
@@ -506,6 +575,15 @@ def probe_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
     memory_probe(model, group, f"DiT-{model_name} B{batch} fused_adaln_residual_tk_mlp train")
     del model
     torch.cuda.empty_cache()
+    if include_fa3:
+        model = make_model(model_name, fused=False, attention_backend="fa3")
+        memory_probe(model, group, f"DiT-{model_name} B{batch} fa3_attn train")
+        del model
+        torch.cuda.empty_cache()
+        model = make_model(model_name, fused=True, fused_residual=True, attention_backend="fa3")
+        memory_probe(model, group, f"DiT-{model_name} B{batch} fused_adaln_residual_fa3 train")
+        del model
+        torch.cuda.empty_cache()
     if include_compile:
         model = torch.compile(make_model(model_name, fused=False))
         memory_probe(model, group, f"DiT-{model_name} B{batch} compile train")
@@ -554,6 +632,7 @@ def main():
     parser.add_argument("--tokens", nargs="+", type=int, default=None, help="Token counts to benchmark. Arbitrary counts are mapped to an exact-product 3D shape.")
     parser.add_argument("--sweep", action="store_true", help="Run every token count in --tokens for every batch in --batches.")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--fa3", action="store_true", help="Include FlashAttention-3 attention variants.")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--probe-memory", action="store_true")
@@ -580,9 +659,9 @@ def main():
     for batch, spatial, tokens in cases:
         try:
             if args.probe_memory:
-                probe_case(args.model, batch, spatial, args.compile)
+                probe_case(args.model, batch, spatial, args.compile, args.fa3)
             else:
-                all_results.extend(bench_case(args.model, batch, spatial, args.compile, args.warmup, args.iters))
+                all_results.extend(bench_case(args.model, batch, spatial, args.compile, args.warmup, args.iters, args.fa3))
         except torch.cuda.OutOfMemoryError as exc:
             print(f"\nDiT-{args.model} B{batch} T{tokens}: SKIP OOM ({exc})")
         except RuntimeError as exc:

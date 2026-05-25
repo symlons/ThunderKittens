@@ -56,6 +56,7 @@ def command_from_args(args: argparse.Namespace) -> list[str]:
         spatial=tuple(args.spatial) if args.spatial is not None else None,
         sweep=args.sweep,
         compile_model=args.compile,
+        fa3=args.fa3,
         probe_memory=args.probe_memory,
         warmup=args.warmup,
         iters=args.iters,
@@ -72,6 +73,7 @@ def main() -> None:
     parser.add_argument("--spatial", nargs=3, type=int, default=None, metavar=("D", "H", "W"), help="Explicit 3D spatial shape for a single full-DiT case.")
     parser.add_argument("--sweep", action="store_true", help="Run all token/batch combinations in guided full-DiT mode.")
     parser.add_argument("--compile", action="store_true", help="Include plain torch.compile(model) in guided full-DiT runs.")
+    parser.add_argument("--fa3", action="store_true", help="Include FlashAttention-3 attention variants in guided full-DiT runs.")
     parser.add_argument("--probe-memory", action="store_true", help="Run memory probe instead of timing in guided full-DiT mode.")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations for guided full-DiT runs.")
     parser.add_argument("--iters", type=int, default=5, help="Measured iterations for guided full-DiT runs.")

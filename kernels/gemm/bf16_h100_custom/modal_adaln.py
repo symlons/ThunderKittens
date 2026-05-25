@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import modal
+
+sys.path.insert(0, "/ThunderKittens/kernels/gemm/bf16_h100_custom")
 
 from adaln_profile_modes import command_for_mode, dit_command
 
@@ -20,9 +23,30 @@ app = modal.App(APP_NAME)
 
 image = (
     modal.Image.from_registry("pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
-    .apt_install("make", "ninja-build")
-    .pip_install("pybind11", "kernels", "timm")
+    .apt_install("git", "make", "ninja-build")
+    .pip_install("packaging", "psutil", "pybind11", "kernels", "timm")
     .add_local_dir(local_path=str(DEFAULT_LOCAL_TK_ROOT), remote_path=THUNDERKITTENS_ROOT, copy=True)
+    .run_commands(
+        "git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && "
+        "cd /tmp/flash-attention/hopper && "
+        "FLASH_ATTENTION_DISABLE_SM80=TRUE "
+        "FLASH_ATTENTION_DISABLE_FP16=TRUE "
+        "FLASH_ATTENTION_DISABLE_FP8=TRUE "
+        "FLASH_ATTENTION_DISABLE_VARLEN=TRUE "
+        "FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE "
+        "FLASH_ATTENTION_DISABLE_APPENDKV=TRUE "
+        "FLASH_ATTENTION_DISABLE_LOCAL=TRUE "
+        "FLASH_ATTENTION_DISABLE_SOFTCAP=TRUE "
+        "FLASH_ATTENTION_DISABLE_PACKGQA=TRUE "
+        "FLASH_ATTENTION_DISABLE_SPLIT=TRUE "
+        "FLASH_ATTENTION_DISABLE_HDIM96=TRUE "
+        "FLASH_ATTENTION_DISABLE_HDIM128=TRUE "
+        "FLASH_ATTENTION_DISABLE_HDIM192=TRUE "
+        "FLASH_ATTENTION_DISABLE_HDIM256=TRUE "
+        "FLASH_ATTENTION_DISABLE_HDIMDIFF64=TRUE "
+        "FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE "
+        "MAX_JOBS=2 NVCC_THREADS=1 python setup.py install"
+    )
     .run_commands(
         "cd /ThunderKittens/kernels/gemm/bf16_h100_custom && "
         "make clean && "
@@ -76,6 +100,7 @@ def main(
     spatial: str = "",
     sweep: bool = False,
     compile: bool = False,
+    fa3: bool = False,
     probe_memory: bool = False,
     warmup: int = 5,
     iters: int = 5,
@@ -93,6 +118,7 @@ def main(
             spatial=tuple(spatial_values) if spatial_values else None,
             sweep=sweep,
             compile_model=compile,
+            fa3=fa3,
             probe_memory=probe_memory,
             warmup=warmup,
             iters=iters,

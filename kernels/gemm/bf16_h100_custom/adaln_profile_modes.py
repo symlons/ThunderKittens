@@ -24,6 +24,7 @@ def dit_command(
     spatial: tuple[int, int, int] | None = None,
     sweep: bool = False,
     compile_model: bool = False,
+    fa3: bool = False,
     probe_memory: bool = False,
     warmup: int = 5,
     iters: int = 5,
@@ -40,6 +41,8 @@ def dit_command(
     command.extend(["--warmup", str(warmup), "--iters", str(iters)])
     if compile_model:
         command.append("--compile")
+    if fa3:
+        command.append("--fa3")
     if probe_memory:
         command.append("--probe-memory")
     return command
@@ -98,5 +101,7 @@ def command_for_mode(mode: str) -> list[str]:
             ])
         if "compile" in parts:
             command.append("--compile")
+        if "fa3" in parts:
+            command.append("--fa3")
         return command
     return ["python3", "harness.py", mode, "--report", "KERNEL_REPORT.md"]
