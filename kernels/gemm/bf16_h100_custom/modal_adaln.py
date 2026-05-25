@@ -79,12 +79,12 @@ def run_profile(mode: str, command: list[str] | None = None) -> str:
     return run_checked(command or command_for_mode(mode), cwd=KERNEL_DIR)
 
 
-@app.function(gpu="H100", image=image, timeout=60 * 8)
+@app.function(gpu="H100", image=image, timeout=60 * 15)
 def test_and_profile_h100(mode: str = "block", command: list[str] | None = None) -> str:
     return run_profile(mode, command)
 
 
-@app.function(gpu="H200", image=image, timeout=60 * 8)
+@app.function(gpu="H200", image=image, timeout=60 * 15)
 def test_and_profile_h200(mode: str = "block", command: list[str] | None = None) -> str:
     return run_profile(mode, command)
 
@@ -104,6 +104,9 @@ def main(
     probe_memory: bool = False,
     warmup: int = 5,
     iters: int = 5,
+    variants: str = "",
+    profile_variant: str = "",
+    profile_rows: int = 30,
 ) -> None:
     def parse_ints(value: str) -> list[int]:
         return [int(part) for part in value.replace(",", " ").split() if part]
@@ -122,6 +125,9 @@ def main(
             probe_memory=probe_memory,
             warmup=warmup,
             iters=iters,
+            variants=[part for part in variants.replace(",", " ").split() if part] or None,
+            profile_variant=profile_variant,
+            profile_rows=profile_rows,
         )
     if gpu.upper() == "H200":
         test_and_profile_h200.remote(mode, command)

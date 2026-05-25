@@ -28,6 +28,9 @@ def dit_command(
     probe_memory: bool = False,
     warmup: int = 5,
     iters: int = 5,
+    variants: list[str] | None = None,
+    profile_variant: str = "",
+    profile_rows: int = 30,
 ) -> list[str]:
     command = ["python3", "dit3d_e2e_bench.py", "--model", model.upper()]
     if sweep or tokens:
@@ -45,6 +48,10 @@ def dit_command(
         command.append("--fa3")
     if probe_memory:
         command.append("--probe-memory")
+    if variants:
+        command.extend(["--variants", *variants])
+    if profile_variant:
+        command.extend(["--profile-variant", profile_variant, "--profile-rows", str(profile_rows)])
     return command
 
 

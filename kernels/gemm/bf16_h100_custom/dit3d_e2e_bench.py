@@ -953,6 +953,26 @@ def make_model(
     return model
 
 
+def variant_config(variant_name: str):
+    variants = {
+        "eager": (False, False, False, False, False, "timm", False),
+        "compile": (False, False, False, False, False, "timm", True),
+        "fused_adaln_residual": (True, True, False, False, False, "timm", False),
+        "compile_fused_adaln_residual": (True, True, False, False, False, "timm", True),
+        "fused_adaln_residual_tk_mlp": (True, True, True, False, False, "timm", False),
+        "compile_fused_adaln_residual_tk_mlp": (True, True, True, False, False, "timm", True),
+        "fa3_attn": (False, False, False, False, False, "fa3", False),
+        "compile_fa3_attn": (False, False, False, False, False, "fa3", True),
+        "fused_adaln_residual_fa3": (True, True, False, False, False, "fa3", False),
+        "compile_fused_adaln_residual_fa3": (True, True, False, False, False, "fa3", True),
+        "fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, "fa3", False),
+        "compile_fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, "fa3", True),
+    }
+    if variant_name not in variants:
+        raise ValueError(f"unknown profile variant: {variant_name}")
+    return variants[variant_name]
+
+
 def clone_state(dst: nn.Module, src: nn.Module) -> None:
     dst.load_state_dict(src.state_dict(), strict=False)
 
@@ -993,6 +1013,41 @@ def train_step_grad(model: nn.Module, x: torch.Tensor, t: torch.Tensor, grad: to
     out = model(x, t)
     grads = torch.autograd.grad(out, (x, *params), grad, allow_unused=True)
     return grads
+
+
+def profile_variant_case(
+    model_name: str,
+    variant_name: str,
+    batch: int,
+    spatial: tuple[int, int, int],
+    warmup: int,
+    iters: int,
+    rows: int,
+) -> None:
+    fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, attention_backend, compiled = variant_config(variant_name)
+    model = make_model(
+        model_name,
+        fused=fused,
+        fused_residual=fused_residual,
+        tk_mlp=tk_mlp,
+        fused_input_projection=fused_input_projection,
+        fused_output_projection=fused_output_projection,
+        attention_backend=attention_backend,
+    )
+    if compiled:
+        model = torch.compile(model)
+    group = make_group(batch, dit_config(model_name)["in_channels"], spatial, 77000)
+    for _ in range(warmup):
+        train_step(model, group)
+    torch.cuda.synchronize()
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
+        for _ in range(iters):
+            train_step(model, group)
+    torch.cuda.synchronize()
+    tokens = spatial[0] * spatial[1] * spatial[2]
+    print(f"\nTorch profiler DiT-{model_name} {variant_name} B{batch} T{tokens} warmup={warmup} iters={iters}")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=rows))
 
 
 def check_close(name: str, actual: torch.Tensor, expected: torch.Tensor, atol: float = 1.2e-1, rtol: float = 1.2e-1) -> bool:
@@ -1165,7 +1220,16 @@ def bench_residual(tokens_list: list[int], batches: list[int], dim: int, warmup:
             print(f"  speedup: {torch_result.us / fused_result.us:.2f}x")
 
 
-def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], include_compile: bool, warmup: int, iters: int, include_fa3: bool):
+def bench_case(
+    model_name: str,
+    batch: int,
+    spatial: tuple[int, int, int],
+    include_compile: bool,
+    warmup: int,
+    iters: int,
+    include_fa3: bool,
+    only_variants: set[str] | None = None,
+):
     cfg = dit_config(model_name)
     tokens = spatial[0] * spatial[1] * spatial[2]
     input_bytes = batch * cfg["in_channels"] * tokens * 2
@@ -1189,7 +1253,9 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
     ])
     if include_compile:
         variants.extend([
+            ("compile_fused_adaln", True, False, False, False, False, "timm", True),
             ("compile_fused_adaln_residual", True, True, False, False, False, "timm", True),
+            ("compile_fused_adaln_tk_mlp", True, False, True, False, False, "timm", True),
             ("compile_fused_adaln_residual_tk_mlp", True, True, True, False, False, "timm", True),
         ])
     if include_fa3:
@@ -1203,6 +1269,17 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
             ("fused_input_proj_fa3_tk_mlp", True, True, True, True, False, "fa3", False),
             ("fused_input_output_proj_fa3_tk_mlp", True, True, True, True, True, "fa3", False),
         ])
+        if include_compile:
+            variants.extend([
+                ("compile_fa3_attn", False, False, False, False, False, "fa3", True),
+                ("compile_fused_adaln_residual_fa3", True, True, False, False, False, "fa3", True),
+                ("compile_fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, "fa3", True),
+            ])
+    if only_variants:
+        missing = only_variants.difference(name for name, *_ in variants)
+        if missing:
+            raise ValueError(f"unknown variants: {sorted(missing)}")
+        variants = [variant for variant in variants if variant[0] in only_variants]
     results = []
     for variant_name, fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, attention_backend, compiled in variants:
         print(f"  running {variant_name}...", flush=True)
@@ -1226,13 +1303,12 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
                 iters=iters,
             )
             results.append(result)
+            print_bench(result)
         except torch.cuda.OutOfMemoryError as exc:
             print(f"DiT-{model_name} B{batch} {variant_name} train: SKIP OOM ({exc})", flush=True)
         finally:
             del model
             torch.cuda.empty_cache()
-    for result in results:
-        print_bench(result)
     if results:
         base = results[0].us
         print("  speedup: " + ", ".join(f"{r.name} {base / r.us:.2f}x" for r in results[1:]))
@@ -1319,6 +1395,9 @@ def main():
     parser.add_argument("--sweep", action="store_true", help="Run every token count in --tokens for every batch in --batches.")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--fa3", action="store_true", help="Include FlashAttention-3 attention variants.")
+    parser.add_argument("--variants", nargs="+", default=None, help="Only run the named benchmark variants.")
+    parser.add_argument("--profile-variant", default="", help="Run torch profiler for one named variant and exit.")
+    parser.add_argument("--profile-rows", type=int, default=30)
     parser.add_argument("--check-fused-input", action="store_true", help="Run isolated LN+AdaLN+projection correctness checks and exit.")
     parser.add_argument("--bench-residual", action="store_true", help="Run isolated standalone gated residual forward+backward benchmarks and exit.")
     parser.add_argument("--hidden-dim", type=int, default=1024, help="Hidden dimension for isolated residual benchmark.")
@@ -1341,6 +1420,10 @@ def main():
     if args.bench_residual:
         bench_residual(args.tokens or [1024], args.batches, args.hidden_dim, args.warmup, args.iters)
         return
+    if args.profile_variant:
+        spatial = spatial_for_tokens(args.tokens[0]) if args.tokens else tuple(args.spatial)
+        profile_variant_case(args.model, args.profile_variant, args.batches[0], spatial, args.warmup, args.iters, args.profile_rows)
+        return
     all_results = []
     cases = []
     if args.sweep or args.tokens is not None:
@@ -1357,7 +1440,16 @@ def main():
             if args.probe_memory:
                 probe_case(args.model, batch, spatial, args.compile, args.fa3)
             else:
-                all_results.extend(bench_case(args.model, batch, spatial, args.compile, args.warmup, args.iters, args.fa3))
+                all_results.extend(bench_case(
+                    args.model,
+                    batch,
+                    spatial,
+                    args.compile,
+                    args.warmup,
+                    args.iters,
+                    args.fa3,
+                    set(args.variants) if args.variants else None,
+                ))
         except torch.cuda.OutOfMemoryError as exc:
             print(f"\nDiT-{args.model} B{batch} T{tokens}: SKIP OOM ({exc})")
         except RuntimeError as exc:
