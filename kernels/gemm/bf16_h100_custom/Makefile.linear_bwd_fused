@@ -1,6 +1,7 @@
 BUILD_MODE ?= cuda
 
 GPU := H100
+ARCH := SM90
 SRC := linear_bwd_fused.cu
 
 ifeq ($(BUILD_MODE),torch)
