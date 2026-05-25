@@ -183,6 +183,7 @@ __device__ static inline void apply_ln_adaln_modulation(
 template<ducks::st::all ST>
 __device__ static inline void apply_gated_residual_epilogue(
     ST &tile,
+    bf16 *__restrict__ projected_out,
     const bf16 *__restrict__ residual,
     const bf16 *__restrict__ gate,
     int row_tile,
@@ -199,6 +200,7 @@ __device__ static inline void apply_gated_residual_epilogue(
         int batch = global_row / tokens_per_sample;
         size_t idx = size_t(global_row) * N + global_col;
         float projected = __bfloat162float(tile[{row, col}]);
+        projected_out[idx] = tile[{row, col}];
         float base = __bfloat162float(residual[idx]);
         float g = __bfloat162float(gate[batch * N + global_col]);
         tile[{row, col}] = __float2bfloat16(base + g * projected);
@@ -519,6 +521,37 @@ __global__ void gated_residual_forward_kernel(
     }
 }
 
+__global__ void gated_residual_forward_vec2_kernel(
+    bf16 *__restrict__ out,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ h,
+    const bf16 *__restrict__ gate,
+    int M,
+    int K,
+    int tokens_per_sample
+) {
+    using bf16_2 = __nv_bfloat162;
+    size_t pair_idx = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    size_t total_pairs = size_t(M) * K / 2;
+    const bf16_2 *__restrict__ x2 = reinterpret_cast<const bf16_2*>(x);
+    const bf16_2 *__restrict__ h2 = reinterpret_cast<const bf16_2*>(h);
+    const bf16_2 *__restrict__ gate2 = reinterpret_cast<const bf16_2*>(gate);
+    bf16_2 *__restrict__ out2 = reinterpret_cast<bf16_2*>(out);
+    int K2 = K / 2;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        size_t p = pair_idx + j;
+        if (p >= total_pairs) return;
+        int row = p / K2;
+        int col_pair = p - size_t(row) * K2;
+        int batch = row / tokens_per_sample;
+        float2 xv = __bfloat1622float2(x2[p]);
+        float2 hv = __bfloat1622float2(h2[p]);
+        float2 gv = __bfloat1622float2(gate2[size_t(batch) * K2 + col_pair]);
+        out2[p] = __floats2bfloat162_rn(xv.x + gv.x * hv.x, xv.y + gv.y * hv.y);
+    }
+}
+
 __global__ void gated_residual_backward_kernel(
     bf16 *__restrict__ dx,
     bf16 *__restrict__ dh,
@@ -547,6 +580,50 @@ __global__ void gated_residual_backward_kernel(
             float go = __bfloat162float(grad[idx]);
             float hv = __bfloat162float(h[idx]);
             dx[idx] = __float2bfloat16(go);
+            dh[idx] = __float2bfloat16(go * gv);
+            acc += go * hv;
+        }
+    }
+
+    gate_sums[ty][threadIdx.x] = acc;
+    __syncthreads();
+
+    if (ty == 0 && col < K) {
+        float dg = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TOK_THREADS; i++) {
+            dg += gate_sums[i][threadIdx.x];
+        }
+        dgate[batch * K + col] = dg;
+    }
+}
+
+__global__ void gated_residual_backward_no_dx_kernel(
+    bf16 *__restrict__ dh,
+    float *__restrict__ dgate,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ h,
+    const bf16 *__restrict__ gate,
+    int K,
+    int tokens_per_sample
+) {
+    constexpr int COLS = 16;
+    constexpr int TOK_THREADS = 16;
+    __shared__ float gate_sums[TOK_THREADS][COLS];
+
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int batch = blockIdx.y;
+    int ty = threadIdx.y;
+
+    float acc = 0.0f;
+    if (col < K) {
+        float gv = __bfloat162float(gate[batch * K + col]);
+        int row_base = batch * tokens_per_sample;
+        for (int tok = ty; tok < tokens_per_sample; tok += TOK_THREADS) {
+            int row = row_base + tok;
+            size_t idx = size_t(row) * K + col;
+            float go = __bfloat162float(grad[idx]);
+            float hv = __bfloat162float(h[idx]);
             dh[idx] = __float2bfloat16(go * gv);
             acc += go * hv;
         }
@@ -890,14 +967,9 @@ struct gated_linear_template {
         __device__ static void finish(consumer_finish_args<layout> args) {
             warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
             warpgroup::sync(warpgroup::groupid() + 4);
-            if (warpgroup::elect_leader()) {
-                for (int i = 0; i < N_BLOCK; i++)
-                    tma::store_async(args.globals.preact, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
-                tma::store_async_read_wait();
-            }
-            warpgroup::sync(warpgroup::groupid() + 4);
             apply_gated_residual_epilogue(
                 reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]),
+                reinterpret_cast<bf16*>(args.globals.preact.raw_ptr),
                 reinterpret_cast<const bf16*>(args.globals.residual.raw_ptr),
                 args.globals.gate,
                 args.common.coord.x,
@@ -1528,15 +1600,28 @@ void gated_residual_entrypoint(
     int threads = 256;
     int blocks = (total + threads * 4 - 1) / (threads * 4);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    gated_residual_forward_kernel<<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<bf16*>(out.data_ptr()),
-        reinterpret_cast<const bf16*>(x.data_ptr()),
-        reinterpret_cast<const bf16*>(h.data_ptr()),
-        reinterpret_cast<const bf16*>(gate.data_ptr()),
-        M,
-        K,
-        static_cast<int>(tokens_per_sample)
-    );
+    if ((K % 2) == 0) {
+        int pair_blocks = (size_t(M) * K / 2 + threads * 4 - 1) / (threads * 4);
+        gated_residual_forward_vec2_kernel<<<pair_blocks, threads, 0, stream>>>(
+            reinterpret_cast<bf16*>(out.data_ptr()),
+            reinterpret_cast<const bf16*>(x.data_ptr()),
+            reinterpret_cast<const bf16*>(h.data_ptr()),
+            reinterpret_cast<const bf16*>(gate.data_ptr()),
+            M,
+            K,
+            static_cast<int>(tokens_per_sample)
+        );
+    } else {
+        gated_residual_forward_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<bf16*>(out.data_ptr()),
+            reinterpret_cast<const bf16*>(x.data_ptr()),
+            reinterpret_cast<const bf16*>(h.data_ptr()),
+            reinterpret_cast<const bf16*>(gate.data_ptr()),
+            M,
+            K,
+            static_cast<int>(tokens_per_sample)
+        );
+    }
 }
 
 void gated_residual_backward_entrypoint(
@@ -1572,6 +1657,46 @@ void gated_residual_backward_entrypoint(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     gated_residual_backward_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<bf16*>(dx.data_ptr()),
+        reinterpret_cast<bf16*>(dh.data_ptr()),
+        reinterpret_cast<float*>(dgate.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(h.data_ptr()),
+        reinterpret_cast<const bf16*>(gate.data_ptr()),
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
+void gated_residual_backward_no_dx_entrypoint(
+    const at::Tensor &grad,
+    const at::Tensor &h,
+    const at::Tensor &gate,
+    const at::Tensor &dh,
+    const at::Tensor &dgate,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(grad, h, gate, dh, dgate);
+    TORCH_CHECK(grad.dtype() == torch::kBFloat16 && h.dtype() == torch::kBFloat16);
+    TORCH_CHECK(gate.dtype() == torch::kBFloat16 && dh.dtype() == torch::kBFloat16);
+    TORCH_CHECK(dgate.dtype() == torch::kFloat32);
+    TORCH_CHECK(grad.is_contiguous() && h.is_contiguous() && gate.is_contiguous());
+    TORCH_CHECK(dh.is_contiguous() && dgate.is_contiguous());
+    TORCH_CHECK(grad.dim() == 2 && h.dim() == 2 && dh.dim() == 2 && gate.dim() == 2 && dgate.dim() == 2);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = grad.size(0);
+    int K = grad.size(1);
+    int batch = gate.size(0);
+    TORCH_CHECK(h.size(0) == M && h.size(1) == K);
+    TORCH_CHECK(dh.size(0) == M && dh.size(1) == K);
+    TORCH_CHECK(gate.size(1) == K);
+    TORCH_CHECK(dgate.size(0) == batch && dgate.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, batch);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    gated_residual_backward_no_dx_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<bf16*>(dh.data_ptr()),
         reinterpret_cast<float*>(dgate.data_ptr()),
         reinterpret_cast<const bf16*>(grad.data_ptr()),
@@ -1853,6 +1978,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("adaln_modulate_backward", &adaln_modulate_backward_entrypoint);
     m.def("gated_residual", &gated_residual_entrypoint);
     m.def("gated_residual_backward", &gated_residual_backward_entrypoint);
+    m.def("gated_residual_backward_no_dx", &gated_residual_backward_no_dx_entrypoint);
     m.def("layernorm_adaln", &layernorm_adaln_entrypoint);
     m.def("layernorm_stats", &layernorm_stats_entrypoint);
     m.def("layernorm_adaln_backward", &layernorm_adaln_backward_entrypoint);

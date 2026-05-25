@@ -240,11 +240,10 @@ class FusedGatedResidual(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):
         h, gate = ctx.saved_tensors
         grad = grad_out.reshape_as(h).contiguous()
-        dx = torch.empty_like(grad)
         dh = torch.empty_like(grad)
         dgate = torch.empty_like(gate, dtype=torch.float32)
-        _C.gated_residual_backward(grad, h, gate, dx, dh, dgate, ctx.tokens)
-        return dx.reshape(ctx.shape), dh.reshape(ctx.shape), dgate.to(gate.dtype)
+        _C.gated_residual_backward_no_dx(grad, h, gate, dh, dgate, ctx.tokens)
+        return grad_out, dh.reshape(ctx.shape), dgate.to(gate.dtype)
 
 
 def gated_residual(x: torch.Tensor, h: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -279,13 +278,10 @@ class FusedLinearGatedResidual(torch.autograd.Function):
         dprojected = torch.empty_like(grad)
         dgate = torch.empty_like(gate, dtype=torch.float32)
         _C.gated_residual_backward(grad, projected, gate, dresidual, dprojected, dgate, ctx.tokens)
-        dw = torch.empty_like(w)
-        dx = torch.empty_like(x)
-        db = torch.empty((grad.shape[1],), device=grad.device, dtype=torch.float32)
-        _linear_bwd_fused.dw_gemm(dprojected, x, dw)
-        _linear_bwd_fused.dx_gemm_native(dprojected, w.contiguous(), dx)
-        _linear_bwd_fused.bias_reduce(dprojected, db)
-        return dx.reshape(ctx.x_shape), dresidual.reshape(ctx.residual_shape), dgate.to(gate.dtype), dw, db.to(grad.dtype)
+        dx = dprojected.matmul(w)
+        dw = dprojected.transpose(0, 1).matmul(x)
+        db = dprojected.sum(dim=0)
+        return dx.reshape(ctx.x_shape), dresidual.reshape(ctx.residual_shape), dgate.to(gate.dtype), dw.to(w.dtype), db.to(grad.dtype)
 
 
 def fused_linear_gated_residual(
@@ -375,6 +371,10 @@ class TkMlp(nn.Module):
         h = fused_adaln_linear_gelu(residual, shift, scale, self.fc1, eps)
         return fused_linear_gated_residual(h, residual, gate, self.fc2)
 
+    def forward_residual(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        h = torch.nn.functional.gelu(self.fc1(x), approximate="tanh")
+        return fused_linear_gated_residual(h, residual, gate, self.fc2)
+
 
 class FusedInputMlp(nn.Module):
     def __init__(self, in_features: int, hidden_features: int):
@@ -439,6 +439,12 @@ class SdpaAttention(nn.Module):
         attn = self._attention_from_qkv(qkv)
         return fused_linear_gated_residual(attn, residual, gate, self.proj)
 
+    def forward_residual(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = x.shape
+        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        attn = self._attention_from_qkv(qkv)
+        return fused_linear_gated_residual(attn, residual, gate, self.proj)
+
 
 class FlashAttention3(nn.Module):
     def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
@@ -474,6 +480,13 @@ class FlashAttention3(nn.Module):
     ) -> torch.Tensor:
         batch, tokens, dim = residual.shape
         qkv = fused_adaln_linear(residual, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
+        return fused_linear_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
+
+    def forward_residual(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        batch, tokens, dim = x.shape
+        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
         return fused_linear_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
@@ -562,7 +575,7 @@ class DiTBlock(nn.Module):
         elif attention_backend == "timm":
             self.attn = (
                 SdpaAttention(hidden_size, num_heads=num_heads, qkv_bias=True)
-                if fused_input_projection_enabled
+                if fused_input_projection_enabled or fused_output_projection_enabled
                 else Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
             )
         else:
@@ -573,7 +586,7 @@ class DiTBlock(nn.Module):
             TkMlp(hidden_size, mlp_hidden_dim)
             if tk_mlp_enabled
             else FusedInputMlp(hidden_size, mlp_hidden_dim)
-            if fused_input_projection_enabled
+            if fused_input_projection_enabled or fused_output_projection_enabled
             else Mlp(
                 in_features=hidden_size,
                 hidden_features=mlp_hidden_dim,
@@ -596,6 +609,9 @@ class DiTBlock(nn.Module):
             elif self.fused_input_projection_enabled and hasattr(self.attn, "forward_from_adaln"):
                 attn_out = self.attn.forward_from_adaln(x, shift_msa, scale_msa, self.norm1.eps)
                 x = gated_residual(x, attn_out, gate_msa) if self.fused_residual_enabled else x + gate_msa.unsqueeze(1) * attn_out
+            elif self.fused_output_projection_enabled and self.fused_residual_enabled and hasattr(self.attn, "forward_residual"):
+                attn_in = fused_adaln(x, shift_msa, scale_msa, self.norm1.eps)
+                x = self.attn.forward_residual(attn_in, x, gate_msa)
             else:
                 attn_in = fused_adaln(x, shift_msa, scale_msa, self.norm1.eps)
                 attn_out = self.attn(attn_in)
@@ -610,6 +626,9 @@ class DiTBlock(nn.Module):
             elif self.fused_input_projection_enabled and hasattr(self.mlp, "forward_from_adaln"):
                 mlp_out = self.mlp.forward_from_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
                 x = gated_residual(x, mlp_out, gate_mlp) if self.fused_residual_enabled else x + gate_mlp.unsqueeze(1) * mlp_out
+            elif self.fused_output_projection_enabled and self.fused_residual_enabled and hasattr(self.mlp, "forward_residual"):
+                mlp_in = fused_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
+                x = self.mlp.forward_residual(mlp_in, x, gate_mlp)
             else:
                 mlp_in = fused_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
                 mlp_out = self.mlp(mlp_in)
@@ -923,6 +942,94 @@ def fused_input_projection_correctness(batch: int = 2, tokens: int = 64, dim: in
     return ok
 
 
+def residual_group(batch: int, tokens: int, dim: int, seed: int):
+    x = uniform_bf16((batch, tokens, dim), seed, -1.0, 1.0)
+    h = uniform_bf16((batch, tokens, dim), seed + 1, -1.0, 1.0)
+    gate = uniform_bf16((batch, dim), seed + 2, -0.5, 0.5)
+    grad = uniform_bf16((batch, tokens, dim), seed + 3, -1.0, 1.0)
+    return (
+        x,
+        h,
+        gate,
+        grad,
+        torch.empty_like(x),
+        torch.empty_like(h),
+        torch.empty((batch, dim), device="cuda", dtype=torch.float32),
+    )
+
+
+def residual_torch_step(group):
+    x, h, gate, grad, out, dh, dgate = group
+    out.copy_(x + gate.unsqueeze(1) * h)
+    dh.copy_(grad * gate.unsqueeze(1))
+    dgate.copy_((grad.float() * h.float()).sum(dim=1))
+
+
+def residual_fused_step(group):
+    x, h, gate, grad, out, dh, dgate = group
+    batch, tokens, dim = x.shape
+    _C.gated_residual(
+        x.reshape(batch * tokens, dim),
+        h.reshape(batch * tokens, dim),
+        gate,
+        out.reshape(batch * tokens, dim),
+        tokens,
+    )
+    _C.gated_residual_backward_no_dx(
+        grad.reshape(batch * tokens, dim),
+        h.reshape(batch * tokens, dim),
+        gate,
+        dh.reshape(batch * tokens, dim),
+        dgate,
+        tokens,
+    )
+
+
+def residual_correctness(batch: int = 2, tokens: int = 64, dim: int = 1024) -> bool:
+    print(f"\nStandalone gated residual correctness B{batch} T{tokens} D{dim}")
+    ref = residual_group(batch, tokens, dim, 9100)
+    fused = tuple(t.clone() if i < 4 else torch.empty_like(t) for i, t in enumerate(ref))
+    residual_torch_step(ref)
+    residual_fused_step(fused)
+    ok = check_close("residual output", fused[4], ref[4])
+    ok = check_close("residual dh", fused[5], ref[5]) and ok
+    ok = check_close("residual dgate", fused[6], ref[6]) and ok
+    print(f"Standalone gated residual correctness: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def bench_residual(tokens_list: list[int], batches: list[int], dim: int, warmup: int, iters: int):
+    if not residual_correctness(tokens=max(64, min(tokens_list))):
+        raise SystemExit(1)
+    for tokens in tokens_list:
+        for batch in batches:
+            input_bytes = batch * tokens * dim * 2 * 4 + batch * dim * 2
+            groups_n = min(input_group_count(input_bytes), 8)
+            torch_groups = [residual_group(batch, tokens, dim, 9200 + i * 10) for i in range(groups_n)]
+            fused_groups = [residual_group(batch, tokens, dim, 9300 + i * 10) for i in range(groups_n)]
+            # x,h,gate,grad reads + out,dh,dgate writes. dx is an alias of grad and does not need materialization.
+            bytes_moved = batch * tokens * dim * 2 * 6 + batch * dim * (2 + 4)
+            torch_result = profile_groups(
+                f"residual torch B{batch} T{tokens} D{dim}",
+                torch_groups,
+                residual_torch_step,
+                warmup=warmup,
+                iters=iters,
+                bytes_moved=bytes_moved,
+            )
+            fused_result = profile_groups(
+                f"residual fused B{batch} T{tokens} D{dim}",
+                fused_groups,
+                residual_fused_step,
+                warmup=warmup,
+                iters=iters,
+                bytes_moved=bytes_moved,
+            )
+            print_bench(torch_result)
+            print_bench(fused_result)
+            print(f"  speedup: {torch_result.us / fused_result.us:.2f}x")
+
+
 def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], include_compile: bool, warmup: int, iters: int, include_fa3: bool):
     cfg = dit_config(model_name)
     tokens = spatial[0] * spatial[1] * spatial[2]
@@ -939,6 +1046,7 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
         ("fused_adaln", True, False, False, False, False, "timm", False),
         ("fused_adaln_residual", True, True, False, False, False, "timm", False),
         ("fused_adaln_residual_tk_mlp", True, True, True, False, False, "timm", False),
+        ("fused_output_proj", True, True, False, False, True, "timm", False),
         ("fused_input_proj", True, True, False, True, False, "timm", False),
         ("fused_input_output_proj", True, True, False, True, True, "timm", False),
         ("fused_input_proj_tk_mlp", True, True, True, True, False, "timm", False),
@@ -949,6 +1057,7 @@ def bench_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
             ("fa3_attn", False, False, False, False, False, "fa3", False),
             ("fused_adaln_residual_fa3", True, True, False, False, False, "fa3", False),
             ("fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, "fa3", False),
+            ("fused_output_proj_fa3", True, True, False, False, True, "fa3", False),
             ("fused_input_proj_fa3", True, True, False, True, False, "fa3", False),
             ("fused_input_output_proj_fa3", True, True, False, True, True, "fa3", False),
             ("fused_input_proj_fa3_tk_mlp", True, True, True, True, False, "fa3", False),
@@ -1071,6 +1180,8 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--fa3", action="store_true", help="Include FlashAttention-3 attention variants.")
     parser.add_argument("--check-fused-input", action="store_true", help="Run isolated LN+AdaLN+projection correctness checks and exit.")
+    parser.add_argument("--bench-residual", action="store_true", help="Run isolated standalone gated residual forward+backward benchmarks and exit.")
+    parser.add_argument("--hidden-dim", type=int, default=1024, help="Hidden dimension for isolated residual benchmark.")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--probe-memory", action="store_true")
@@ -1086,6 +1197,9 @@ def main():
     if args.check_fused_input:
         if not fused_input_projection_correctness():
             raise SystemExit(1)
+        return
+    if args.bench_residual:
+        bench_residual(args.tokens or [1024], args.batches, args.hidden_dim, args.warmup, args.iters)
         return
     all_results = []
     cases = []

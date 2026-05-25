@@ -51,6 +51,16 @@ def dit_command(
 def command_for_mode(mode: str) -> list[str]:
     if mode == "fused_input_check":
         return ["python3", "dit3d_e2e_bench.py", "--check-fused-input"]
+    if mode == "residual":
+        return [
+            "python3", "dit3d_e2e_bench.py",
+            "--bench-residual",
+            "--tokens", "1024",
+            "--batches", "2", "8",
+            "--hidden-dim", "1024",
+            "--warmup", "500",
+            "--iters", "100",
+        ]
     if mode.startswith("dit3d"):
         parts = mode.split("_")
         is_sweep = "sweep" in parts or "tokens" in parts
