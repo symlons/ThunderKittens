@@ -1,0 +1,8 @@
+ARCH := SM90
+SRC := bf16_h100_gemm.cu
+OUT := _C$(shell python3 -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+CMD := true
+CONFIG := pytorch
+NVCCFLAGS += -DTORCH_COMPILE -UTORCH_EXTENSION_NAME -DTORCH_EXTENSION_NAME=_C
+
+include ../../common.mk

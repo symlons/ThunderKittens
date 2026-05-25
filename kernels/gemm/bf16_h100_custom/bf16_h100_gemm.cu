@@ -173,8 +173,6 @@ __global__ void layernorm_adaln_forward_kernel(
 
 __global__ void layernorm_adaln_backward_kernel(
     bf16 *__restrict__ dx,
-    float *__restrict__ dshift,
-    float *__restrict__ dscale,
     const bf16 *__restrict__ grad,
     const bf16 *__restrict__ x,
     const bf16 *__restrict__ scale,
@@ -229,8 +227,56 @@ __global__ void layernorm_adaln_backward_kernel(
         float dnorm = g * (1.0f + sc);
         float dxv = (dnorm - s1 * inv_k - xhat * s2 * inv_k) * rs;
         dx[idx] = __float2bfloat16(dxv);
-        atomicAdd(&dshift[batch * K + col], g);
-        atomicAdd(&dscale[batch * K + col], g * xhat);
+    }
+}
+
+__global__ void layernorm_adaln_param_backward_kernel(
+    float *__restrict__ dshift,
+    float *__restrict__ dscale,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ x,
+    const float *__restrict__ mean,
+    const float *__restrict__ rstd,
+    int K,
+    int tokens_per_sample
+) {
+    constexpr int COLS = 16;
+    constexpr int TOK_THREADS = 16;
+    __shared__ float shift_sums[TOK_THREADS][COLS];
+    __shared__ float scale_sums[TOK_THREADS][COLS];
+
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int batch = blockIdx.y;
+    int ty = threadIdx.y;
+
+    float shift_acc = 0.0f;
+    float scale_acc = 0.0f;
+    if (col < K) {
+        int row_base = batch * tokens_per_sample;
+        for (int tok = ty; tok < tokens_per_sample; tok += TOK_THREADS) {
+            int row = row_base + tok;
+            size_t idx = size_t(row) * K + col;
+            float xhat = (__bfloat162float(x[idx]) - mean[row]) * rstd[row];
+            float g = __bfloat162float(grad[idx]);
+            shift_acc += g;
+            scale_acc += g * xhat;
+        }
+    }
+
+    shift_sums[ty][threadIdx.x] = shift_acc;
+    scale_sums[ty][threadIdx.x] = scale_acc;
+    __syncthreads();
+
+    if (ty == 0 && col < K) {
+        float ds = 0.0f;
+        float dc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TOK_THREADS; i++) {
+            ds += shift_sums[i][threadIdx.x];
+            dc += scale_sums[i][threadIdx.x];
+        }
+        dshift[batch * K + col] = ds;
+        dscale[batch * K + col] = dc;
     }
 }
 
@@ -835,20 +881,28 @@ void layernorm_adaln_backward_entrypoint(
     TORCH_CHECK(M == batch * tokens_per_sample);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    cudaMemsetAsync(dshift.data_ptr(), 0, dshift.numel() * sizeof(float), stream);
-    cudaMemsetAsync(dscale.data_ptr(), 0, dscale.numel() * sizeof(float), stream);
     int threads = 256;
     int smem = threads * 2 * sizeof(float);
     layernorm_adaln_backward_kernel<<<M, threads, smem, stream>>>(
         reinterpret_cast<bf16*>(dA.data_ptr()),
-        reinterpret_cast<float*>(dshift.data_ptr()),
-        reinterpret_cast<float*>(dscale.data_ptr()),
         reinterpret_cast<const bf16*>(grad.data_ptr()),
         reinterpret_cast<const bf16*>(A.data_ptr()),
         reinterpret_cast<const bf16*>(scale.data_ptr()),
         reinterpret_cast<const float*>(mean.data_ptr()),
         reinterpret_cast<const float*>(rstd.data_ptr()),
         M,
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+    dim3 param_block(16, 16);
+    dim3 param_grid((K + param_block.x - 1) / param_block.x, batch);
+    layernorm_adaln_param_backward_kernel<<<param_grid, param_block, 0, stream>>>(
+        reinterpret_cast<float*>(dshift.data_ptr()),
+        reinterpret_cast<float*>(dscale.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const float*>(mean.data_ptr()),
+        reinterpret_cast<const float*>(rstd.data_ptr()),
         K,
         static_cast<int>(tokens_per_sample)
     );

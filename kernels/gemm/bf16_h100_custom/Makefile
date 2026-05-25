@@ -11,7 +11,7 @@ PYTHON := env PYTHONPATH="$(CURDIR):$$PYTHONPATH" LD_LIBRARY_PATH="$(TORCH_LIB):
 all: $(KERNELS)
 
 _C$(EXT): bf16_h100_gemm.cu
-	$(MAKE) -f Makefile.gemm BUILD_MODE=torch
+	$(MAKE) -f Makefile.gemm_torch
 
 _gelu_bwd$(EXT): gelu_bwd.cu
 	$(MAKE) -f Makefile.gelu_bwd BUILD_MODE=torch
