@@ -66,6 +66,57 @@ void launch_gelu_bwd(
     gelu_bwd_kernel<<<blocks, 256, 0, stream>>>(dz, dy, preact, count);
 }
 
+constexpr int GELU_BWD_BIAS_COLS = 16;
+constexpr int GELU_BWD_BIAS_ROW_THREADS = 16;
+constexpr int GELU_BWD_BIAS_ROWS_PER_BLOCK = 256;
+
+__device__ static inline float gelu_tanh_grad(float x) {
+    float x2 = x * x;
+    float a = 0.79788456f * x * (1.f + 0.044715f * x2);
+    float t;
+    asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(a));
+    float s2 = 1.f - t * t;
+    return 0.5f * (1.f + t) + 0.5f * x * s2 * 0.79788456f * (1.f + 3.f * 0.044715f * x2);
+}
+
+__global__ void gelu_bwd_bias_fused_kernel(
+    __nv_bfloat16 *__restrict__ dz,
+    float *__restrict__ dbias,
+    const __nv_bfloat16 *__restrict__ dy,
+    const __nv_bfloat16 *__restrict__ preact,
+    int M,
+    int N
+) {
+    __shared__ float sums[GELU_BWD_BIAS_ROW_THREADS][GELU_BWD_BIAS_COLS];
+    int col = blockIdx.x * GELU_BWD_BIAS_COLS + threadIdx.x;
+    int row_start = blockIdx.y * GELU_BWD_BIAS_ROWS_PER_BLOCK;
+    int row_end = min(row_start + GELU_BWD_BIAS_ROWS_PER_BLOCK, M);
+    int ty = threadIdx.y;
+
+    float acc = 0.f;
+    if (col < N) {
+        for (int row = row_start + ty; row < row_end; row += GELU_BWD_BIAS_ROW_THREADS) {
+            size_t idx = size_t(row) * N + col;
+            float x = __bfloat162float(preact[idx]);
+            float g = __bfloat162float(dy[idx]);
+            float out = g * gelu_tanh_grad(x);
+            dz[idx] = __float2bfloat16(out);
+            acc += out;
+        }
+    }
+    sums[ty][threadIdx.x] = acc;
+    __syncthreads();
+
+    if (ty == 0 && col < N) {
+        float total = 0.f;
+        #pragma unroll
+        for (int i = 0; i < GELU_BWD_BIAS_ROW_THREADS; i++) {
+            total += sums[i][threadIdx.x];
+        }
+        atomicAdd(&dbias[col], total);
+    }
+}
+
 // ============================================================
 // dW = x^T @ dz  (mma_AtB) — unchanged from linear_bwd.cu
 // ============================================================
@@ -397,19 +448,17 @@ void gelu_bwd_bias_entrypoint(
     int M = dy.size(0), N = dy.size(1);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    launch_gelu_bwd(
+    cudaMemsetAsync(dbias.data_ptr(), 0, N * sizeof(float), stream);
+    dim3 block(GELU_BWD_BIAS_COLS, GELU_BWD_BIAS_ROW_THREADS);
+    dim3 grid((N + GELU_BWD_BIAS_COLS - 1) / GELU_BWD_BIAS_COLS,
+              (M + GELU_BWD_BIAS_ROWS_PER_BLOCK - 1) / GELU_BWD_BIAS_ROWS_PER_BLOCK);
+    gelu_bwd_bias_fused_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(dz.data_ptr()),
+        reinterpret_cast<float*>(dbias.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(preact.data_ptr()),
-        M, N, stream
-    );
-
-    cudaMemsetAsync(dbias.data_ptr(), 0, N * sizeof(float), stream);
-    dim3 grid2((N + BIAS_THREADS - 1) / BIAS_THREADS, (M + BIAS_ROWS_PER_BLOCK - 1) / BIAS_ROWS_PER_BLOCK);
-    bias_reduce_kernel<<<grid2, BIAS_THREADS, 0, stream>>>(
-        reinterpret_cast<float*>(dbias.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(dz.data_ptr()),
-        M, N
+        M,
+        N
     );
 }
 
