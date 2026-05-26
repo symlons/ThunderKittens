@@ -56,6 +56,91 @@ def dit_command(
 
 
 def command_for_mode(mode: str) -> list[str]:
+    if mode == "compile_trace_no_attn":
+        return [
+            "python3", "compile_trace_no_attn.py",
+            "--batch", "4",
+            "--tokens", "1024",
+            "--dim", "1024",
+            "--warmup", "3",
+            "--iters", "3",
+        ]
+    if mode == "compile_trace_fusions":
+        return [
+            "python3", "compile_trace_no_attn.py",
+            "--batch", "4",
+            "--tokens", "1024",
+            "--dim", "1024",
+            "--warmup", "2",
+            "--iters", "2",
+            "--dump-inductor",
+        ]
+    if mode == "compile_trace_fusions_summary":
+        return [
+            "python3", "compile_trace_no_attn.py",
+            "--batch", "4",
+            "--tokens", "1024",
+            "--dim", "1024",
+            "--warmup", "2",
+            "--iters", "2",
+            "--dump-inductor",
+            "--skip-profiler",
+        ]
+    if mode == "custom_vs_compile":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--batches", "1", "2", "4", "8",
+            "--tokens", "64", "128", "1024",
+            "--dim", "1024",
+            "--warmup", "8",
+            "--iters", "15",
+        ]
+    if mode == "custom_correctness":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--batches", "4", "8",
+            "--tokens", "1024",
+            "--dim", "1024",
+            "--correctness-only",
+        ]
+    if mode == "custom_vs_compile_fixed":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--batches", "1", "2", "4", "8",
+            "--tokens", "64", "128", "1024",
+            "--dim", "1024",
+            "--warmup", "8",
+            "--iters", "15",
+        ]
+    if mode == "custom_vs_compile_long":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--batches", "1", "2", "4",
+            "--tokens", "4096", "16384",
+            "--dim", "1024",
+            "--warmup", "4",
+            "--iters", "6",
+        ]
+    if mode == "custom_vs_compile_large_batch":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--batches", "16", "32",
+            "--tokens", "64", "128", "1024",
+            "--dim", "1024",
+            "--warmup", "4",
+            "--iters", "6",
+            "--cases", "pre_qkv", "fc1_gelu", "post_residual",
+        ]
+    if mode == "compile_trace_pre_qkv":
+        return [
+            "python3", "compile_trace_no_attn.py",
+            "--batch", "4",
+            "--tokens", "1024",
+            "--dim", "1024",
+            "--warmup", "3",
+            "--iters", "3",
+            "--cases", "pre_qkv_projection",
+        ]
     if mode == "fused_input_check":
         return ["python3", "dit3d_e2e_bench.py", "--check-fused-input"]
     if mode == "residual":

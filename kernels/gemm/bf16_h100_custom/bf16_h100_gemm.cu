@@ -977,6 +977,7 @@ struct gated_linear_template {
                 args.globals.tokens_per_sample,
                 args.globals.N
             );
+            warpgroup::sync(warpgroup::groupid() + 4);
             if (warpgroup::elect_leader()) {
                 for (int i = 0; i < N_BLOCK; i++)
                     tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});

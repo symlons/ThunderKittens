@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,8 @@ DEFAULT_LOCAL_TK_ROOT = Path(
 ).expanduser()
 
 app = modal.App(APP_NAME)
+artifact_volume = modal.Volume.from_name("tk_kernels", create_if_missing=True)
+ARTIFACT_DIR = "/data/adaln"
 
 image = (
     modal.Image.from_registry("pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
@@ -47,13 +50,6 @@ image = (
         "MAX_JOBS=2 NVCC_THREADS=1 python setup.py install"
     )
     .add_local_dir(local_path=str(DEFAULT_LOCAL_TK_ROOT), remote_path=THUNDERKITTENS_ROOT, copy=True)
-    .run_commands(
-        "cd /ThunderKittens/kernels/gemm/bf16_h100_custom && "
-        "make clean && "
-        "make -j4 _C$(python3 -c 'import sysconfig; print(sysconfig.get_config_var(\"EXT_SUFFIX\"))') && "
-        "make -j4 _gelu_bwd$(python3 -c 'import sysconfig; print(sysconfig.get_config_var(\"EXT_SUFFIX\"))') && "
-        "make -j4 _linear_bwd_fused$(python3 -c 'import sysconfig; print(sysconfig.get_config_var(\"EXT_SUFFIX\"))')"
-    )
 )
 
 
@@ -79,13 +75,71 @@ def run_profile(mode: str, command: list[str] | None = None) -> str:
     return run_checked(command or command_for_mode(mode), cwd=KERNEL_DIR)
 
 
-@app.function(gpu="H100", image=image, timeout=60 * 15)
-def test_and_profile_h100(mode: str = "block", command: list[str] | None = None) -> str:
+def extension_suffix() -> str:
+    return subprocess.check_output(
+        ["python3", "-c", "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"],
+        text=True,
+    ).strip()
+
+
+def artifact_names() -> list[str]:
+    suffix = extension_suffix()
+    return [f"_C{suffix}", f"_gelu_bwd{suffix}", f"_linear_bwd_fused{suffix}"]
+
+
+@app.function(cpu=8, image=image, timeout=60 * 20, volumes={"/data": artifact_volume})
+def build_artifacts(rebuild: bool = False) -> list[str]:
+    suffix = extension_suffix()
+    targets = [f"_C{suffix}", f"_gelu_bwd{suffix}", f"_linear_bwd_fused{suffix}"]
+    artifact_volume.reload()
+    cached = [os.path.join(ARTIFACT_DIR, target) for target in targets]
+    if not rebuild and all(os.path.exists(path) for path in cached):
+        for path in cached:
+            print(f"using cached artifact: {path} ({os.path.getsize(path)} bytes)", flush=True)
+        return targets
+
+    run_checked(["make", "clean"], cwd=KERNEL_DIR)
+    for target in targets:
+        run_checked(["make", "-j4", target], cwd=KERNEL_DIR)
+
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+    for name in os.listdir(ARTIFACT_DIR):
+        if name.endswith(".so"):
+            os.unlink(os.path.join(ARTIFACT_DIR, name))
+    for target in targets:
+        src = os.path.join(KERNEL_DIR, target)
+        dst = os.path.join(ARTIFACT_DIR, target)
+        if not os.path.exists(src):
+            raise FileNotFoundError(src)
+        shutil.copy2(src, dst)
+        print(f"saved artifact: {dst} ({os.path.getsize(dst)} bytes)", flush=True)
+
+    artifact_volume.commit()
+    return targets
+
+
+def load_artifacts(names: list[str]) -> None:
+    artifact_volume.reload()
+    if not names:
+        raise RuntimeError("No build artifacts were provided")
+    for name in names:
+        src = os.path.join(ARTIFACT_DIR, name)
+        dst = os.path.join(KERNEL_DIR, name)
+        if not os.path.exists(src):
+            raise FileNotFoundError(src)
+        shutil.copy2(src, dst)
+        print(f"loaded artifact: {src} -> {dst}", flush=True)
+
+
+@app.function(gpu="H100", image=image, timeout=60 * 15, volumes={"/data": artifact_volume})
+def test_and_profile_h100(mode: str = "block", command: list[str] | None = None, artifacts: list[str] | None = None) -> str:
+    load_artifacts(artifacts or artifact_names())
     return run_profile(mode, command)
 
 
-@app.function(gpu="H200", image=image, timeout=60 * 15)
-def test_and_profile_h200(mode: str = "block", command: list[str] | None = None) -> str:
+@app.function(gpu="H200", image=image, timeout=60 * 15, volumes={"/data": artifact_volume})
+def test_and_profile_h200(mode: str = "block", command: list[str] | None = None, artifacts: list[str] | None = None) -> str:
+    load_artifacts(artifacts or artifact_names())
     return run_profile(mode, command)
 
 
@@ -107,6 +161,7 @@ def main(
     variants: str = "",
     profile_variant: str = "",
     profile_rows: int = 30,
+    rebuild_artifacts: bool = False,
 ) -> None:
     def parse_ints(value: str) -> list[int]:
         return [int(part) for part in value.replace(",", " ").split() if part]
@@ -129,7 +184,9 @@ def main(
             profile_variant=profile_variant,
             profile_rows=profile_rows,
         )
+    artifacts = build_artifacts.remote(rebuild_artifacts)
+    print("CPU build artifacts:", artifacts, flush=True)
     if gpu.upper() == "H200":
-        test_and_profile_h200.remote(mode, command)
+        test_and_profile_h200.remote(mode, command, artifacts)
     else:
-        test_and_profile_h100.remote(mode, command)
+        test_and_profile_h100.remote(mode, command, artifacts)
