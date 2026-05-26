@@ -957,8 +957,11 @@ def variant_config(variant_name: str):
     variants = {
         "eager": (False, False, False, False, False, "timm", False),
         "compile": (False, False, False, False, False, "timm", True),
+        "compile_fused_adaln": (True, False, False, False, False, "timm", True),
+        "compile_tk_adaln_only": (True, False, False, False, False, "timm", True),
         "fused_adaln_residual": (True, True, False, False, False, "timm", False),
         "compile_fused_adaln_residual": (True, True, False, False, False, "timm", True),
+        "compile_tk_adaln_residual_only": (True, True, False, False, False, "timm", True),
         "fused_adaln_residual_tk_mlp": (True, True, True, False, False, "timm", False),
         "compile_fused_adaln_residual_tk_mlp": (True, True, True, False, False, "timm", True),
         "fa3_attn": (False, False, False, False, False, "fa3", False),
@@ -1034,6 +1037,7 @@ def profile_variant_case(
         fused_output_projection=fused_output_projection,
         attention_backend=attention_backend,
     )
+    model.pos_embed(spatial, torch.bfloat16, torch.device("cuda"))
     if compiled:
         model = torch.compile(model)
     group = make_group(batch, dit_config(model_name)["in_channels"], spatial, 77000)
@@ -1254,7 +1258,9 @@ def bench_case(
     if include_compile:
         variants.extend([
             ("compile_fused_adaln", True, False, False, False, False, "timm", True),
+            ("compile_tk_adaln_only", True, False, False, False, False, "timm", True),
             ("compile_fused_adaln_residual", True, True, False, False, False, "timm", True),
+            ("compile_tk_adaln_residual_only", True, True, False, False, False, "timm", True),
             ("compile_fused_adaln_tk_mlp", True, False, True, False, False, "timm", True),
             ("compile_fused_adaln_residual_tk_mlp", True, True, True, False, False, "timm", True),
         ])
@@ -1292,6 +1298,7 @@ def bench_case(
             fused_output_projection=fused_output_projection,
             attention_backend=attention_backend,
         )
+        model.pos_embed(spatial, torch.bfloat16, torch.device("cuda"))
         if compiled:
             model = torch.compile(model)
         try:

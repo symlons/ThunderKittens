@@ -643,10 +643,21 @@ def benchmark_mlp_branch_case(batch: int, tokens: int, dim: int, eps: float, lab
     )
     groups_n = min(input_group_count(group_bytes), 8)
     torch_groups = [make_mlp_group(batch, tokens, dim, hidden_dim, 12000 + i * 100) for i in range(groups_n)]
+    compile_groups = [clone_mlp_group(group) for group in torch_groups]
     fused_groups = [clone_mlp_group(group) for group in torch_groups]
     fused_tk_gelu_groups = [clone_mlp_group(group) for group in torch_groups]
     tk_full_mlp_groups = [clone_mlp_group(group) for group in torch_groups]
     fused_tk_full_mlp_groups = [clone_mlp_group(group) for group in torch_groups]
+    compiled_torch_mlp = compile_fn(
+        lambda x, shift, scale, gate, w1, b1, w2, b2:
+            torch_mlp_branch(x, shift, scale, gate, w1, b1, w2, b2, tokens, eps)
+    )
+
+    def compiled_mlp_branch_step(group: tuple[torch.Tensor, ...]) -> None:
+        assert compiled_torch_mlp is not None
+        y = compiled_torch_mlp(*group[:-1])
+        y.backward(group[-1])
+        zero_mlp_group_grads(group)
 
     flops = 4.0 * m * dim * hidden_dim
     bytes_forward = group_bytes
@@ -681,6 +692,20 @@ def benchmark_mlp_branch_case(batch: int, tokens: int, dim: int, eps: float, lab
             flops=flops * 3.0,
             bytes_moved=bytes_train,
         ),
+    ]
+    if compiled_torch_mlp is not None:
+        results.append(
+            profile_groups(
+                f"{label} mlp torch.compile train",
+                compile_groups,
+                compiled_mlp_branch_step,
+                warmup=50,
+                iters=100,
+                flops=flops * 3.0,
+                bytes_moved=bytes_train,
+            )
+        )
+    results.extend([
         profile_groups(
             f"{label} mlp fused train",
             fused_groups,
@@ -717,10 +742,18 @@ def benchmark_mlp_branch_case(batch: int, tokens: int, dim: int, eps: float, lab
             flops=flops * 3.0,
             bytes_moved=bytes_train,
         ),
-    ]
+    ])
     for result in results:
         print_bench(result)
-    torch_fwd, fused_fwd, torch_train, fused_train, fused_tk_gelu_train, tk_full_mlp_train, fused_tk_full_mlp_train = results
+    result_by_name = {result.name: result for result in results}
+    torch_fwd = result_by_name[f"{label} mlp torch forward"]
+    fused_fwd = result_by_name[f"{label} mlp fused forward"]
+    torch_train = result_by_name[f"{label} mlp torch train"]
+    compile_train = result_by_name.get(f"{label} mlp torch.compile train")
+    fused_train = result_by_name[f"{label} mlp fused train"]
+    fused_tk_gelu_train = result_by_name[f"{label} mlp fused+tk_gelu train"]
+    tk_full_mlp_train = result_by_name[f"{label} mlp tk_full_mlp train"]
+    fused_tk_full_mlp_train = result_by_name[f"{label} mlp fused+tk_full_mlp train"]
     print(
         f"  MLP branch speedup: forward {torch_fwd.us / fused_fwd.us:.2f}x, "
         f"train {torch_train.us / fused_train.us:.2f}x, "
@@ -728,6 +761,13 @@ def benchmark_mlp_branch_case(batch: int, tokens: int, dim: int, eps: float, lab
         f"train+tk_full_mlp {torch_train.us / tk_full_mlp_train.us:.2f}x, "
         f"train+fused_adaln+tk_full_mlp {torch_train.us / fused_tk_full_mlp_train.us:.2f}x"
     )
+    if compile_train is not None:
+        print(
+            f"  vs torch.compile: fused {compile_train.us / fused_train.us:.2f}x, "
+            f"fused+tk_gelu {compile_train.us / fused_tk_gelu_train.us:.2f}x, "
+            f"tk_full_mlp {compile_train.us / tk_full_mlp_train.us:.2f}x, "
+            f"fused+tk_full_mlp {compile_train.us / fused_tk_full_mlp_train.us:.2f}x"
+        )
     return results
 
 
