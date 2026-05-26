@@ -131,6 +131,31 @@ def command_for_mode(mode: str) -> list[str]:
             "--iters", "6",
             "--cases", "pre_qkv", "fc1_gelu", "post_residual",
         ]
+    if mode == "torch_compile_capacity":
+        return [
+            "python3", "torch_compile_dit_capacity.py",
+            "--model", "L",
+            "--tokens", "1024", "4096",
+            "--batches", "16", "32", "48", "64", "80", "96", "128",
+            "--stop-after-oom",
+            "--second-step",
+        ]
+    if mode == "torch_compile_capacity_1024":
+        return [
+            "python3", "torch_compile_dit_capacity.py",
+            "--model", "L",
+            "--tokens", "1024",
+            "--batches", "64", "80", "96", "112", "128",
+            "--stop-after-oom",
+        ]
+    if mode == "torch_compile_capacity_4096":
+        return [
+            "python3", "torch_compile_dit_capacity.py",
+            "--model", "L",
+            "--tokens", "4096",
+            "--batches", "8", "12", "16", "20", "24", "32",
+            "--stop-after-oom",
+        ]
     if mode == "compile_trace_pre_qkv":
         return [
             "python3", "compile_trace_no_attn.py",
