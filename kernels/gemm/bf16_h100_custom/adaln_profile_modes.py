@@ -169,6 +169,56 @@ def command_for_mode(mode: str) -> list[str]:
             "--iters", "2",
             "--cases", "pre_qkv", "fc1_gelu", "post_residual",
         ]
+    if mode == "adaln_layernorm_smoke":
+        return [
+            "python3", "profile_adaln_layernorm.py",
+            "--shapes", "64x1024",
+            "--dim", "1024",
+            "--warmup", "2",
+            "--iters", "2",
+        ]
+    if mode == "adaln_layernorm_train_smoke":
+        return [
+            "python3", "profile_adaln_layernorm.py",
+            "--shapes", "64x1024",
+            "--dim", "1024",
+            "--warmup", "2",
+            "--iters", "2",
+            "--train",
+        ]
+    if mode == "adaln_layernorm_profile":
+        return [
+            "python3", "profile_adaln_layernorm.py",
+            "--shapes", "64x1024", "80x1024", "16x4096", "20x4096",
+            "--dim", "1024",
+            "--warmup", "6",
+            "--iters", "10",
+        ]
+    if mode == "adaln_layernorm_train_profile":
+        return [
+            "python3", "profile_adaln_layernorm.py",
+            "--shapes", "64x1024", "80x1024", "16x4096", "20x4096",
+            "--dim", "1024",
+            "--warmup", "6",
+            "--iters", "10",
+            "--train",
+        ]
+    if mode == "adaln_call_overhead":
+        return [
+            "python3", "profile_adaln_call_overhead.py",
+            "--shapes", "64x1024", "16x4096",
+            "--dim", "1024",
+            "--warmup", "20",
+            "--iters", "50",
+        ]
+    if mode == "adaln_layernorm_profile_h200":
+        return [
+            "python3", "profile_adaln_layernorm.py",
+            "--shapes", "128x1024", "160x1024", "32x4096", "40x4096",
+            "--dim", "1024",
+            "--warmup", "6",
+            "--iters", "10",
+        ]
     if mode == "custom_vs_compile_large_batch_h200":
         return [
             "python3", "compare_custom_compile.py",

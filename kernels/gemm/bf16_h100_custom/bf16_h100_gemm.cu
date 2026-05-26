@@ -211,6 +211,93 @@ __device__ static inline void apply_gated_residual_epilogue(
 
 
 
+__device__ __forceinline__ float warp_sum_float(float value) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffff, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float block_sum_128_float(float value) {
+    __shared__ float warp_sums[4];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    value = warp_sum_float(value);
+    if (lane == 0) {
+        warp_sums[warp] = value;
+    }
+    __syncthreads();
+    value = threadIdx.x < 4 ? warp_sums[lane] : 0.0f;
+    if (warp == 0) {
+        value = warp_sum_float(value);
+    }
+    if (threadIdx.x == 0) {
+        warp_sums[0] = value;
+    }
+    __syncthreads();
+    return warp_sums[0];
+}
+
+__global__ __launch_bounds__(128, 4) void layernorm_adaln_forward_k1024_vec2_kernel(
+    bf16 *__restrict__ out,
+    float *__restrict__ mean_out,
+    float *__restrict__ rstd_out,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ shift,
+    const bf16 *__restrict__ scale,
+    int tokens_per_sample,
+    float eps
+) {
+    constexpr int K = 1024;
+    constexpr int K2 = K / 2;
+    using bf16_2 = __nv_bfloat162;
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int batch = row / tokens_per_sample;
+    size_t pair_base = size_t(row) * K2;
+    size_t param_pair_base = size_t(batch) * K2;
+    const bf16_2 *__restrict__ x2 = reinterpret_cast<const bf16_2*>(x);
+    const bf16_2 *__restrict__ shift2 = reinterpret_cast<const bf16_2*>(shift);
+    const bf16_2 *__restrict__ scale2 = reinterpret_cast<const bf16_2*>(scale);
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int pair_col = tid + j * 128;
+        float2 v = __bfloat1622float2(x2[pair_base + pair_col]);
+        sum += v.x + v.y;
+        sq += v.x * v.x + v.y * v.y;
+    }
+    sum = block_sum_128_float(sum);
+    sq = block_sum_128_float(sq);
+    float mean = sum * (1.0f / K);
+    float var = sq * (1.0f / K) - mean * mean;
+    var = fmaxf(var, 0.0f);
+    float rstd = rsqrtf(var + eps);
+    if (tid == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int pair_col = tid + j * 128;
+        size_t pair_idx = pair_base + pair_col;
+        int col = pair_col * 2;
+        size_t scalar_idx = size_t(row) * K + col;
+        float2 xv = __bfloat1622float2(x2[pair_idx]);
+        float2 sh = __bfloat1622float2(shift2[param_pair_base + pair_col]);
+        float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
+        float out_x = ((xv.x - mean) * rstd) * (1.0f + sc.x) + sh.x;
+        float out_y = ((xv.y - mean) * rstd) * (1.0f + sc.y) + sh.y;
+        out[scalar_idx] = __float2bfloat16(out_x);
+        out[scalar_idx + 1] = __float2bfloat16(out_y);
+    }
+}
+
 __global__ void layernorm_adaln_forward_kernel(
     bf16 *__restrict__ out,
     float *__restrict__ mean_out,
@@ -1740,18 +1827,31 @@ void layernorm_adaln_entrypoint(
     int threads = 256;
     int smem = threads * 2 * sizeof(float);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    layernorm_adaln_forward_kernel<<<M, threads, smem, stream>>>(
-        reinterpret_cast<bf16*>(out.data_ptr()),
-        reinterpret_cast<float*>(mean.data_ptr()),
-        reinterpret_cast<float*>(rstd.data_ptr()),
-        reinterpret_cast<const bf16*>(A.data_ptr()),
-        reinterpret_cast<const bf16*>(shift.data_ptr()),
-        reinterpret_cast<const bf16*>(scale.data_ptr()),
-        M,
-        K,
-        static_cast<int>(tokens_per_sample),
-        static_cast<float>(eps)
-    );
+    if (K == 1024) {
+        layernorm_adaln_forward_k1024_vec2_kernel<<<M, 128, 0, stream>>>(
+            reinterpret_cast<bf16*>(out.data_ptr()),
+            reinterpret_cast<float*>(mean.data_ptr()),
+            reinterpret_cast<float*>(rstd.data_ptr()),
+            reinterpret_cast<const bf16*>(A.data_ptr()),
+            reinterpret_cast<const bf16*>(shift.data_ptr()),
+            reinterpret_cast<const bf16*>(scale.data_ptr()),
+            static_cast<int>(tokens_per_sample),
+            static_cast<float>(eps)
+        );
+    } else {
+        layernorm_adaln_forward_kernel<<<M, threads, smem, stream>>>(
+            reinterpret_cast<bf16*>(out.data_ptr()),
+            reinterpret_cast<float*>(mean.data_ptr()),
+            reinterpret_cast<float*>(rstd.data_ptr()),
+            reinterpret_cast<const bf16*>(A.data_ptr()),
+            reinterpret_cast<const bf16*>(shift.data_ptr()),
+            reinterpret_cast<const bf16*>(scale.data_ptr()),
+            M,
+            K,
+            static_cast<int>(tokens_per_sample),
+            static_cast<float>(eps)
+        );
+    }
 }
 
 void layernorm_stats_entrypoint(
