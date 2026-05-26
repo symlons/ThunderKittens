@@ -13,6 +13,9 @@ from dit3d_e2e_bench import (
     fused_adaln_linear_gelu,
     fused_linear_gated_residual,
     modulate,
+    tk_gemm_gelu_ln_adaln_op,
+    tk_gemm_linear_gated_residual_op,
+    tk_gemm_linear_ln_adaln_op,
 )
 from tk_bench import profile_groups, uniform_bf16
 
@@ -56,15 +59,44 @@ def torch_mlp_branch(x, shift, scale, gate, w1, b1, w2, b2, eps):
 
 
 def custom_ln_linear(x, shift, scale, w, b, eps):
-    return FusedAdaLNLinear.apply(x, shift, scale, w, b, eps)
+    batch, tokens, dim = x.shape
+    out, _, _, _ = tk_gemm_linear_ln_adaln_op(
+        x.reshape(batch * tokens, dim).contiguous(),
+        w.contiguous(),
+        b.contiguous(),
+        shift.contiguous(),
+        scale.contiguous(),
+        tokens,
+        eps,
+    )
+    return out.reshape(batch, tokens, w.shape[0])
 
 
 def custom_ln_linear_gelu(x, shift, scale, w, b, eps):
-    return FusedAdaLNLinearGelu.apply(x, shift, scale, w, b, eps)
+    batch, tokens, dim = x.shape
+    out, _, _, _ = tk_gemm_gelu_ln_adaln_op(
+        x.reshape(batch * tokens, dim).contiguous(),
+        w.contiguous(),
+        b.contiguous(),
+        shift.contiguous(),
+        scale.contiguous(),
+        tokens,
+        eps,
+    )
+    return out.reshape(batch, tokens, w.shape[0])
 
 
 def custom_linear_gated_residual(h, residual, gate, w, b):
-    return FusedLinearGatedResidual.apply(h, residual, gate, w, b)
+    batch, tokens, _ = h.shape
+    out, _ = tk_gemm_linear_gated_residual_op(
+        h.reshape(batch * tokens, h.shape[-1]).contiguous(),
+        w.contiguous(),
+        residual.reshape(batch * tokens, residual.shape[-1]).contiguous(),
+        gate.contiguous(),
+        b.contiguous(),
+        tokens,
+    )
+    return out.reshape_as(residual)
 
 
 def custom_mlp_branch(x, shift, scale, gate, w1, b1, w2, b2, eps):
@@ -220,6 +252,7 @@ def compare_case(
     torch_group = clone_ln_group(base_group)
     compile_group = clone_ln_group(base_group)
     custom_group = clone_ln_group(base_group)
+    custom_compile_group = clone_ln_group(base_group)
 
     if eps is None:
         torch_call = torch_fn
@@ -239,6 +272,7 @@ def compare_case(
     else:
         raise ValueError(f"unsupported group arity for eps case: {len(base_group)}")
     compiled_call = compile_fn(torch_call)
+    compiled_custom_call = compile_fn(custom_call)
 
     with torch.no_grad():
         check_close(label, custom_call(*custom_group[:-1]), torch_call(*torch_group[:-1]))
@@ -259,12 +293,23 @@ def compare_case(
         iters=iters,
         cooldown_s=0.0,
     )
-    speedup = compile_result.us / custom_result.us
+    custom_compile_result = profile_groups(
+        f"{label} custom+torch.compile train",
+        [custom_compile_group],
+        lambda g: train_step(compiled_custom_call, g),
+        warmup=max(3, min(warmup, 10)),
+        iters=iters,
+        cooldown_s=0.0,
+    )
+    custom_speedup = compile_result.us / custom_result.us
+    custom_compile_speedup = compile_result.us / custom_compile_result.us
     print(
-        f"RESULT {label}: compile={compile_result.us:.2f}us custom={custom_result.us:.2f}us speedup={speedup:.2f}x",
+        f"RESULT {label}: compile={compile_result.us:.2f}us "
+        f"custom={custom_result.us:.2f}us custom_speedup={custom_speedup:.2f}x "
+        f"custom_compile={custom_compile_result.us:.2f}us custom_compile_speedup={custom_compile_speedup:.2f}x",
         flush=True,
     )
-    return compile_result.us, custom_result.us
+    return compile_result.us, custom_compile_result.us
 
 
 def run_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, eps: float) -> None:

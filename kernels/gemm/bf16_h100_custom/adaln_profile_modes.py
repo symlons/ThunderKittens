@@ -160,6 +160,15 @@ def command_for_mode(mode: str) -> list[str]:
             "--iters", "6",
             "--cases", "pre_qkv", "fc1_gelu", "post_residual",
         ]
+    if mode == "custom_vs_compile_smoke":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--shapes", "64x1024",
+            "--dim", "1024",
+            "--warmup", "2",
+            "--iters", "2",
+            "--cases", "pre_qkv", "fc1_gelu", "post_residual",
+        ]
     if mode == "custom_vs_compile_large_batch_h200":
         return [
             "python3", "compare_custom_compile.py",
@@ -172,6 +181,22 @@ def command_for_mode(mode: str) -> list[str]:
             "--warmup", "4",
             "--iters", "6",
             "--cases", "pre_qkv", "fc1_gelu", "post_residual",
+        ]
+    if mode == "dit_block_profile":
+        return [
+            "python3", "dit_block_profile.py",
+            "--model", "L",
+            "--shapes", "64x1024", "80x1024", "16x4096", "20x4096",
+            "--warmup", "4",
+            "--iters", "6",
+        ]
+    if mode == "dit_block_profile_h200":
+        return [
+            "python3", "dit_block_profile.py",
+            "--model", "L",
+            "--shapes", "128x1024", "160x1024", "32x4096", "40x4096",
+            "--warmup", "4",
+            "--iters", "6",
         ]
     if mode == "torch_compile_capacity":
         return [

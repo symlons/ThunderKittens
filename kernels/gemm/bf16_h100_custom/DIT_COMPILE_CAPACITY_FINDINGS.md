@@ -131,3 +131,63 @@ uvx modal run kernels/gemm/bf16_h100_custom/modal_adaln.py --gpu H200 --mode cus
 ```
 
 The T64/T128 pairs keep the same rough total-token pressure as the measured T1024/T4096 capacity boundary. Smaller batch sizes at those short sequence lengths are not useful for judging realistic high-memory H100/H200 training regimes.
+
+## Current Individual Kernel Results
+
+Runs use forward+backward train-step timing against pure `torch.compile`, without full-DiT E2E training. The intended headline comparison is custom/TK kernels inside a `torch.compile` path versus the pure `torch.compile` baseline. Older rows below that say only `custom` measured the eager custom call path and should be treated as diagnostic until rerun with `custom_compile`.
+
+H100 80GB run for `pre_qkv`, `fc1_gelu`, and `post_residual`:
+
+| Shape | pre_qkv | fc1_gelu | post_residual |
+| --- | ---: | ---: | ---: |
+| B1024 T64 | 0.42x | 0.49x | 0.56x |
+| B1280 T64 | 0.39x | 0.50x | 0.56x |
+| B512 T128 | 0.43x | 0.55x | 0.54x |
+| B640 T128 | 0.42x | 0.53x | 0.54x |
+| B64 T1024 | 0.42x | 0.54x | 0.54x |
+| B80 T1024 | 0.41x | 0.54x | 0.54x |
+| B16 T4096 | 0.53x | 0.61x | 0.59x |
+| B20 T4096 | 0.49x | 0.58x | 0.57x |
+
+Full MLP branch results:
+
+| Shape | full_mlp_branch speedup |
+| --- | ---: |
+| B1024 T64 | 0.56x |
+| B1280 T64 | 0.56x |
+| B512 T128 | 0.56x |
+| B640 T128 | 0.58x |
+| B64 T1024 | 0.56x |
+| B80 T1024 | 0.58x |
+
+Long-context full MLP branch run landed on H100 NVL (~95 GiB), not the earlier H100 80GB instance:
+
+| Shape | pre_qkv | fc1_gelu | post_residual | full_mlp_branch |
+| --- | ---: | ---: | ---: | ---: |
+| B16 T4096 | 0.45x | 0.52x | 0.58x | 0.60x |
+| B20 T4096 | 0.44x | 0.52x | 0.53x | 0.59x |
+| B4 T16384 | 0.42x | 0.54x | 0.53x | 0.62x |
+| B5 T16384 | 0.46x | 0.58x | 0.52x | 0.63x |
+
+Takeaway: the current custom fused kernels are slower than `torch.compile` at realistic H100-sized shapes. The best observed individual result is still below parity at about 0.63x.
+
+## Current DiTBlock Results
+
+Block-only benchmark command:
+
+```bash
+uvx modal run kernels/gemm/bf16_h100_custom/modal_adaln.py --gpu H100 --mode dit_block_profile
+```
+
+This profiles one `DiTBlock` train step with synthetic `(x, c)` inputs and does not run full-DiT E2E training. Attention is included inside the block and kept on the same backend for the compared variants. Custom variants are wrapped in `torch.compile`, so the comparison is TK/custom block paths plus `torch.compile` versus pure `torch.compile`.
+
+H100 80GB block speedups versus the regular `torch.compile` block baseline:
+
+| Shape | eager | custom_adaln_residual | custom_full |
+| --- | ---: | ---: | ---: |
+| B64 T1024 | 0.79x | 0.85x | 0.70x |
+| B80 T1024 | 0.79x | 0.85x | 0.71x |
+| B16 T4096 | 0.87x | 0.92x | 0.81x |
+| B20 T4096 | 0.90x | 0.93x | 0.83x |
+
+Takeaway: block-level fusion is closer to parity than isolated kernels, especially at T4096, but it is still slower than the regular `torch.compile` block baseline. The fuller fused projection/MLP path is slower than the simpler fused AdaLN+residual path.
