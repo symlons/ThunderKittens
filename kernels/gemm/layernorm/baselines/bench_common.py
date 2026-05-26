@@ -7,8 +7,9 @@ import torch
 import torch.nn as nn
 
 
-COOLDOWN_S = 0.5
+COOLDOWN_S = 0.05 # for final results use 0.5
 DEFAULT_SHAPES = ["64x1024", "80x1024", "16x4096", "20x4096"]
+PROFILE_MODES = ("fwd", "deploy", "bwd", "fwd-bwd")
 GRAD_SEED_BWD = 17
 GRAD_SEED_FWD_BWD = 31
 
@@ -25,6 +26,27 @@ class ProfileCase:
     flops: float
     hbm_bytes: int
     correctness: Correctness | None
+
+
+@dataclass(frozen=True)
+class TimingResult:
+    us: float
+    tflops: float
+    hbm_gb_s: float
+    hbm_tb_s: float
+
+
+@dataclass(frozen=True)
+class WorkloadPart:
+    name: str
+    flops: float
+    bytes: int
+
+
+@dataclass(frozen=True)
+class MeasuredPart:
+    name: str
+    us: float
 
 
 def parse_shape(text: str) -> tuple[int, int]:
@@ -79,6 +101,57 @@ def prompt_shapes(default: list[str]) -> list[str]:
 
 def should_prompt() -> bool:
     return len(sys.argv) == 1
+
+
+def prompt_compile_options(args) -> None:
+    compile_choice = prompt_choice("torch.compile", ["off", "on"], "off")
+    args.compile = compile_choice == "on"
+    if not args.compile:
+        return
+
+    args.compile_backend = prompt_choice("compile backend", ["inductor", "eager", "aot_eager"], args.compile_backend)
+    args.compile_mode = prompt_choice("compile mode", ["default", "reduce-overhead", "max-autotune"], args.compile_mode)
+    args.compile_fullgraph = prompt_choice("compile fullgraph", ["off", "on"], "off") == "on"
+    args.compile_dynamic = prompt_choice("compile dynamic", ["auto", "true", "false"], args.compile_dynamic)
+
+
+def prompt_diagnostic_options(args) -> None:
+    diagnostics_choice = prompt_choice("graph breaks / profiler trace", ["off", "on"], "off")
+    if diagnostics_choice != "on":
+        return
+
+    args.dynamo_explain = prompt_choice("Dynamo explain", ["off", "on"], "on") == "on"
+    trace_choice = prompt_choice("export profiler trace", ["off", "on"], "off")
+    if trace_choice == "on":
+        args.profiler_trace = input("trace file [trace.json]: ").strip() or "trace.json"
+
+
+def compile_module(
+    module: nn.Module,
+    *,
+    backend: str,
+    mode: str,
+    fullgraph: bool,
+    dynamic: str,
+) -> nn.Module:
+    compile_mode = None if mode == "default" else mode
+    compile_dynamic = None if dynamic == "auto" else dynamic == "true"
+    return torch.compile(
+        module,
+        backend=backend,
+        mode=compile_mode,
+        fullgraph=fullgraph,
+        dynamic=compile_dynamic,
+    )
+
+
+def trace_path(base: str, *, shape: str, mode: str, multi: bool) -> str:
+    if not multi:
+        return base
+    if base.endswith(".json"):
+        stem = base[:-5]
+        return f"{stem}_{shape}_{mode}.json"
+    return f"{base}_{shape}_{mode}.json"
 
 
 def l2_cache_size_bytes(device: torch.device) -> int:
@@ -193,6 +266,68 @@ def print_allocator_report(
     print_kv("peak reserv", format_bytes(peak_reserved), indent=4)
 
 
+def print_profiled_bandwidth_report(*, bytes_per_iter: int, gb_s: float, tb_s: float) -> None:
+    print_kv("Profiled BW", "")
+    print_kv("traffic/iter", format_bytes(bytes_per_iter), indent=4)
+    print_kv("GB/s", f"{gb_s:.2f}", indent=4)
+    print_kv("TB/s", f"{tb_s:.3f}", indent=4)
+    print_kv("source", "estimated traffic for this mode", indent=4)
+
+
+def print_architecture_workload(
+    *,
+    op_name: str,
+    mode: str,
+    shape: str,
+    dim: int,
+    dtype: torch.dtype,
+    parts: list[WorkloadPart],
+) -> None:
+    total_flops = sum(part.flops for part in parts)
+    total_bytes = sum(part.bytes for part in parts)
+
+    print(f"\nArchitecture workload op={op_name} mode={mode} shape={shape} dim={dim} dtype={dtype}")
+    print("  part                  FLOPs        FLOP%      traffic      traffic%")
+    for part in parts:
+        flop_pct = 100.0 * part.flops / total_flops if total_flops else 0.0
+        byte_pct = 100.0 * part.bytes / total_bytes if total_bytes else 0.0
+        print(
+            f"  {part.name:<18} "
+            f"{part.flops:>12.3e} "
+            f"{flop_pct:>8.2f}% "
+            f"{format_bytes(part.bytes):>12} "
+            f"{byte_pct:>8.2f}%"
+        )
+    print(
+        f"  {'total':<18} "
+        f"{total_flops:>12.3e} "
+        f"{100.0:>8.2f}% "
+        f"{format_bytes(total_bytes):>12} "
+        f"{100.0:>8.2f}%"
+    )
+    print_kv("source", "estimated original formulation, not profiler kernel names")
+
+
+def print_architecture_measurements(
+    *,
+    op_name: str,
+    mode: str,
+    shape: str,
+    dim: int,
+    dtype: torch.dtype,
+    parts: list[MeasuredPart],
+) -> None:
+    total_us = sum(part.us for part in parts)
+
+    print(f"\nArchitecture measured time op={op_name} mode={mode} shape={shape} dim={dim} dtype={dtype}")
+    print("  part                     time      time%")
+    for part in parts:
+        time_pct = 100.0 * part.us / total_us if total_us else 0.0
+        print(f"  {part.name:<18} {part.us:>10.2f} us {time_pct:>8.2f}%")
+    print(f"  {'total':<18} {total_us:>10.2f} us {100.0:>8.2f}%")
+    print_kv("source", "CUDA events around original formulation components")
+
+
 def print_benchmark_report(
     *,
     op_name: str,
@@ -206,6 +341,7 @@ def print_benchmark_report(
     output_shape: tuple[int, ...],
     us: float,
     tflops: float,
+    hbm_gb_s: float,
     hbm_tb_s: float,
     hbm_bytes: int,
     total_bytes: int,
@@ -228,7 +364,7 @@ def print_benchmark_report(
     print_kv("output", str(output_shape))
     print_kv("time", f"{us:.2f} us")
     print_kv("TFLOPS", f"{tflops:.2f}")
-    print_kv("HBM BW", f"{hbm_tb_s:.2f} TB/s estimated traffic ({format_bytes(hbm_bytes)} / iter)")
+    print_profiled_bandwidth_report(bytes_per_iter=hbm_bytes, gb_s=hbm_gb_s, tb_s=hbm_tb_s)
     print_hbm_report(
         total_bytes=total_bytes,
         hbm_used_before=hbm_used_before,
@@ -257,6 +393,15 @@ def print_benchmark_report(
                 f"atol={atol:g} rtol={rtol:g}"
             ),
         )
+
+
+def print_baseline_comparison(*, current_name: str, current: TimingResult, baseline_name: str, baseline: TimingResult) -> None:
+    speedup = baseline.us / current.us if current.us else 0.0
+    print_kv("Compare", "")
+    print_kv("baseline", f"{baseline_name}: {baseline.us:.2f} us", indent=4)
+    print_kv("current", f"{current_name}: {current.us:.2f} us", indent=4)
+    print_kv("speedup", f"{speedup:.3f}x vs baseline", indent=4)
+    print_kv("delta", f"{current.us - baseline.us:+.2f} us", indent=4)
 
 
 def clear_grads(module: nn.Module, inputs: list[torch.Tensor]) -> None:
@@ -418,9 +563,80 @@ def make_fwd_bwd_case(
     )
 
 
+def run_dynamo_explain(case: ProfileCase) -> None:
+    print(f"\nDynamo explain for mode={case.mode}")
+    explanation = torch._dynamo.explain(case.run)(case.groups[0])
+    graph_count = getattr(explanation, "graph_count", None)
+    graph_break_count = getattr(explanation, "graph_break_count", None)
+    break_reasons = getattr(explanation, "break_reasons", None)
+    if graph_count is not None:
+        print_kv("graphs", str(graph_count))
+    if graph_break_count is not None:
+        print_kv("breaks", str(graph_break_count))
+    if break_reasons:
+        print_kv("break reasons", "")
+        for reason in break_reasons:
+            print(f"    {reason}")
+    else:
+        print_kv("break reasons", "none reported")
+    print(explanation)
+
+
+def export_profiler_trace(case: ProfileCase, trace_file: str, *, warmup: int = 5, active: int = 10) -> None:
+    print(f"\nExporting profiler trace for mode={case.mode}: {trace_file}")
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    torch.cuda.synchronize()
+    for i in range(warmup):
+        case.run(case.groups[i % len(case.groups)])
+    torch.cuda.synchronize()
+
+    with torch.profiler.profile(
+        activities=activities,
+        record_shapes=True,
+        with_stack=False,
+        profile_memory=True,
+    ) as prof:
+        for i in range(active):
+            case.run(case.groups[i % len(case.groups)])
+            prof.step()
+
+    torch.cuda.synchronize()
+    prof.export_chrome_trace(trace_file)
+    print_kv("trace", trace_file)
+    print_kv("inspect", "CompiledFunction, triton_* kernels, cuBLAS/cuDNN, custom ops")
+
+
+def time_case(case: ProfileCase, *, num_groups: int, warmup: int, iters: int) -> TimingResult:
+    torch.cuda.synchronize()
+    for i in range(warmup):
+        case.run(case.groups[i % num_groups])
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for i in range(iters):
+        case.run(case.groups[i % num_groups])
+    end.record()
+    end.synchronize()
+
+    us = start.elapsed_time(end) * 1000.0 / iters
+    seconds = us * 1e-6
+    return TimingResult(
+        us=us,
+        tflops=case.flops / seconds / 1e12,
+        hbm_gb_s=case.hbm_bytes / seconds / 1e9,
+        hbm_tb_s=case.hbm_bytes / seconds / 1e12,
+    )
+
+
 def run_profile(
     case: ProfileCase,
     *,
+    baseline_case: ProfileCase | None = None,
+    baseline_name: str | None = None,
     op_name: str,
     shape: str,
     dim: int,
@@ -441,23 +657,11 @@ def run_profile(
     torch.cuda.reset_peak_memory_stats(device)
     hbm_used_before_profile, _, _ = device_hbm_used_bytes(device)
 
-    torch.cuda.synchronize()
-    for i in range(warmup):
-        case.run(case.groups[i % num_groups])
+    baseline_result = None
+    if baseline_case is not None:
+        baseline_result = time_case(baseline_case, num_groups=num_groups, warmup=warmup, iters=iters)
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-    for i in range(iters):
-        case.run(case.groups[i % num_groups])
-    end.record()
-    end.synchronize()
-
-    us = start.elapsed_time(end) * 1000.0 / iters
-    seconds = us * 1e-6
-    tflops = case.flops / seconds / 1e12
-    hbm_tb_s = case.hbm_bytes / seconds / 1e12
+    result = time_case(case, num_groups=num_groups, warmup=warmup, iters=iters)
     peak_allocated = torch.cuda.max_memory_allocated(device)
     peak_reserved = torch.cuda.max_memory_reserved(device)
     hbm_used_after_profile, hbm_free_after_profile, _ = device_hbm_used_bytes(device)
@@ -474,9 +678,10 @@ def run_profile(
         l2_bytes=l2_bytes,
         num_groups=num_groups,
         output_shape=case.output_shape,
-        us=us,
-        tflops=tflops,
-        hbm_tb_s=hbm_tb_s,
+        us=result.us,
+        tflops=result.tflops,
+        hbm_gb_s=result.hbm_gb_s,
+        hbm_tb_s=result.hbm_tb_s,
         hbm_bytes=case.hbm_bytes,
         total_bytes=total_bytes,
         hbm_used_before=hbm_used_before,
@@ -492,6 +697,13 @@ def run_profile(
         peak_reserved=peak_reserved,
         correctness=case.correctness,
     )
+    if baseline_result is not None and baseline_name is not None:
+        print_baseline_comparison(
+            current_name=op_name,
+            current=result,
+            baseline_name=baseline_name,
+            baseline=baseline_result,
+        )
 
     torch.cuda.synchronize()
     time.sleep(COOLDOWN_S)
