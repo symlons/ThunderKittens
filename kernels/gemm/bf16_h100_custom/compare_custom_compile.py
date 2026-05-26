@@ -321,11 +321,27 @@ def run_shape_cases(batch: int, tokens: int, dim: int, warmup: int, iters: int, 
         )
 
 
+def parse_shape_pair(value: str) -> tuple[int, int]:
+    for sep in ("x", ":", ","):
+        if sep not in value:
+            continue
+        batch_s, tokens_s = value.split(sep, 1)
+        return int(batch_s), int(tokens_s)
+    raise argparse.ArgumentTypeError(f"shape must be BxT, B:T, or B,T; got {value!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--batches", type=int, nargs="+", default=None)
     parser.add_argument("--tokens", type=int, nargs="+", default=[64, 128, 1024])
+    parser.add_argument(
+        "--shapes",
+        type=parse_shape_pair,
+        nargs="+",
+        default=None,
+        help="Explicit batch/token pairs as BxT, B:T, or B,T. Overrides --batch/--batches x --tokens.",
+    )
     parser.add_argument("--dim", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
@@ -342,13 +358,15 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
     torch.cuda.init()
-    batches = args.batches or [args.batch or 4]
-    for batch in batches:
-        for tokens in args.tokens:
-            if args.correctness_only:
-                detailed_correctness(batch, tokens, args.dim, args.eps)
-            else:
-                run_shape_cases(batch, tokens, args.dim, args.warmup, args.iters, args.eps, set(args.cases))
+    shape_pairs = args.shapes
+    if shape_pairs is None:
+        batches = args.batches or [args.batch or 4]
+        shape_pairs = [(batch, tokens) for batch in batches for tokens in args.tokens]
+    for batch, tokens in shape_pairs:
+        if args.correctness_only:
+            detailed_correctness(batch, tokens, args.dim, args.eps)
+        else:
+            run_shape_cases(batch, tokens, args.dim, args.warmup, args.iters, args.eps, set(args.cases))
 
 
 if __name__ == "__main__":

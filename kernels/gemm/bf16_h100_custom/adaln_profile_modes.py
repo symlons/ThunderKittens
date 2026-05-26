@@ -89,11 +89,13 @@ def command_for_mode(mode: str) -> list[str]:
     if mode == "custom_vs_compile":
         return [
             "python3", "compare_custom_compile.py",
-            "--batches", "1", "2", "4", "8",
-            "--tokens", "64", "128", "1024",
+            "--shapes",
+            "1024x64", "1280x64",
+            "512x128", "640x128",
+            "64x1024", "80x1024",
             "--dim", "1024",
-            "--warmup", "8",
-            "--iters", "15",
+            "--warmup", "4",
+            "--iters", "6",
         ]
     if mode == "custom_correctness":
         return [
@@ -106,17 +108,41 @@ def command_for_mode(mode: str) -> list[str]:
     if mode == "custom_vs_compile_fixed":
         return [
             "python3", "compare_custom_compile.py",
-            "--batches", "1", "2", "4", "8",
-            "--tokens", "64", "128", "1024",
+            "--shapes",
+            "1024x64", "1280x64",
+            "512x128", "640x128",
+            "64x1024", "80x1024",
             "--dim", "1024",
-            "--warmup", "8",
-            "--iters", "15",
+            "--warmup", "4",
+            "--iters", "6",
         ]
     if mode == "custom_vs_compile_long":
         return [
             "python3", "compare_custom_compile.py",
-            "--batches", "1", "2", "4",
-            "--tokens", "4096", "16384",
+            "--shapes",
+            "16x4096", "20x4096",
+            "4x16384", "5x16384",
+            "--dim", "1024",
+            "--warmup", "4",
+            "--iters", "6",
+        ]
+    if mode == "custom_vs_compile_h200":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--shapes",
+            "2048x64", "2560x64",
+            "1024x128", "1280x128",
+            "128x1024", "160x1024",
+            "--dim", "1024",
+            "--warmup", "4",
+            "--iters", "6",
+        ]
+    if mode == "custom_vs_compile_long_h200":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--shapes",
+            "32x4096", "40x4096",
+            "8x16384", "10x16384",
             "--dim", "1024",
             "--warmup", "4",
             "--iters", "6",
@@ -124,8 +150,24 @@ def command_for_mode(mode: str) -> list[str]:
     if mode == "custom_vs_compile_large_batch":
         return [
             "python3", "compare_custom_compile.py",
-            "--batches", "16", "32",
-            "--tokens", "64", "128", "1024",
+            "--shapes",
+            "1024x64", "1280x64",
+            "512x128", "640x128",
+            "64x1024", "80x1024",
+            "16x4096", "20x4096",
+            "--dim", "1024",
+            "--warmup", "4",
+            "--iters", "6",
+            "--cases", "pre_qkv", "fc1_gelu", "post_residual",
+        ]
+    if mode == "custom_vs_compile_large_batch_h200":
+        return [
+            "python3", "compare_custom_compile.py",
+            "--shapes",
+            "2048x64", "2560x64",
+            "1024x128", "1280x128",
+            "128x1024", "160x1024",
+            "32x4096", "40x4096",
             "--dim", "1024",
             "--warmup", "4",
             "--iters", "6",

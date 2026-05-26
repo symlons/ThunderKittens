@@ -58,3 +58,76 @@ Current H100 capacity for this setup at sequence length 4096: **batch 20**.
 - For H100/H200 capacity sweeps, avoid tiny batches by default. Start near expected memory pressure and bracket the OOM boundary.
 - Use `--second-step` only when steady-state post-compile memory matters; it roughly doubles runtime and is not needed for a first capacity boundary.
 - Full torch.compile train-step compilation can take minutes for a new shape. Peak memory results are still the key signal for capacity.
+
+## Speedup Measurement Scope
+
+Measure custom-kernel speedups at three levels. Treat the highest level as the headline result, and use lower levels to explain where the time moved.
+
+1. **E2E full training step**
+
+   This is the primary number. Use the same realistic full-DiT training path used for capacity search: full model, forward, backward, representative batch/sequence shape, and `torch.compile` as the baseline. Compare:
+
+   - regular eager PyTorch
+   - regular `torch.compile` without custom/TK kernels
+   - custom/TK-enabled model variants
+
+   Report wall time per train step, peak allocated/reserved memory, batch size, token count, GPU, attention backend, and whether the first compile step is excluded. Use the maximum realistic batch for each sequence length rather than small synthetic batches.
+
+2. **DiTBlock-level speedups**
+
+   Measure the block in the same shape regime as E2E, using this logical scope:
+
+   ```python
+   shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+   x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+   x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+   ```
+
+   Report speedups for:
+
+   - pre-attention path: `norm1 + AdaLN modulation + qkv/input projection` where applicable
+   - post-attention path: attention output projection plus gated residual where applicable
+   - MLP path: `norm2 + AdaLN modulation + fc1 + GELU + fc2 + gated residual`
+
+   Attention itself is not the current optimization target, so isolate it or keep the backend fixed when reporting block-level results. The block-level result should explain how much of the E2E gain is available before/after attention and inside the MLP.
+
+3. **Individual fused kernels**
+
+   Use individual kernel profiling to attribute wins and losses, not as the headline. Compare custom kernels against eager and `torch.compile` for:
+
+   - `pre_qkv_ln_adaln_linear`
+   - `mlp_fc1_ln_adaln_linear_gelu`
+   - `post_linear_gated_residual`
+   - `full_mlp_branch`
+
+   Report forward+backward train-step time for each case, correctness deltas, and speedup versus `torch.compile`. Prefer capacity-relevant `B*T` sizes over small convenience shapes.
+
+## Individual Kernel Profiling Shapes
+
+Use explicit `BxT` shape pairs for custom-vs-compile kernel profiling so each sequence length is tested near the realistic full-DiT capacity regime instead of as a Cartesian product of small batches and token counts.
+
+H100 80GB shape pairs:
+
+- T64: B1024 and B1280
+- T128: B512 and B640
+- T1024: B64 and B80
+- T4096: B16 and B20
+- T16384: B4 and B5 for the long-context mode
+
+H200 140GB shape pairs should start at roughly double the H100 batch sizes:
+
+- T64: B2048 and B2560
+- T128: B1024 and B1280
+- T1024: B128 and B160
+- T4096: B32 and B40
+- T16384: B8 and B10 for the long-context mode
+
+Use the `_h200` profiling modes for these shapes:
+
+```bash
+uvx modal run kernels/gemm/bf16_h100_custom/modal_adaln.py --gpu H200 --mode custom_vs_compile_h200
+uvx modal run kernels/gemm/bf16_h100_custom/modal_adaln.py --gpu H200 --mode custom_vs_compile_large_batch_h200
+uvx modal run kernels/gemm/bf16_h100_custom/modal_adaln.py --gpu H200 --mode custom_vs_compile_long_h200
+```
+
+The T64/T128 pairs keep the same rough total-token pressure as the measured T1024/T4096 capacity boundary. Smaller batch sizes at those short sequence lengths are not useful for judging realistic high-memory H100/H200 training regimes.
