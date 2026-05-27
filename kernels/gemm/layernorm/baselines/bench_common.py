@@ -1,7 +1,8 @@
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, ContextManager
 
 import torch
 import torch.nn as nn
@@ -62,6 +63,22 @@ def parse_dtype(text: str) -> torch.dtype:
     if text == "fp32" or text == "float32":
         return torch.float32
     raise ValueError(f"unsupported dtype: {text}")
+
+
+def parse_optional_dtype(text: str) -> torch.dtype | None:
+    if text == "off" or text == "none":
+        return None
+    return parse_dtype(text)
+
+
+def format_dtype(dtype: torch.dtype | None) -> str:
+    return "off" if dtype is None else str(dtype).replace("torch.", "")
+
+
+def autocast_context(device: torch.device, dtype: torch.dtype | None) -> ContextManager:
+    if dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
 
 def prompt_choice(label: str, choices: list[str], default: str) -> str:
@@ -185,6 +202,36 @@ def uniform_tensor(
     return x.to(dtype)
 
 
+def group_device(group: object) -> torch.device:
+    if isinstance(group, torch.Tensor):
+        return group.device
+    if isinstance(group, tuple) and group and isinstance(group[0], torch.Tensor):
+        return group[0].device
+    raise TypeError(f"unsupported input group type: {type(group)}")
+
+
+def call_module(module: nn.Module, group: object) -> torch.Tensor:
+    if isinstance(group, tuple):
+        return module(*group)
+    return module(group)
+
+
+def clone_group_for_grad(group: object) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    if isinstance(group, torch.Tensor):
+        return group.detach().clone().requires_grad_(True)
+    if isinstance(group, tuple):
+        return tuple(t.detach().clone().requires_grad_(True) for t in group)
+    raise TypeError(f"unsupported input group type: {type(group)}")
+
+
+def group_tensors(group: object) -> list[torch.Tensor]:
+    if isinstance(group, torch.Tensor):
+        return [group]
+    if isinstance(group, tuple):
+        return list(group)
+    raise TypeError(f"unsupported input group type: {type(group)}")
+
+
 def make_input_groups(
     shape: tuple[int, ...],
     dtype: torch.dtype,
@@ -281,12 +328,16 @@ def print_architecture_workload(
     shape: str,
     dim: int,
     dtype: torch.dtype,
+    autocast_dtype: torch.dtype | None,
     parts: list[WorkloadPart],
 ) -> None:
     total_flops = sum(part.flops for part in parts)
     total_bytes = sum(part.bytes for part in parts)
 
-    print(f"\nArchitecture workload op={op_name} mode={mode} shape={shape} dim={dim} dtype={dtype}")
+    print(
+        f"\nArchitecture workload op={op_name} mode={mode} shape={shape} dim={dim} "
+        f"dtype={format_dtype(dtype)} autocast={format_dtype(autocast_dtype)}"
+    )
     print("  part                  FLOPs        FLOP%      traffic      traffic%")
     for part in parts:
         flop_pct = 100.0 * part.flops / total_flops if total_flops else 0.0
@@ -315,11 +366,15 @@ def print_architecture_measurements(
     shape: str,
     dim: int,
     dtype: torch.dtype,
+    autocast_dtype: torch.dtype | None,
     parts: list[MeasuredPart],
 ) -> None:
     total_us = sum(part.us for part in parts)
 
-    print(f"\nArchitecture measured time op={op_name} mode={mode} shape={shape} dim={dim} dtype={dtype}")
+    print(
+        f"\nArchitecture measured time op={op_name} mode={mode} shape={shape} dim={dim} "
+        f"dtype={format_dtype(dtype)} autocast={format_dtype(autocast_dtype)}"
+    )
     print("  part                     time      time%")
     for part in parts:
         time_pct = 100.0 * part.us / total_us if total_us else 0.0
@@ -336,6 +391,7 @@ def print_benchmark_report(
     shape: str,
     dim: int,
     dtype: torch.dtype,
+    autocast_dtype: torch.dtype | None,
     l2_bytes: int,
     num_groups: int,
     output_shape: tuple[int, ...],
@@ -358,7 +414,10 @@ def print_benchmark_report(
     peak_reserved: int,
     correctness: Correctness | None,
 ) -> None:
-    print(f"\nop={op_name} mode={mode} model={model_state} shape={shape} dim={dim} dtype={dtype}")
+    print(
+        f"\nop={op_name} mode={mode} model={model_state} shape={shape} dim={dim} "
+        f"dtype={format_dtype(dtype)} autocast={format_dtype(autocast_dtype)}"
+    )
     print_kv("l2", f"{l2_bytes / 1024 / 1024:.1f} MiB")
     print_kv("groups", str(num_groups))
     print_kv("output", str(output_shape))
@@ -417,6 +476,12 @@ def grad_snapshot(x: torch.Tensor, module: nn.Module) -> tuple[torch.Tensor, ...
     return tuple(grads)
 
 
+def grad_snapshot_group(group: object, module: nn.Module) -> tuple[torch.Tensor, ...]:
+    grads = [t.grad.detach().float() for t in group_tensors(group) if t.grad is not None]
+    grads.extend(param.grad.detach().float() for param in module.parameters() if param.grad is not None)
+    return tuple(grads)
+
+
 def compare_tensors(actual: tuple[torch.Tensor, ...], expected: tuple[torch.Tensor, ...], *, eps: float) -> Correctness:
     diffs = [(a - e).abs() for a, e in zip(actual, expected)]
     max_diff = max(diff.max().item() for diff in diffs)
@@ -427,10 +492,11 @@ def compare_tensors(actual: tuple[torch.Tensor, ...], expected: tuple[torch.Tens
     return ok, max_diff, mean_diff, rel_diff, eps, 0.0
 
 
-def self_consistency(module: nn.Module, group: torch.Tensor, *, eps: float) -> Correctness:
-    with torch.inference_mode():
-        actual = module(group).float()
-        expected = module(group).float()
+def self_consistency(module: nn.Module, group: torch.Tensor, *, eps: float, inference: bool) -> Correctness:
+    context = torch.inference_mode if inference else torch.no_grad
+    with context():
+        actual = call_module(module, group).float().clone()
+        expected = call_module(module, group).float().clone()
         correctness = compare_tensors((actual,), (expected,), eps=eps)
     del actual, expected
     torch.cuda.synchronize()
@@ -439,19 +505,31 @@ def self_consistency(module: nn.Module, group: torch.Tensor, *, eps: float) -> C
 
 def make_fwd_case(
     module: nn.Module,
-    groups: list[torch.Tensor],
+    groups: list[object],
     *,
     mode: str,
     flops: float,
     hbm_bytes: int,
     eps: float,
     check_correctness: bool,
+    autocast_dtype: torch.dtype | None,
 ) -> ProfileCase:
-    correctness = self_consistency(module, groups[0], eps=eps) if check_correctness else None
+    def forward(group: torch.Tensor) -> torch.Tensor:
+        with autocast_context(group_device(group), autocast_dtype):
+            return call_module(module, group)
+
+    correctness = None
+    if check_correctness:
+        with torch.no_grad(), autocast_context(group_device(groups[0]), autocast_dtype):
+            actual = call_module(module, groups[0]).float().clone()
+            expected = call_module(module, groups[0]).float().clone()
+        correctness = compare_tensors((actual,), (expected,), eps=eps)
+        del actual, expected
+        torch.cuda.synchronize()
 
     def run(group: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            return module(group)
+            return forward(group)
 
     output = run(groups[0])
     return ProfileCase(mode=mode, groups=groups, run=run, output_shape=tuple(output.shape), flops=flops, hbm_bytes=hbm_bytes, correctness=correctness)
@@ -459,19 +537,27 @@ def make_fwd_case(
 
 def make_deploy_case(
     module: nn.Module,
-    groups: list[torch.Tensor],
+    groups: list[object],
     *,
     mode: str,
     flops: float,
     hbm_bytes: int,
     eps: float,
     check_correctness: bool,
+    autocast_dtype: torch.dtype | None,
 ) -> ProfileCase:
-    correctness = self_consistency(module, groups[0], eps=eps) if check_correctness else None
+    correctness = None
+    if check_correctness:
+        with torch.inference_mode(), autocast_context(group_device(groups[0]), autocast_dtype):
+            actual = call_module(module, groups[0]).float().clone()
+            expected = call_module(module, groups[0]).float().clone()
+        correctness = compare_tensors((actual,), (expected,), eps=eps)
+        del actual, expected
+        torch.cuda.synchronize()
 
     def run(group: torch.Tensor) -> torch.Tensor:
-        with torch.inference_mode():
-            return module(group)
+        with torch.inference_mode(), autocast_context(group_device(group), autocast_dtype):
+            return call_module(module, group)
 
     output = run(groups[0])
     return ProfileCase(mode=mode, groups=groups, run=run, output_shape=tuple(output.shape), flops=flops, hbm_bytes=hbm_bytes, correctness=correctness)
@@ -479,7 +565,7 @@ def make_deploy_case(
 
 def make_bwd_case(
     module: nn.Module,
-    groups: list[torch.Tensor],
+    groups: list[object],
     *,
     mode: str,
     flops: float,
@@ -487,32 +573,34 @@ def make_bwd_case(
     dtype: torch.dtype,
     eps: float,
     check_correctness: bool,
+    autocast_dtype: torch.dtype | None,
 ) -> ProfileCase:
-    grad_groups: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    grad_groups: list[tuple[object, torch.Tensor, torch.Tensor]] = []
     for group in groups:
-        x = group.detach().clone().requires_grad_(True)
-        y = module(x)
-        grad = uniform_tensor(tuple(y.shape), dtype=dtype, device=group.device, seed=GRAD_SEED_BWD + len(grad_groups))
+        x = clone_group_for_grad(group)
+        with autocast_context(group_device(group), autocast_dtype):
+            y = call_module(module, x)
+        grad = uniform_tensor(tuple(y.shape), dtype=y.dtype, device=group_device(group), seed=GRAD_SEED_BWD + len(grad_groups))
         grad_groups.append((x, y, grad))
 
-    def run(group: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    def run(group: tuple[object, torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, ...]:
         x, y, grad = group
-        clear_grads(module, [x])
+        clear_grads(module, group_tensors(x))
         torch.autograd.backward(y, grad, retain_graph=True, create_graph=False)
-        return grad_snapshot(x, module)
+        return grad_snapshot_group(x, module)
 
     correctness = None
     if check_correctness:
         actual = run(grad_groups[0])
         expected = run(grad_groups[0])
         correctness = compare_tensors(actual, expected, eps=eps)
-        clear_grads(module, [grad_groups[0][0]])
+        clear_grads(module, group_tensors(grad_groups[0][0]))
 
     return ProfileCase(
         mode=mode,
         groups=grad_groups,
         run=run,
-        output_shape=tuple(grad_groups[0][0].shape),
+        output_shape=tuple(group_tensors(grad_groups[0][0])[0].shape),
         flops=flops,
         hbm_bytes=hbm_bytes,
         correctness=correctness,
@@ -521,7 +609,7 @@ def make_bwd_case(
 
 def make_fwd_bwd_case(
     module: nn.Module,
-    groups: list[torch.Tensor],
+    groups: list[object],
     *,
     mode: str,
     flops: float,
@@ -529,34 +617,36 @@ def make_fwd_bwd_case(
     dtype: torch.dtype,
     eps: float,
     check_correctness: bool,
+    autocast_dtype: torch.dtype | None,
 ) -> ProfileCase:
-    grad_groups: list[tuple[torch.Tensor, torch.Tensor]] = []
+    grad_groups: list[tuple[object, torch.Tensor]] = []
     for group in groups:
-        x = group.detach().clone().requires_grad_(True)
-        with torch.inference_mode():
-            y = module(group)
-        grad = uniform_tensor(tuple(y.shape), dtype=dtype, device=group.device, seed=GRAD_SEED_FWD_BWD + len(grad_groups))
+        x = clone_group_for_grad(group)
+        with torch.inference_mode(), autocast_context(group_device(group), autocast_dtype):
+            y = call_module(module, group)
+        grad = uniform_tensor(tuple(y.shape), dtype=y.dtype, device=group_device(group), seed=GRAD_SEED_FWD_BWD + len(grad_groups))
         grad_groups.append((x, grad))
 
-    def run(group: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    def run(group: tuple[object, torch.Tensor]) -> tuple[torch.Tensor, ...]:
         x, grad = group
-        clear_grads(module, [x])
-        y = module(x)
+        clear_grads(module, group_tensors(x))
+        with autocast_context(group_device(x), autocast_dtype):
+            y = call_module(module, x)
         torch.autograd.backward(y, grad, create_graph=False)
-        return grad_snapshot(x, module)
+        return grad_snapshot_group(x, module)
 
     correctness = None
     if check_correctness:
         actual = run(grad_groups[0])
         expected = run(grad_groups[0])
         correctness = compare_tensors(actual, expected, eps=eps)
-        clear_grads(module, [grad_groups[0][0]])
+        clear_grads(module, group_tensors(grad_groups[0][0]))
 
     return ProfileCase(
         mode=mode,
         groups=grad_groups,
         run=run,
-        output_shape=tuple(grad_groups[0][0].shape),
+        output_shape=tuple(group_tensors(grad_groups[0][0])[0].shape),
         flops=flops,
         hbm_bytes=hbm_bytes,
         correctness=correctness,
@@ -641,6 +731,7 @@ def run_profile(
     shape: str,
     dim: int,
     dtype: torch.dtype,
+    autocast_dtype: torch.dtype | None,
     model_state: str,
     l2_bytes: int,
     num_groups: int,
@@ -675,6 +766,7 @@ def run_profile(
         shape=shape,
         dim=dim,
         dtype=dtype,
+        autocast_dtype=autocast_dtype,
         l2_bytes=l2_bytes,
         num_groups=num_groups,
         output_shape=case.output_shape,
