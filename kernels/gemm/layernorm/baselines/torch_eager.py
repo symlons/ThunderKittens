@@ -1,7 +1,8 @@
 import argparse
 from contextlib import nullcontext
+from dataclasses import dataclass
 from functools import partial
-from typing import cast
+from typing import Callable, cast
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,21 @@ from bench_common import (
 MLP_RATIO = 4
 MODES = PROFILE_MODES
 
+
+ModelBuilder = Callable[[int, int, torch.dtype, torch.device, bool], nn.Module]
+GroupBuilder = Callable[[int, int, int, torch.dtype, torch.device, int], tuple[list[object], int, int]]
+WorkloadBuilder = Callable[[str, int, int, int, int, torch.dtype], list[WorkloadPart]]
+FwdCostBuilder = Callable[[int, int, int, int, torch.dtype], tuple[float, int]]
+
+
+@dataclass(frozen=True)
+class ModelVariant:
+    name: str
+    make_model: ModelBuilder
+    make_groups: GroupBuilder
+    workload_parts: WorkloadBuilder
+    fwd_cost: FwdCostBuilder
+
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -68,6 +84,21 @@ def make_mlp(dim: int, hidden_dim: int, dtype: torch.dtype, device: torch.device
     return model
 
 
+def make_layernorm(dim: int, dtype: torch.dtype, device: torch.device, train: bool) -> nn.Module:
+    model = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6).to(device=device, dtype=dtype)
+    model.train(train)
+    return model
+
+
+def build_adaln_mlp(dim: int, hidden_dim: int, dtype: torch.dtype, device: torch.device, train: bool) -> nn.Module:
+    return make_mlp(dim, hidden_dim, dtype, device, train)
+
+
+def build_layernorm(dim: int, hidden_dim: int, dtype: torch.dtype, device: torch.device, train: bool) -> nn.Module:
+    del hidden_dim
+    return make_layernorm(dim, dtype, device, train)
+
+
 def make_adaln_input_groups(
     batch: int,
     tokens: int,
@@ -82,6 +113,18 @@ def make_adaln_input_groups(
         for group_idx in range(num_groups)
     ]
     return list(zip(x_groups, c_groups)), l2_bytes, num_groups
+
+
+def make_model_input_groups(
+    batch: int,
+    tokens: int,
+    dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+) -> tuple[list[object], int, int]:
+    groups, l2_bytes, num_groups = make_input_groups((batch, tokens, dim), dtype, device, seed)
+    return list(groups), l2_bytes, num_groups
 
 
 def matmul_flops(batch: int, tokens: int, dim: int, hidden_dim: int) -> float:
@@ -99,6 +142,15 @@ def estimated_fwd_hbm_bytes(batch: int, tokens: int, dim: int, hidden_dim: int, 
     fc2_weight_bytes = hidden_dim * dim * elem_bytes
 
     return input_bytes + fc1_weight_bytes + hidden_bytes + hidden_bytes + fc2_weight_bytes + output_bytes
+
+
+def layernorm_flops(batch: int, tokens: int, dim: int) -> float:
+    return float(batch * tokens * dim * 5)
+
+
+def estimated_layernorm_hbm_bytes(batch: int, tokens: int, dim: int, dtype: torch.dtype) -> int:
+    elem_bytes = torch.empty((), dtype=dtype).element_size()
+    return 2 * batch * tokens * dim * elem_bytes
 
 
 def linear_fwd_part(name: str, elems: int, in_dim: int, out_dim: int, elem_bytes: int) -> WorkloadPart:
@@ -141,7 +193,6 @@ def architecture_workload_parts(
 ) -> list[WorkloadPart]:
     elem_bytes = torch.empty((), dtype=dtype).element_size()
     elems = batch * tokens
-
     fwd_parts = [
         linear_fwd_part("fc1 fwd", elems, dim, hidden_dim, elem_bytes),
         gelu_fwd_part(elems, hidden_dim, elem_bytes),
@@ -162,6 +213,54 @@ def architecture_workload_parts(
     raise ValueError(f"unsupported mode: {mode}")
 
 
+def layernorm_workload_parts(
+    mode: str,
+    batch: int,
+    tokens: int,
+    dim: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+) -> list[WorkloadPart]:
+    del hidden_dim
+    fwd_parts = [WorkloadPart("layernorm fwd", layernorm_flops(batch, tokens, dim), estimated_layernorm_hbm_bytes(batch, tokens, dim, dtype))]
+    bwd_parts = [WorkloadPart("layernorm bwd", 2.0 * layernorm_flops(batch, tokens, dim), 2 * estimated_layernorm_hbm_bytes(batch, tokens, dim, dtype))]
+    if mode == "fwd" or mode == "deploy":
+        return fwd_parts
+    if mode == "bwd":
+        return bwd_parts
+    if mode == "fwd-bwd":
+        return fwd_parts + bwd_parts
+    raise ValueError(f"unsupported mode: {mode}")
+
+
+def adaln_mlp_fwd_cost(batch: int, tokens: int, dim: int, hidden_dim: int, dtype: torch.dtype) -> tuple[float, int]:
+    return matmul_flops(batch, tokens, dim, hidden_dim), estimated_fwd_hbm_bytes(batch, tokens, dim, hidden_dim, dtype)
+
+
+def layernorm_fwd_cost(batch: int, tokens: int, dim: int, hidden_dim: int, dtype: torch.dtype) -> tuple[float, int]:
+    del hidden_dim
+    return layernorm_flops(batch, tokens, dim), estimated_layernorm_hbm_bytes(batch, tokens, dim, dtype)
+
+
+MODEL_REGISTRY: dict[str, ModelVariant] = {
+    "adaln-mlp": ModelVariant(
+        name="adaln-mlp",
+        make_model=build_adaln_mlp,
+        make_groups=make_adaln_input_groups,
+        workload_parts=architecture_workload_parts,
+        fwd_cost=adaln_mlp_fwd_cost,
+    ),
+    "layernorm": ModelVariant(
+        name="layernorm",
+        make_model=build_layernorm,
+        make_groups=make_model_input_groups,
+        workload_parts=layernorm_workload_parts,
+        fwd_cost=layernorm_fwd_cost,
+    ),
+}
+MODEL_VARIANTS = tuple(MODEL_REGISTRY)
+
+
 def timed_component_us(fn, groups: list[torch.Tensor], *, warmup: int, iters: int) -> float:
     torch.cuda.synchronize()
     for i in range(warmup):
@@ -179,7 +278,7 @@ def timed_component_us(fn, groups: list[torch.Tensor], *, warmup: int, iters: in
 
 def measure_fwd_architecture_parts(
     mlp: nn.Module,
-    groups: list[tuple[torch.Tensor, torch.Tensor]],
+    groups: list[object],
     *,
     mode: str,
     warmup: int,
@@ -188,15 +287,23 @@ def measure_fwd_architecture_parts(
 ) -> list[MeasuredPart]:
     mlp = getattr(mlp, "_orig_mod", mlp)
     context = torch.inference_mode if mode == "deploy" else torch.no_grad
-    timm_mlp = mlp.mlp
-    drop1 = getattr(timm_mlp, "drop1", nn.Identity())
-    drop2 = getattr(timm_mlp, "drop2", nn.Identity())
-    norm = getattr(timm_mlp, "norm", nn.Identity())
 
     def maybe_autocast(x: torch.Tensor):
         if autocast_dtype is None:
             return nullcontext()
         return torch.autocast(device_type=x.device.type, dtype=autocast_dtype)
+
+    if isinstance(mlp, nn.LayerNorm):
+        def layernorm(x: torch.Tensor) -> torch.Tensor:
+            with context(), maybe_autocast(x):
+                return mlp(x)
+
+        return [MeasuredPart("layernorm fwd", timed_component_us(layernorm, groups, warmup=warmup, iters=iters))]
+
+    timm_mlp = mlp.mlp
+    drop1 = getattr(timm_mlp, "drop1", nn.Identity())
+    drop2 = getattr(timm_mlp, "drop2", nn.Identity())
+    norm = getattr(timm_mlp, "norm", nn.Identity())
 
     with context(), maybe_autocast(groups[0][0]):
         norm_inputs = groups
@@ -235,8 +342,9 @@ def measure_fwd_architecture_parts(
 
 def print_architecture_breakdown(
     mlp: nn.Module,
-    groups: list[tuple[torch.Tensor, torch.Tensor]],
+    groups: list[object],
     *,
+    model_variant: ModelVariant,
     mode: str,
     shape: str,
     batch: int,
@@ -256,7 +364,7 @@ def print_architecture_breakdown(
         dim=dim,
         dtype=dtype,
         autocast_dtype=autocast_dtype,
-        parts=architecture_workload_parts(
+        parts=model_variant.workload_parts(
             mode,
             batch=batch,
             tokens=tokens,
@@ -287,6 +395,7 @@ def print_architecture_breakdown(
 
 
 def build_profile_case(
+    model_variant: ModelVariant,
     mode: str,
     mlp: nn.Module,
     groups: list[torch.Tensor],
@@ -301,8 +410,7 @@ def build_profile_case(
     eps: float,
     check_correctness: bool,
 ):
-    fwd_flops = matmul_flops(batch, tokens, dim, hidden_dim)
-    fwd_hbm_bytes = estimated_fwd_hbm_bytes(batch, tokens, dim, hidden_dim, traffic_dtype)
+    fwd_flops, fwd_hbm_bytes = model_variant.fwd_cost(batch, tokens, dim, hidden_dim, traffic_dtype)
 
     if mode == "fwd":
         return make_fwd_case(
@@ -355,6 +463,7 @@ def build_profile_case(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model-variant", choices=MODEL_VARIANTS, default="adaln-mlp")
     parser.add_argument("--shapes", nargs="+", default=DEFAULT_SHAPES)
     parser.add_argument("--dim", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=500)
@@ -370,6 +479,10 @@ def main() -> None:
     parser.add_argument("--compile-dynamic", choices=["auto", "true", "false"], default="auto")
     parser.add_argument("--compile-fixed-shapes", action="store_true")
     parser.add_argument("--compare-baseline", choices=["none", "eager", "compile"], default="none")
+    parser.add_argument("--baseline-compile-backend", default="inductor")
+    parser.add_argument("--baseline-compile-mode", choices=["default", "reduce-overhead", "max-autotune"], default="default")
+    parser.add_argument("--baseline-compile-fullgraph", action="store_true")
+    parser.add_argument("--baseline-compile-dynamic", choices=["auto", "true", "false"], default="auto")
     parser.add_argument("--dynamo-explain", action="store_true")
     parser.add_argument("--profiler-trace", default=None)
     parser.add_argument("--profiler-warmup", type=int, default=5)
@@ -383,6 +496,7 @@ def main() -> None:
 
     if should_prompt():
         print("Torch eager MLP benchmark setup. Press Enter to accept defaults.\n")
+        args.model_variant = prompt_choice("model variant", list(MODEL_VARIANTS), args.model_variant)
         args.mode = prompt_choice("mode", [*MODES, "all"], args.mode)
         args.model_state = prompt_choice("model state", ["eval", "train"], args.model_state)
         prompt_compile_options(args)
@@ -406,8 +520,10 @@ def main() -> None:
     autocast_dtype = parse_optional_dtype(args.autocast)
     traffic_dtype = autocast_dtype or dtype
     compile_dynamic = "false" if args.compile_fixed_shapes else args.compile_dynamic
+    baseline_compile_dynamic = "false" if args.compile_fixed_shapes else args.baseline_compile_dynamic
     modes = MODES if args.mode == "all" else (args.mode,)
-    current_variant = "compile" if args.compile else "eager"
+    model_variant = MODEL_REGISTRY[args.model_variant]
+    current_variant = f"compile_{args.compile_mode}" if args.compile else "eager"
     if args.compare_baseline == current_variant:
         print(f"warning: compare baseline is also {current_variant}; speedup should be near 1x")
     for shape in args.shapes:
@@ -417,7 +533,7 @@ def main() -> None:
         torch.manual_seed(args.seed)
 
         hbm_used_before, _, total_bytes = device_hbm_used_bytes(device)
-        mlp = make_mlp(args.dim, hidden_dim, dtype, device, train=args.model_state == "train")
+        mlp = model_variant.make_model(args.dim, hidden_dim, dtype, device, args.model_state == "train")
         if args.compile:
             if args.compile_fixed_shapes:
                 torch._dynamo.reset()
@@ -429,26 +545,31 @@ def main() -> None:
                 dynamic=compile_dynamic,
             )
         baseline_mlp = None
+        baseline_name = None
         if args.compare_baseline != "none":
-            baseline_mlp = make_mlp(args.dim, hidden_dim, dtype, device, train=args.model_state == "train")
+            baseline_mlp = model_variant.make_model(args.dim, hidden_dim, dtype, device, args.model_state == "train")
             baseline_mlp.load_state_dict(getattr(mlp, "_orig_mod", mlp).state_dict())
             if args.compare_baseline == "compile":
                 if args.compile_fixed_shapes:
                     torch._dynamo.reset()
                 baseline_mlp = compile_module(
                     baseline_mlp,
-                    backend=args.compile_backend,
-                    mode=args.compile_mode,
-                    fullgraph=args.compile_fullgraph,
-                    dynamic=compile_dynamic,
+                    backend=args.baseline_compile_backend,
+                    mode=args.baseline_compile_mode,
+                    fullgraph=args.baseline_compile_fullgraph,
+                    dynamic=baseline_compile_dynamic,
                 )
-        groups, l2_bytes, num_groups = make_adaln_input_groups(batch, tokens, args.dim, dtype, device, args.seed)
+                baseline_name = f"compile_{args.baseline_compile_mode}"
+            else:
+                baseline_name = args.compare_baseline
+        groups, l2_bytes, num_groups = model_variant.make_groups(batch, tokens, args.dim, dtype, device, args.seed)
 
         for mode in modes:
             if args.architecture_breakdown:
                 print_architecture_breakdown(
                     mlp,
                     groups,
+                    model_variant=model_variant,
                     mode=mode,
                     shape=shape,
                     batch=batch,
@@ -461,6 +582,7 @@ def main() -> None:
                     iters=args.iters,
                 )
             case = build_profile_case(
+                model_variant,
                 mode,
                 mlp,
                 groups,
@@ -477,6 +599,7 @@ def main() -> None:
             baseline_case = None
             if baseline_mlp is not None:
                 baseline_case = build_profile_case(
+                    model_variant,
                     mode,
                     baseline_mlp,
                     groups,
@@ -502,8 +625,8 @@ def main() -> None:
             run_profile(
                 case,
                 baseline_case=baseline_case,
-                baseline_name=args.compare_baseline if baseline_case is not None else None,
-                op_name=f"timm_mlp_{current_variant}",
+                baseline_name=baseline_name if baseline_case is not None else None,
+                op_name=f"{model_variant.name}_{current_variant}",
                 shape=shape,
                 dim=args.dim,
                 dtype=dtype,
