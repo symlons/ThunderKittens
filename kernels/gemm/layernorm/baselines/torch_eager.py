@@ -84,8 +84,8 @@ def make_mlp(dim: int, hidden_dim: int, dtype: torch.dtype, device: torch.device
     return model
 
 
-def make_layernorm(dim: int, dtype: torch.dtype, device: torch.device, train: bool) -> nn.Module:
-    model = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6).to(device=device, dtype=dtype)
+def make_layernorm(dim: int, dtype: torch.dtype, device: torch.device, train: bool, *, affine: bool) -> nn.Module:
+    model = nn.LayerNorm(dim, elementwise_affine=affine, eps=1e-6).to(device=device, dtype=dtype)
     model.train(train)
     return model
 
@@ -96,7 +96,12 @@ def build_adaln_mlp(dim: int, hidden_dim: int, dtype: torch.dtype, device: torch
 
 def build_layernorm(dim: int, hidden_dim: int, dtype: torch.dtype, device: torch.device, train: bool) -> nn.Module:
     del hidden_dim
-    return make_layernorm(dim, dtype, device, train)
+    return make_layernorm(dim, dtype, device, train, affine=False)
+
+
+def build_layernorm_affine(dim: int, hidden_dim: int, dtype: torch.dtype, device: torch.device, train: bool) -> nn.Module:
+    del hidden_dim
+    return make_layernorm(dim, dtype, device, train, affine=True)
 
 
 def make_adaln_input_groups(
@@ -148,9 +153,10 @@ def layernorm_flops(batch: int, tokens: int, dim: int) -> float:
     return float(batch * tokens * dim * 5)
 
 
-def estimated_layernorm_hbm_bytes(batch: int, tokens: int, dim: int, dtype: torch.dtype) -> int:
+def estimated_layernorm_hbm_bytes(batch: int, tokens: int, dim: int, dtype: torch.dtype, *, affine: bool = False) -> int:
     elem_bytes = torch.empty((), dtype=dtype).element_size()
-    return 2 * batch * tokens * dim * elem_bytes
+    affine_bytes = 2 * dim * elem_bytes if affine else 0
+    return 2 * batch * tokens * dim * elem_bytes + affine_bytes
 
 
 def linear_fwd_part(name: str, elems: int, in_dim: int, out_dim: int, elem_bytes: int) -> WorkloadPart:
@@ -233,6 +239,27 @@ def layernorm_workload_parts(
     raise ValueError(f"unsupported mode: {mode}")
 
 
+def layernorm_affine_workload_parts(
+    mode: str,
+    batch: int,
+    tokens: int,
+    dim: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+) -> list[WorkloadPart]:
+    del hidden_dim
+    fwd_bytes = estimated_layernorm_hbm_bytes(batch, tokens, dim, dtype, affine=True)
+    fwd_parts = [WorkloadPart("layernorm affine fwd", layernorm_flops(batch, tokens, dim), fwd_bytes)]
+    bwd_parts = [WorkloadPart("layernorm affine bwd", 2.0 * layernorm_flops(batch, tokens, dim), 2 * fwd_bytes)]
+    if mode == "fwd" or mode == "deploy":
+        return fwd_parts
+    if mode == "bwd":
+        return bwd_parts
+    if mode == "fwd-bwd":
+        return fwd_parts + bwd_parts
+    raise ValueError(f"unsupported mode: {mode}")
+
+
 def adaln_mlp_fwd_cost(batch: int, tokens: int, dim: int, hidden_dim: int, dtype: torch.dtype) -> tuple[float, int]:
     return matmul_flops(batch, tokens, dim, hidden_dim), estimated_fwd_hbm_bytes(batch, tokens, dim, hidden_dim, dtype)
 
@@ -240,6 +267,11 @@ def adaln_mlp_fwd_cost(batch: int, tokens: int, dim: int, hidden_dim: int, dtype
 def layernorm_fwd_cost(batch: int, tokens: int, dim: int, hidden_dim: int, dtype: torch.dtype) -> tuple[float, int]:
     del hidden_dim
     return layernorm_flops(batch, tokens, dim), estimated_layernorm_hbm_bytes(batch, tokens, dim, dtype)
+
+
+def layernorm_affine_fwd_cost(batch: int, tokens: int, dim: int, hidden_dim: int, dtype: torch.dtype) -> tuple[float, int]:
+    del hidden_dim
+    return layernorm_flops(batch, tokens, dim), estimated_layernorm_hbm_bytes(batch, tokens, dim, dtype, affine=True)
 
 
 MODEL_REGISTRY: dict[str, ModelVariant] = {
@@ -256,6 +288,13 @@ MODEL_REGISTRY: dict[str, ModelVariant] = {
         make_groups=make_model_input_groups,
         workload_parts=layernorm_workload_parts,
         fwd_cost=layernorm_fwd_cost,
+    ),
+    "layernorm-affine": ModelVariant(
+        name="layernorm-affine",
+        make_model=build_layernorm_affine,
+        make_groups=make_model_input_groups,
+        workload_parts=layernorm_affine_workload_parts,
+        fwd_cost=layernorm_affine_fwd_cost,
     ),
 }
 MODEL_VARIANTS = tuple(MODEL_REGISTRY)
@@ -409,6 +448,7 @@ def build_profile_case(
     autocast_dtype: torch.dtype | None,
     eps: float,
     check_correctness: bool,
+    fwd_requires_grad: bool,
 ):
     fwd_flops, fwd_hbm_bytes = model_variant.fwd_cost(batch, tokens, dim, hidden_dim, traffic_dtype)
 
@@ -422,6 +462,7 @@ def build_profile_case(
             eps=eps,
             check_correctness=check_correctness,
             autocast_dtype=autocast_dtype,
+            requires_grad=fwd_requires_grad,
         )
     if mode == "deploy":
         return make_deploy_case(
@@ -488,6 +529,7 @@ def main() -> None:
     parser.add_argument("--profiler-warmup", type=int, default=5)
     parser.add_argument("--profiler-active", type=int, default=10)
     parser.add_argument("--architecture-breakdown", action="store_true")
+    parser.add_argument("--fwd-requires-grad", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--eps", type=float, default=1e-6, help=argparse.SUPPRESS)
@@ -595,6 +637,7 @@ def main() -> None:
                 autocast_dtype=autocast_dtype,
                 eps=args.eps,
                 check_correctness=not args.skip_correctness,
+                fwd_requires_grad=args.fwd_requires_grad,
             )
             baseline_case = None
             if baseline_mlp is not None:
@@ -612,6 +655,7 @@ def main() -> None:
                     autocast_dtype=autocast_dtype,
                     eps=args.eps,
                     check_correctness=False,
+                    fwd_requires_grad=args.fwd_requires_grad,
                 )
             if args.dynamo_explain:
                 run_dynamo_explain(case)

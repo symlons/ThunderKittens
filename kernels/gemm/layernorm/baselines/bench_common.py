@@ -457,8 +457,8 @@ def print_benchmark_report(
 def print_baseline_comparison(*, current_name: str, current: TimingResult, baseline_name: str, baseline: TimingResult) -> None:
     speedup = baseline.us / current.us if current.us else 0.0
     print_kv("Compare", "")
-    print_kv("baseline", f"{baseline_name}: {baseline.us:.2f} us", indent=4)
-    print_kv("current", f"{current_name}: {current.us:.2f} us", indent=4)
+    print_kv("baseline", f"{baseline_name}: {baseline.us:.2f} us, {baseline.hbm_tb_s:.3f} TB/s", indent=4)
+    print_kv("current", f"{current_name}: {current.us:.2f} us, {current.hbm_tb_s:.3f} TB/s", indent=4)
     print_kv("speedup", f"{speedup:.3f}x vs baseline", indent=4)
     print_kv("delta", f"{current.us - baseline.us:+.2f} us", indent=4)
 
@@ -513,14 +513,19 @@ def make_fwd_case(
     eps: float,
     check_correctness: bool,
     autocast_dtype: torch.dtype | None,
+    requires_grad: bool = False,
 ) -> ProfileCase:
+    if requires_grad:
+        groups = [clone_group_for_grad(group) for group in groups]
+
     def forward(group: torch.Tensor) -> torch.Tensor:
         with autocast_context(group_device(group), autocast_dtype):
             return call_module(module, group)
 
     correctness = None
     if check_correctness:
-        with torch.no_grad(), autocast_context(group_device(groups[0]), autocast_dtype):
+        grad_context = torch.enable_grad if requires_grad else torch.no_grad
+        with grad_context(), autocast_context(group_device(groups[0]), autocast_dtype):
             actual = call_module(module, groups[0]).float().clone()
             expected = call_module(module, groups[0]).float().clone()
         correctness = compare_tensors((actual,), (expected,), eps=eps)
@@ -528,7 +533,8 @@ def make_fwd_case(
         torch.cuda.synchronize()
 
     def run(group: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
+        grad_context = torch.enable_grad if requires_grad else torch.no_grad
+        with grad_context():
             return forward(group)
 
     output = run(groups[0])

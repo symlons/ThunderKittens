@@ -67,6 +67,7 @@ def benchmark_command(
     dtype: str,
     autocast: str,
     skip_correctness: bool,
+    fwd_requires_grad: bool,
     architecture_breakdown: bool,
     dynamo_explain: bool,
     profiler_trace: str,
@@ -114,6 +115,8 @@ def benchmark_command(
             command.append("--compile-fixed-shapes")
     if skip_correctness:
         command.append("--skip-correctness")
+    if fwd_requires_grad:
+        command.append("--fwd-requires-grad")
     if architecture_breakdown:
         command.append("--architecture-breakdown")
     if dynamo_explain:
@@ -161,6 +164,7 @@ def main(
     dtype: str = "fp32",
     autocast: str = "bf16",
     skip_correctness: bool = False,
+    fwd_requires_grad: bool = False,
     architecture_breakdown: bool = False,
     dynamo_explain: bool = False,
     profiler_trace: str = "",
@@ -187,6 +191,7 @@ def main(
         dtype=dtype,
         autocast=autocast,
         skip_correctness=skip_correctness,
+        fwd_requires_grad=fwd_requires_grad,
         architecture_breakdown=architecture_breakdown,
         dynamo_explain=dynamo_explain,
         profiler_trace=profiler_trace,
