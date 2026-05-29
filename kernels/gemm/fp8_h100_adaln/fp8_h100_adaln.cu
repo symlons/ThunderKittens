@@ -1,0 +1,508 @@
+#define TORCH_COMPILE
+#include "../fp8_h100/fp8_h100_gemm.cu"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <pybind11/pybind11.h>
+
+namespace {
+
+constexpr int K1024 = 1024;
+constexpr float FP8_E4M3_MAX_F = 448.0f;
+
+__device__ __forceinline__ float warp_max(float v) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    return v;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+__device__ __forceinline__ float block_sum(float v) {
+    __shared__ float warp_vals[8];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    v = warp_sum(v);
+    if (lane == 0) {
+        warp_vals[warp] = v;
+    }
+    __syncthreads();
+    v = threadIdx.x < 8 ? warp_vals[lane] : 0.0f;
+    if (warp == 0) {
+        v = warp_sum(v);
+    }
+    return v;
+}
+
+__device__ __forceinline__ float block_sum_all(float v) {
+    __shared__ float result;
+    float sum = block_sum(v);
+    if (threadIdx.x == 0) {
+        result = sum;
+    }
+    __syncthreads();
+    return result;
+}
+
+__device__ __forceinline__ void block_sum2_all(float &a, float &b) {
+    __shared__ float result_a;
+    __shared__ float result_b;
+    float sum_a = block_sum(a);
+    __syncthreads();
+    float sum_b = block_sum(b);
+    if (threadIdx.x == 0) {
+        result_a = sum_a;
+        result_b = sum_b;
+    }
+    __syncthreads();
+    a = result_a;
+    b = result_b;
+}
+
+__device__ __forceinline__ float block_max(float v) {
+    __shared__ float warp_vals[8];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    v = warp_max(v);
+    if (lane == 0) {
+        warp_vals[warp] = v;
+    }
+    __syncthreads();
+    v = threadIdx.x < 8 ? warp_vals[lane] : 0.0f;
+    if (warp == 0) {
+        v = warp_max(v);
+    }
+    return v;
+}
+
+__device__ __forceinline__ void atomic_max_positive_float(float *addr, float value) {
+    atomicMax(reinterpret_cast<unsigned int *>(addr), __float_as_uint(value));
+}
+
+__global__ void ln_adaln_quantize_stats_k1024_kernel(
+    fp8e4m3 *__restrict__ out,
+    float *__restrict__ mean,
+    float *__restrict__ rstd,
+    float *__restrict__ global_amax,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ shift,
+    const __nv_bfloat16 *__restrict__ scale,
+    float inv_quant_scale,
+    int rows,
+    int tokens_per_sample,
+    float eps
+) {
+    int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    int batch = row / tokens_per_sample;
+    const __nv_bfloat16 *x_row = x + static_cast<size_t>(row) * K1024;
+    const __nv_bfloat16 *shift_row = shift + static_cast<size_t>(batch) * K1024;
+    const __nv_bfloat16 *scale_row = scale + static_cast<size_t>(batch) * K1024;
+    fp8e4m3 *out_row = out + static_cast<size_t>(row) * K1024;
+
+    float local_sum = 0.0f;
+    float local_sumsq = 0.0f;
+    #pragma unroll
+    for (int col = threadIdx.x; col < K1024; col += blockDim.x) {
+        float xv = __bfloat162float(x_row[col]);
+        local_sum += xv;
+        local_sumsq += xv * xv;
+    }
+    block_sum2_all(local_sum, local_sumsq);
+    float inv_k = 1.0f / static_cast<float>(K1024);
+    float mu = local_sum * inv_k;
+    float variance = fmaxf(local_sumsq * inv_k - mu * mu, 0.0f);
+    float rs = rsqrtf(variance + eps);
+    __syncthreads();
+
+    float local_amax = 0.0f;
+    #pragma unroll
+    for (int col = threadIdx.x; col < K1024; col += blockDim.x) {
+        float xv = __bfloat162float(x_row[col]);
+        float sh = __bfloat162float(shift_row[col]);
+        float sc = __bfloat162float(scale_row[col]);
+        float z = (xv - mu) * rs;
+        float y = z * (1.0f + sc) + sh;
+        local_amax = fmaxf(local_amax, fabsf(y));
+        float q = fminf(fmaxf(y * inv_quant_scale, -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        out_row[col] = fp8e4m3(q);
+    }
+
+    float amax = block_max(local_amax);
+    if (threadIdx.x == 0) {
+        mean[row] = mu;
+        rstd[row] = rs;
+        atomic_max_positive_float(global_amax, amax);
+    }
+}
+
+__global__ void ln_adaln_quantize_k1024_kernel(
+    fp8e4m3 *__restrict__ out,
+    float *__restrict__ global_amax,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ shift,
+    const __nv_bfloat16 *__restrict__ scale,
+    const float *__restrict__ mean,
+    const float *__restrict__ rstd,
+    float inv_quant_scale,
+    int rows,
+    int tokens_per_sample
+) {
+    int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    int batch = row / tokens_per_sample;
+    const __nv_bfloat16 *x_row = x + static_cast<size_t>(row) * K1024;
+    const __nv_bfloat16 *shift_row = shift + static_cast<size_t>(batch) * K1024;
+    const __nv_bfloat16 *scale_row = scale + static_cast<size_t>(batch) * K1024;
+    fp8e4m3 *out_row = out + static_cast<size_t>(row) * K1024;
+
+    float mu = mean[row];
+    float rs = rstd[row];
+    float local_amax = 0.0f;
+
+    #pragma unroll
+    for (int col = threadIdx.x; col < K1024; col += blockDim.x) {
+        float xv = __bfloat162float(x_row[col]);
+        float sh = __bfloat162float(shift_row[col]);
+        float sc = __bfloat162float(scale_row[col]);
+        float z = (xv - mu) * rs;
+        float y = z * (1.0f + sc) + sh;
+        local_amax = fmaxf(local_amax, fabsf(y));
+        float q = fminf(fmaxf(y * inv_quant_scale, -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        out_row[col] = fp8e4m3(q);
+    }
+
+    float amax = block_max(local_amax);
+    if (threadIdx.x == 0) {
+        atomic_max_positive_float(global_amax, amax);
+    }
+}
+
+__global__ void reduce_amax_kernel(
+    float *__restrict__ block_amax,
+    const float *__restrict__ row_amax,
+    int rows
+) {
+    float local = 0.0f;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < rows; idx += blockDim.x * gridDim.x) {
+        local = fmaxf(local, row_amax[idx]);
+    }
+    float amax = block_max(local);
+    if (threadIdx.x == 0) {
+        block_amax[blockIdx.x] = amax;
+    }
+}
+
+__global__ void finalize_amax_kernel(
+    float *__restrict__ global_amax,
+    const float *__restrict__ block_amax,
+    int blocks
+) {
+    float local = 0.0f;
+    for (int idx = threadIdx.x; idx < blocks; idx += blockDim.x) {
+        local = fmaxf(local, block_amax[idx]);
+    }
+    float amax = block_max(local);
+    if (threadIdx.x == 0) {
+        global_amax[0] = amax;
+    }
+}
+
+} // namespace
+
+namespace fp8_fp32out {
+
+struct matmul_layout {
+    using  a_tile         = st_fp8e4m3<64,  128>;
+    using  b_tile         = st_fp8e4m3<128, 128>;
+    using  c_tile         = st_fl<64,  128>;
+    using  a_layout       = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
+    using  b_layout       = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
+    using  c_layout       = gl<float, 1, 1, -1, -1, c_tile>;
+    struct globals        { a_layout A; b_layout B; c_layout C; };
+    struct input_block    { a_tile a[2]; b_tile b; };
+    struct finish_block   { c_tile c[2]; };
+    struct common_state   { int2 coord; };
+    struct consumer_state {
+        rt_fl<16, c_tile::cols> tc_accum;
+        rt_fl<16, c_tile::cols> fp32_accum;
+    };
+};
+
+template<int _SUPER_M=12>
+struct matmul_template {
+    static constexpr int SUPER_M = _SUPER_M;
+    using layout = matmul_layout;
+    static constexpr int NUM_CONSUMER_WARPS=8, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        return dim3(PERISISTENT_GRID ? 128 : M*N/(2*layout::c_tile::num_elements));
+    }
+
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        int Rblocks = args.globals.C.rows() / (2*layout::c_tile::rows), Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+        int super_rows = (Rblocks/SUPER_M)*SUPER_M,
+            final_rows = Rblocks - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        if (task_id < super_rows * Cblocks) {
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
+        } else if (task_id < Rblocks*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        } else {
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/layout::a_tile::cols;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid();
+        args.common.coord = { args.common.coord.x*2 + id, args.common.coord.y };
+    }
+
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::laneid() == 0) {
+                tma::expect(args.inputs_arrived, args.input);
+                for (int i = 0; i < 2; i++) {
+                    tma::load_async(args.input.a[i], args.globals.A, {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                }
+                tma::load_async(args.input.b, args.globals.B, {args.common.coord.y, args.iter}, args.inputs_arrived);
+            }
+        }
+    };
+
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>();
+            warp::zero(args.state.tc_accum);
+            warp::zero(args.state.fp32_accum);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            warpgroup::mma_ABt(
+                args.state.tc_accum,
+                args.input.a[warpgroup::groupid()],
+                args.input.b
+            );
+            warpgroup::mma_async_wait();
+            warp::add(args.state.fp32_accum, args.state.fp32_accum, args.state.tc_accum);
+            warp::zero(args.state.tc_accum);
+            if (warp::laneid() == 0) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.fp32_accum);
+            warpgroup::sync(warpgroup::groupid()+4);
+            if (warpgroup::laneid() == 0) {
+                tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()], {args.common.coord.x, args.common.coord.y});
+                tma::store_async_read_wait();
+            }
+            warp::zero(args.state.fp32_accum);
+            if (warp::laneid() == 0) arrive(args.finish_finished);
+        }
+    };
+};
+
+template<typename mmt>
+void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, float *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
+    using a_layout = typename mmt::layout::a_layout;
+    using b_layout = typename mmt::layout::b_layout;
+    using c_layout = typename mmt::layout::c_layout;
+    using globals  = typename mmt::layout::globals;
+    a_layout Ag{d_A, nullptr, nullptr, M, K};
+    b_layout Bg{d_B, nullptr, nullptr, N, K};
+    c_layout Cg{d_C, nullptr, nullptr, M, N};
+    globals G{Ag, Bg, Cg};
+    prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
+}
+
+} // namespace fp8_fp32out
+
+std::vector<at::Tensor> ln_adaln_quantize_k1024(
+    const at::Tensor &x,
+    const at::Tensor &shift,
+    const at::Tensor &scale,
+    const at::Tensor &mean,
+    const at::Tensor &rstd,
+    int64_t tokens_per_sample,
+    double inv_quant_scale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(shift);
+    CHECK_INPUT(scale);
+    CHECK_INPUT(mean);
+    CHECK_INPUT(rstd);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, "x must be bf16");
+    TORCH_CHECK(shift.scalar_type() == at::ScalarType::BFloat16, "shift must be bf16");
+    TORCH_CHECK(scale.scalar_type() == at::ScalarType::BFloat16, "scale must be bf16");
+    TORCH_CHECK(mean.scalar_type() == at::ScalarType::Float, "mean must be fp32");
+    TORCH_CHECK(rstd.scalar_type() == at::ScalarType::Float, "rstd must be fp32");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == K1024, "x must have shape [M, 1024]");
+    TORCH_CHECK(shift.dim() == 2 && shift.size(1) == K1024, "shift must have shape [B, 1024]");
+    TORCH_CHECK(scale.sizes() == shift.sizes(), "scale shape must match shift");
+    TORCH_CHECK(mean.dim() == 1 && mean.size(0) == x.size(0), "mean must have shape [M]");
+    TORCH_CHECK(rstd.dim() == 1 && rstd.size(0) == x.size(0), "rstd must have shape [M]");
+    TORCH_CHECK(tokens_per_sample > 0, "tokens_per_sample must be positive");
+    TORCH_CHECK(x.size(0) == shift.size(0) * tokens_per_sample, "M must equal B * tokens_per_sample");
+
+    auto out = at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto global_amax = at::empty({1}, x.options().dtype(at::ScalarType::Float));
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA_ERROR(cudaMemsetAsync(global_amax.data_ptr<float>(), 0, sizeof(float), stream));
+    ln_adaln_quantize_k1024_kernel<<<x.size(0), 256, 0, stream>>>(
+        reinterpret_cast<fp8e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
+        global_amax.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(shift.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(scale.data_ptr<at::BFloat16>()),
+        mean.data_ptr<float>(),
+        rstd.data_ptr<float>(),
+        static_cast<float>(inv_quant_scale),
+        static_cast<int>(x.size(0)),
+        static_cast<int>(tokens_per_sample)
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {out, global_amax};
+}
+
+std::vector<at::Tensor> ln_adaln_quantize_stats_k1024(
+    const at::Tensor &x,
+    const at::Tensor &shift,
+    const at::Tensor &scale,
+    int64_t tokens_per_sample,
+    double inv_quant_scale,
+    double eps
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(shift);
+    CHECK_INPUT(scale);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, "x must be bf16");
+    TORCH_CHECK(shift.scalar_type() == at::ScalarType::BFloat16, "shift must be bf16");
+    TORCH_CHECK(scale.scalar_type() == at::ScalarType::BFloat16, "scale must be bf16");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == K1024, "x must have shape [M, 1024]");
+    TORCH_CHECK(shift.dim() == 2 && shift.size(1) == K1024, "shift must have shape [B, 1024]");
+    TORCH_CHECK(scale.sizes() == shift.sizes(), "scale shape must match shift");
+    TORCH_CHECK(tokens_per_sample > 0, "tokens_per_sample must be positive");
+    TORCH_CHECK(x.size(0) == shift.size(0) * tokens_per_sample, "M must equal B * tokens_per_sample");
+
+    auto out = at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto mean = at::empty({x.size(0)}, x.options().dtype(at::ScalarType::Float));
+    auto rstd = at::empty_like(mean);
+    auto global_amax = at::empty({1}, x.options().dtype(at::ScalarType::Float));
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA_ERROR(cudaMemsetAsync(global_amax.data_ptr<float>(), 0, sizeof(float), stream));
+    ln_adaln_quantize_stats_k1024_kernel<<<x.size(0), 256, 0, stream>>>(
+        reinterpret_cast<fp8e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
+        mean.data_ptr<float>(),
+        rstd.data_ptr<float>(),
+        global_amax.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(shift.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(scale.data_ptr<at::BFloat16>()),
+        static_cast<float>(inv_quant_scale),
+        static_cast<int>(x.size(0)),
+        static_cast<int>(tokens_per_sample),
+        static_cast<float>(eps)
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {out, global_amax, mean, rstd};
+}
+
+at::Tensor reduce_amax(const at::Tensor &partial_amax) {
+    CHECK_INPUT(partial_amax);
+    TORCH_CHECK(partial_amax.scalar_type() == at::ScalarType::Float, "partial_amax must be fp32");
+    TORCH_CHECK(partial_amax.dim() == 1, "partial_amax must be 1D");
+    int rows = static_cast<int>(partial_amax.numel());
+    int blocks = std::min(1024, (rows + 255) / 256);
+    auto block_amax = at::empty({blocks}, partial_amax.options());
+    auto global_amax = at::empty({1}, partial_amax.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    reduce_amax_kernel<<<blocks, 256, 0, stream>>>(block_amax.data_ptr<float>(), partial_amax.data_ptr<float>(), rows);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    finalize_amax_kernel<<<1, 256, 0, stream>>>(global_amax.data_ptr<float>(), block_amax.data_ptr<float>(), blocks);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return global_amax;
+}
+
+at::Tensor fp8_gemm_k1024(const at::Tensor &A, const at::Tensor &B) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+    TORCH_CHECK(A.scalar_type() == at::ScalarType::Float8_e4m3fn, "A must be fp8 e4m3");
+    TORCH_CHECK(B.scalar_type() == at::ScalarType::Float8_e4m3fn, "B must be fp8 e4m3");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(A.size(1) == K1024 && B.size(1) == K1024, "A and B must have K=1024");
+    TORCH_CHECK((A.size(0) % 128) == 0 && (B.size(0) % 256) == 0, "M must be multiple of 128 and N multiple of 256");
+
+    auto M = A.size(0);
+    auto N = B.size(0);
+    auto K = A.size(1);
+    at::Tensor C = at::empty({M, N}, A.options());
+
+    fp8e4m3 *d_A = reinterpret_cast<fp8e4m3 *>(A.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_B = reinterpret_cast<fp8e4m3 *>(B.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_C = reinterpret_cast<fp8e4m3 *>(C.data_ptr<c10::Float8_e4m3fn>());
+
+    using mmt = matmul_template<8>;
+    dim3 grid(mmt::grid(M, N, K));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    inner_run<mmt>(d_A, d_B, d_C, M, N, K, grid, block);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return C;
+}
+
+at::Tensor fp8_gemm_k1024_fp32_out(const at::Tensor &A, const at::Tensor &B) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+    TORCH_CHECK(A.scalar_type() == at::ScalarType::Float8_e4m3fn, "A must be fp8 e4m3");
+    TORCH_CHECK(B.scalar_type() == at::ScalarType::Float8_e4m3fn, "B must be fp8 e4m3");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(A.size(1) == K1024 && B.size(1) == K1024, "A and B must have K=1024");
+    TORCH_CHECK((A.size(0) % 128) == 0 && (B.size(0) % 256) == 0, "M must be multiple of 128 and N multiple of 256");
+
+    auto M = A.size(0);
+    auto N = B.size(0);
+    auto K = A.size(1);
+    at::Tensor C = at::empty({M, N}, A.options().dtype(at::ScalarType::Float));
+
+    fp8e4m3 *d_A = reinterpret_cast<fp8e4m3 *>(A.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_B = reinterpret_cast<fp8e4m3 *>(B.data_ptr<c10::Float8_e4m3fn>());
+    float *d_C = C.data_ptr<float>();
+
+    using mmt = fp8_fp32out::matmul_template<8>;
+    dim3 grid(mmt::grid(M, N, K));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fp8_fp32out::inner_run<mmt>(d_A, d_B, d_C, M, N, K, grid, block);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return C;
+}
+
+PYBIND11_MODULE(_C, m) {
+    m.def("ln_adaln_quantize_k1024", &ln_adaln_quantize_k1024);
+    m.def("ln_adaln_quantize_stats_k1024", &ln_adaln_quantize_stats_k1024);
+    m.def("reduce_amax", &reduce_amax);
+    m.def("fp8_gemm_k1024", &fp8_gemm_k1024);
+    m.def("fp8_gemm_k1024_fp32_out", &fp8_gemm_k1024_fp32_out);
+}
