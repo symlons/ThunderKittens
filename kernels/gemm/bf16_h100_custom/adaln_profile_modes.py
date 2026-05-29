@@ -202,6 +202,16 @@ def command_for_mode(mode: str) -> list[str]:
             "--warmup", "500",
             "--iters", "100",
         ]
+    if mode == "adaln_layernorm_profile_full_max_autotune_fixed":
+        return [
+            "python3", "profile_adaln_layernorm.py",
+            "--shapes", "64x1024", "80x1024", "16x4096", "20x4096",
+            "--dim", "1024",
+            "--warmup", "500",
+            "--iters", "100",
+            "--compile-max-autotune",
+            "--compile-fixed-shapes",
+        ]
     if mode == "adaln_layernorm_train_profile":
         return [
             "python3", "profile_adaln_layernorm.py",

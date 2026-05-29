@@ -11,9 +11,15 @@ from harness import reference_backward, reference_forward, run_fused_backward, r
 from tk_bench import check_close, input_group_count, print_bench, profile_groups, uniform_bf16
 
 
-def compile_or_none(fn: Callable):
+def compile_or_none(fn: Callable, *, max_autotune: bool = False, fixed_shapes: bool = False):
     try:
-        return torch.compile(fn)
+        kwargs = {}
+        if max_autotune:
+            kwargs["mode"] = "max-autotune"
+        if fixed_shapes:
+            kwargs["dynamic"] = False
+            torch._dynamo.reset()
+        return torch.compile(fn, **kwargs)
     except Exception as exc:
         print(f"torch.compile unavailable for {getattr(fn, '__name__', repr(fn))}: {exc!r}", flush=True)
         return None
@@ -160,15 +166,31 @@ def validate_shape(batch: int, tokens: int, dim: int, eps: float) -> bool:
     return ok
 
 
-def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, eps: float) -> bool:
+def profile_shape(
+    batch: int,
+    tokens: int,
+    dim: int,
+    warmup: int,
+    iters: int,
+    eps: float,
+    *,
+    compile_max_autotune: bool,
+    compile_fixed_shapes: bool,
+) -> bool:
     label = f"B{batch}T{tokens}D{dim}"
     print(f"\nLayerNorm+AdaLN profile {label}", flush=True)
     ok = validate_shape(batch, tokens, dim, eps)
     groups = make_groups(batch, tokens, dim, eps, seed=72000 + batch + tokens)
 
-    compiled_forward = compile_or_none(lambda x, shift, scale: reference_forward(x, shift, scale, tokens, eps)[0])
+    compiled_forward = compile_or_none(
+        lambda x, shift, scale: reference_forward(x, shift, scale, tokens, eps)[0],
+        max_autotune=compile_max_autotune,
+        fixed_shapes=compile_fixed_shapes,
+    )
     compiled_backward = compile_or_none(
-        lambda grad, x, scale, mean, rstd: reference_backward(grad, x, scale, mean, rstd, tokens)
+        lambda grad, x, scale, mean, rstd: reference_backward(grad, x, scale, mean, rstd, tokens),
+        max_autotune=compile_max_autotune,
+        fixed_shapes=compile_fixed_shapes,
     )
 
     rows = batch * tokens
@@ -190,7 +212,7 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
                 f"{label} compile forward",
                 groups,
                 lambda g: compiled_forward(g[0], g[1], g[2]),
-                warmup=max(2, min(warmup, 10)),
+                warmup=warmup,
                 iters=iters,
                 bytes_moved=bytes_forward,
             )
@@ -233,7 +255,7 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
                 f"{label} compile backward",
                 groups,
                 lambda g: compiled_backward(g[3], g[0], g[2], g[4], g[5]),
-                warmup=max(2, min(warmup, 10)),
+                warmup=warmup,
                 iters=iters,
                 bytes_moved=bytes_backward,
             )
@@ -276,7 +298,17 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
     return ok
 
 
-def profile_train_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, eps: float) -> bool:
+def profile_train_shape(
+    batch: int,
+    tokens: int,
+    dim: int,
+    warmup: int,
+    iters: int,
+    eps: float,
+    *,
+    compile_max_autotune: bool,
+    compile_fixed_shapes: bool,
+) -> bool:
     label = f"B{batch}T{tokens}D{dim}"
     print(f"\nLayerNorm+AdaLN autograd train profile {label}", flush=True)
     ok = validate_shape(batch, tokens, dim, eps)
@@ -285,8 +317,16 @@ def profile_train_shape(batch: int, tokens: int, dim: int, warmup: int, iters: i
     compile_groups = make_train_groups(batch, tokens, dim, seed=74000 + batch + tokens)
     custom_groups = make_train_groups(batch, tokens, dim, seed=75000 + batch + tokens)
 
-    compiled_forward = compile_or_none(torch_autograd_forward)
-    compiled_custom_forward = compile_or_none(custom_autograd_forward)
+    compiled_forward = compile_or_none(
+        torch_autograd_forward,
+        max_autotune=compile_max_autotune,
+        fixed_shapes=compile_fixed_shapes,
+    )
+    compiled_custom_forward = compile_or_none(
+        custom_autograd_forward,
+        max_autotune=compile_max_autotune,
+        fixed_shapes=compile_fixed_shapes,
+    )
 
     rows = batch * tokens
     bytes_train = rows * dim * 2 * 8 + batch * dim * 2 * 4 + rows * 4 * 2 + batch * dim * 4 * 2
@@ -306,7 +346,7 @@ def profile_train_shape(batch: int, tokens: int, dim: int, warmup: int, iters: i
                 f"{label} compile autograd train",
                 compile_groups,
                 lambda g: train_step(compiled_forward, g, tokens, eps),
-                warmup=max(2, min(warmup, 10)),
+                warmup=warmup,
                 iters=iters,
                 bytes_moved=bytes_train,
             )
@@ -327,7 +367,7 @@ def profile_train_shape(batch: int, tokens: int, dim: int, warmup: int, iters: i
                 f"{label} custom+compile autograd train",
                 custom_groups,
                 lambda g: train_step(compiled_custom_forward, g, tokens, eps),
-                warmup=max(2, min(warmup, 10)),
+                warmup=warmup,
                 iters=iters,
                 bytes_moved=bytes_train,
             )
@@ -362,15 +402,35 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--train", action="store_true")
+    parser.add_argument("--compile-max-autotune", action="store_true")
+    parser.add_argument("--compile-fixed-shapes", action="store_true")
     args = parser.parse_args()
 
     ok = True
     for shape in args.shapes:
         batch, tokens = parse_shape(shape)
         if args.train:
-            ok = profile_train_shape(batch, tokens, args.dim, args.warmup, args.iters, args.eps) and ok
+            ok = profile_train_shape(
+                batch,
+                tokens,
+                args.dim,
+                args.warmup,
+                args.iters,
+                args.eps,
+                compile_max_autotune=args.compile_max_autotune,
+                compile_fixed_shapes=args.compile_fixed_shapes,
+            ) and ok
         else:
-            ok = profile_shape(batch, tokens, args.dim, args.warmup, args.iters, args.eps) and ok
+            ok = profile_shape(
+                batch,
+                tokens,
+                args.dim,
+                args.warmup,
+                args.iters,
+                args.eps,
+                compile_max_autotune=args.compile_max_autotune,
+                compile_fixed_shapes=args.compile_fixed_shapes,
+            ) and ok
     raise SystemExit(0 if ok else 1)
 
 
