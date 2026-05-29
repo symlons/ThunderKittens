@@ -22,6 +22,7 @@ image = (
     .apt_install("make", "ninja-build")
     .pip_install("packaging", "pybind11")
     .pip_install("quack-kernels[cu13]", extra_index_url="https://download.pytorch.org/whl/cu130")
+    .pip_install("liger-kernel")
     .add_local_dir(str(LOCAL_TK_ROOT), str(TK_ROOT), copy=True)
 )
 
