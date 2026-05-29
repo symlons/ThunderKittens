@@ -216,6 +216,16 @@ def call_module(module: nn.Module, group: object) -> torch.Tensor:
     return module(group)
 
 
+def call_reference_module(module: nn.Module, group: object) -> torch.Tensor:
+    module = getattr(module, "_orig_mod", module)
+    reference_forward = getattr(module, "reference_forward", None)
+    if reference_forward is None:
+        return call_module(module, group)
+    if isinstance(group, tuple):
+        return reference_forward(*group)
+    return reference_forward(group)
+
+
 def clone_group_for_grad(group: object) -> torch.Tensor | tuple[torch.Tensor, ...]:
     if isinstance(group, torch.Tensor):
         return group.detach().clone().requires_grad_(True)
@@ -527,7 +537,7 @@ def make_fwd_case(
         grad_context = torch.enable_grad if requires_grad else torch.no_grad
         with grad_context(), autocast_context(group_device(groups[0]), autocast_dtype):
             actual = call_module(module, groups[0]).float().clone()
-            expected = call_module(module, groups[0]).float().clone()
+            expected = call_reference_module(module, groups[0]).float().clone()
         correctness = compare_tensors((actual,), (expected,), eps=eps)
         del actual, expected
         torch.cuda.synchronize()
@@ -556,7 +566,7 @@ def make_deploy_case(
     if check_correctness:
         with torch.inference_mode(), autocast_context(group_device(groups[0]), autocast_dtype):
             actual = call_module(module, groups[0]).float().clone()
-            expected = call_module(module, groups[0]).float().clone()
+            expected = call_reference_module(module, groups[0]).float().clone()
         correctness = compare_tensors((actual,), (expected,), eps=eps)
         del actual, expected
         torch.cuda.synchronize()

@@ -12,6 +12,7 @@ TK_ROOT = Path("/ThunderKittens")
 LOCAL_TK_ROOT = Path(os.environ.get("THUNDERKITTENS_ROOT", "/Users/sfkost/research/ThunderKittens"))
 PYTORCH_IMAGE = os.environ.get("PYTORCH_IMAGE", "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
 MODAL_ADD_PYTHON = os.environ.get("MODAL_ADD_PYTHON") or None
+INSTALL_QUACK = os.environ.get("INSTALL_QUACK", "0") == "1"
 BENCH_DIR = TK_ROOT / "kernels/gemm/layernorm/baselines"
 
 app = modal.App(APP_NAME)
@@ -30,6 +31,12 @@ image = (
     .pip_install("timm")
     .add_local_dir(str(LOCAL_TK_ROOT), str(TK_ROOT), copy=True)
 )
+
+if INSTALL_QUACK:
+    image = image.pip_install(
+        "quack-kernels[cu13]",
+        extra_index_url="https://download.pytorch.org/whl/cu130",
+    )
 
 
 def run(command: list[str]) -> None:
@@ -71,6 +78,7 @@ def benchmark_command(
     architecture_breakdown: bool,
     dynamo_explain: bool,
     profiler_trace: str,
+    eps: float,
 ) -> list[str]:
     command = [
         "python3",
@@ -91,6 +99,8 @@ def benchmark_command(
         dtype,
         "--autocast",
         autocast,
+        "--eps",
+        str(eps),
         "--compare-baseline",
         compare_baseline,
         "--baseline-compile-backend",
@@ -168,6 +178,7 @@ def main(
     architecture_breakdown: bool = False,
     dynamo_explain: bool = False,
     profiler_trace: str = "",
+    eps: float = 1e-6,
 ) -> None:
     command = benchmark_command(
         model_variant=model_variant,
@@ -195,6 +206,7 @@ def main(
         architecture_breakdown=architecture_breakdown,
         dynamo_explain=dynamo_explain,
         profiler_trace=profiler_trace,
+        eps=eps,
     )
     if gpu.upper() == "H200":
         run_h200.remote(command)

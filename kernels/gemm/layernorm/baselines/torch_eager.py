@@ -104,6 +104,37 @@ def build_layernorm_affine(dim: int, hidden_dim: int, dtype: torch.dtype, device
     return make_layernorm(dim, dtype, device, train, affine=True)
 
 
+class QuackLayerNormAffine(nn.Module):
+    def __init__(self, dim: int, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=torch.float32), requires_grad=False)
+        self.bias = nn.Parameter(torch.zeros(dim, device=device, dtype=torch.float32), requires_grad=False)
+        self.eps = 1e-6
+        self.output_dtype = dtype
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from quack.rmsnorm import layernorm_fwd
+
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1]).contiguous()
+        y = layernorm_fwd(x_2d, self.weight, self.bias, eps=self.eps)
+        return y.reshape(shape)
+
+    def reference_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.layer_norm(x.float(), x.shape[-1:], self.weight, self.bias, self.eps).to(x.dtype)
+
+
+def build_quack_layernorm_affine(
+    dim: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    train: bool,
+) -> nn.Module:
+    del hidden_dim, train
+    return QuackLayerNormAffine(dim, dtype, device)
+
+
 def make_adaln_input_groups(
     batch: int,
     tokens: int,
@@ -292,6 +323,13 @@ MODEL_REGISTRY: dict[str, ModelVariant] = {
     "layernorm-affine": ModelVariant(
         name="layernorm-affine",
         make_model=build_layernorm_affine,
+        make_groups=make_model_input_groups,
+        workload_parts=layernorm_affine_workload_parts,
+        fwd_cost=layernorm_affine_fwd_cost,
+    ),
+    "quack-layernorm-affine": ModelVariant(
+        name="quack-layernorm-affine",
+        make_model=build_quack_layernorm_affine,
         make_groups=make_model_input_groups,
         workload_parts=layernorm_affine_workload_parts,
         fwd_cost=layernorm_affine_fwd_cost,
