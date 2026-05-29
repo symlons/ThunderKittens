@@ -52,7 +52,10 @@ def tk_layernorm_adaln_op(
     out = torch.empty_like(flat)
     mean = torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32)
     rstd = torch.empty_like(mean)
-    _C.layernorm_adaln(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
+    if flat.dtype == torch.bfloat16 and flat.shape[1] == 1024:
+        _C.layernorm_adaln_warp4(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
+    else:
+        _C.layernorm_adaln(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
     return out, mean, rstd
 
 
@@ -77,7 +80,10 @@ def tk_layernorm_adaln_backward_op(
     dx = torch.empty_like(flat)
     dshift = torch.empty_like(scale, dtype=torch.float32)
     dscale = torch.empty_like(scale, dtype=torch.float32)
-    _C.layernorm_adaln_backward(grad, flat, scale, mean, rstd, dx, dshift, dscale, tokens)
+    if flat.dtype == torch.bfloat16 and flat.shape[1] == 1024:
+        _C.layernorm_adaln_backward_warp4(grad, flat, scale, mean, rstd, dx, dshift, dscale, tokens)
+    else:
+        _C.layernorm_adaln_backward(grad, flat, scale, mean, rstd, dx, dshift, dscale, tokens)
     return dx, dshift, dscale
 
 
@@ -413,8 +419,6 @@ class FusedAdaLN(torch.autograd.Function):
 
 
 def fused_adaln(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    if _is_compiling() and x.numel() // x.shape[-1] >= 16384:
-        return modulate(torch.nn.functional.layer_norm(x, (x.shape[-1],), eps=eps), shift, scale)
     return FusedAdaLN.apply(x, shift, scale, eps)
 
 
@@ -649,6 +653,15 @@ def fused_linear_gated_residual(
     return gated_residual(residual, linear(x), gate)
 
 
+def linear_then_gated_residual(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    linear: nn.Linear,
+) -> torch.Tensor:
+    return gated_residual(residual, torch.nn.functional.linear(x, linear.weight, linear.bias), gate)
+
+
 class TkGelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor) -> torch.Tensor:
@@ -753,6 +766,10 @@ class TkMlp(nn.Module):
         h = torch.nn.functional.gelu(self.fc1(x), approximate="tanh")
         return fused_linear_gated_residual(h, residual, gate, self.fc2)
 
+    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        h = torch.nn.functional.gelu(self.fc1(x), approximate="tanh")
+        return linear_then_gated_residual(h, residual, gate, self.fc2)
+
 
 class FusedInputMlp(nn.Module):
     def __init__(self, in_features: int, hidden_features: int):
@@ -776,6 +793,10 @@ class FusedInputMlp(nn.Module):
     ) -> torch.Tensor:
         h = fused_adaln_linear_gelu(residual, shift, scale, self.fc1, eps)
         return fused_linear_gated_residual(h, residual, gate, self.fc2)
+
+    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        h = torch.nn.functional.gelu(self.fc1(x), approximate="tanh")
+        return linear_then_gated_residual(h, residual, gate, self.fc2)
 
 
 class SdpaAttention(nn.Module):
@@ -823,6 +844,12 @@ class SdpaAttention(nn.Module):
         attn = self._attention_from_qkv(qkv)
         return fused_linear_gated_residual(attn, residual, gate, self.proj)
 
+    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = x.shape
+        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        attn = self._attention_from_qkv(qkv)
+        return linear_then_gated_residual(attn, residual, gate, self.proj)
+
 
 class FlashAttention3(nn.Module):
     def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
@@ -868,6 +895,13 @@ class FlashAttention3(nn.Module):
         q, k, v = qkv.unbind(dim=2)
         out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
         return fused_linear_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
+
+    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        batch, tokens, dim = x.shape
+        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
+        return linear_then_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
 
 
 class PatchEmbed3D(nn.Module):
@@ -939,6 +973,7 @@ class DiTBlock(nn.Module):
         tk_mlp_enabled=False,
         fused_input_projection_enabled=False,
         fused_output_projection_enabled=False,
+        fused_epilogue_only_enabled=False,
         attention_backend="timm",
         **block_kwargs,
     ):
@@ -947,6 +982,7 @@ class DiTBlock(nn.Module):
         self.fused_residual_enabled = fused_residual_enabled
         self.fused_input_projection_enabled = fused_input_projection_enabled
         self.fused_output_projection_enabled = fused_output_projection_enabled
+        self.fused_epilogue_only_enabled = fused_epilogue_only_enabled
         self.tk_mlp_enabled = tk_mlp_enabled
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         if attention_backend == "fa3":
@@ -988,6 +1024,13 @@ class DiTBlock(nn.Module):
             elif self.fused_input_projection_enabled and hasattr(self.attn, "forward_from_adaln"):
                 attn_out = self.attn.forward_from_adaln(x, shift_msa, scale_msa, self.norm1.eps)
                 x = gated_residual(x, attn_out, gate_msa) if self.fused_residual_enabled else x + gate_msa.unsqueeze(1) * attn_out
+            elif (
+                self.fused_epilogue_only_enabled
+                and self.fused_residual_enabled
+                and hasattr(self.attn, "forward_residual_epilogue")
+            ):
+                attn_in = fused_adaln(x, shift_msa, scale_msa, self.norm1.eps)
+                x = self.attn.forward_residual_epilogue(attn_in, x, gate_msa)
             elif self.fused_output_projection_enabled and self.fused_residual_enabled and hasattr(self.attn, "forward_residual"):
                 attn_in = fused_adaln(x, shift_msa, scale_msa, self.norm1.eps)
                 x = self.attn.forward_residual(attn_in, x, gate_msa)
@@ -1011,6 +1054,13 @@ class DiTBlock(nn.Module):
             elif self.fused_input_projection_enabled and hasattr(self.mlp, "forward_from_adaln"):
                 mlp_out = self.mlp.forward_from_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
                 x = gated_residual(x, mlp_out, gate_mlp) if self.fused_residual_enabled else x + gate_mlp.unsqueeze(1) * mlp_out
+            elif (
+                self.fused_epilogue_only_enabled
+                and self.fused_residual_enabled
+                and hasattr(self.mlp, "forward_residual_epilogue")
+            ):
+                mlp_in = fused_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
+                x = self.mlp.forward_residual_epilogue(mlp_in, x, gate_mlp)
             elif self.fused_output_projection_enabled and self.fused_residual_enabled and hasattr(self.mlp, "forward_residual"):
                 mlp_in = fused_adaln(x, shift_mlp, scale_mlp, self.norm2.eps)
                 x = self.mlp.forward_residual(mlp_in, x, gate_mlp)
@@ -1058,6 +1108,7 @@ class DiT(nn.Module):
         tk_mlp_enabled=False,
         fused_input_projection_enabled=False,
         fused_output_projection_enabled=False,
+        fused_epilogue_only_enabled=False,
         attention_backend="timm",
     ):
         super().__init__()
@@ -1078,6 +1129,7 @@ class DiT(nn.Module):
                 tk_mlp_enabled=tk_mlp_enabled,
                 fused_input_projection_enabled=fused_input_projection_enabled,
                 fused_output_projection_enabled=fused_output_projection_enabled,
+                fused_epilogue_only_enabled=fused_epilogue_only_enabled,
                 attention_backend=attention_backend,
             )
             for _ in range(depth)

@@ -12,6 +12,8 @@ from dit3d_e2e_bench import (
     FusedLinearGatedResidual,
     fused_adaln_linear_gelu,
     fused_linear_gated_residual,
+    gated_residual,
+    linear_then_gated_residual,
     modulate,
     tk_gemm_gelu_ln_adaln_op,
     tk_gemm_linear_gated_residual_op,
@@ -51,6 +53,10 @@ def torch_ln_linear_gelu(x, shift, scale, w, b, eps):
 
 def torch_linear_gated_residual(h, residual, gate, w, b):
     return residual + gate.unsqueeze(1) * F.linear(h, w, b)
+
+
+def torch_gated_residual(residual, h, gate):
+    return residual + gate.unsqueeze(1) * h
 
 
 def torch_mlp_branch(x, shift, scale, gate, w1, b1, w2, b2, eps):
@@ -99,9 +105,22 @@ def custom_linear_gated_residual(h, residual, gate, w, b):
     return out.reshape_as(residual)
 
 
+def custom_epilogue_linear_gated_residual(h, residual, gate, w, b):
+    return linear_then_gated_residual(h, residual, gate, _linear_from_tensors(w, b))
+
+
+def custom_gated_residual(residual, h, gate):
+    return gated_residual(residual, h, gate)
+
+
 def custom_mlp_branch(x, shift, scale, gate, w1, b1, w2, b2, eps):
     h = fused_adaln_linear_gelu(x, shift, scale, _linear_from_tensors(w1, b1), eps)
     return fused_linear_gated_residual(h, x, gate, _linear_from_tensors(w2, b2))
+
+
+def custom_epilogue_mlp_branch(x, shift, scale, gate, w1, b1, w2, b2, eps):
+    h = F.gelu(torch_ln_linear(x, shift, scale, w1, b1, eps), approximate="tanh")
+    return custom_epilogue_linear_gated_residual(h, x, gate, w2, b2)
 
 
 class _linear_from_tensors:
@@ -133,6 +152,14 @@ def make_residual_base(batch: int, tokens: int, dim: int, seed: int) -> tuple[to
     b = uniform_bf16((dim,), seed + 4, -0.02, 0.02).requires_grad_(True)
     grad = uniform_bf16((batch, tokens, dim), seed + 5, -1.0, 1.0)
     return h, residual, gate, w, b, grad
+
+
+def make_gated_residual_base(batch: int, tokens: int, dim: int, seed: int) -> tuple[torch.Tensor, ...]:
+    residual = uniform_bf16((batch, tokens, dim), seed, -2.0, 2.0).requires_grad_(True)
+    h = uniform_bf16((batch, tokens, dim), seed + 1, -2.0, 2.0).requires_grad_(True)
+    gate = uniform_bf16((batch, dim), seed + 2, -0.5, 0.5).requires_grad_(True)
+    grad = uniform_bf16((batch, tokens, dim), seed + 3, -1.0, 1.0)
+    return residual, h, gate, grad
 
 
 def make_mlp_base(batch: int, tokens: int, dim: int, seed: int) -> tuple[torch.Tensor, ...]:
@@ -202,10 +229,26 @@ def detailed_correctness(batch: int, tokens: int, dim: int, eps: float) -> None:
             ("h", "residual", "gate", "w", "b"),
         ),
         (
+            "post_linear_gated_residual_epilogue",
+            torch_linear_gated_residual,
+            custom_epilogue_linear_gated_residual,
+            make_residual_base(batch, tokens, dim, 53500 + tokens + batch),
+            None,
+            ("h", "residual", "gate", "w", "b"),
+        ),
+        (
             "full_mlp_branch",
             torch_mlp_branch,
             custom_mlp_branch,
             make_mlp_base(batch, tokens, dim, 54000 + tokens + batch),
+            eps,
+            ("x", "shift", "scale", "gate", "w1", "b1", "w2", "b2"),
+        ),
+        (
+            "full_mlp_branch_epilogue",
+            torch_mlp_branch,
+            custom_epilogue_mlp_branch,
+            make_mlp_base(batch, tokens, dim, 54500 + tokens + batch),
             eps,
             ("x", "shift", "scale", "gate", "w1", "b1", "w2", "b2"),
         ),
@@ -354,12 +397,42 @@ def run_shape_cases(batch: int, tokens: int, dim: int, warmup: int, iters: int, 
             warmup,
             iters,
         )
+    if "post_residual_epilogue" in cases:
+        compare_case(
+            "post_linear_gated_residual_epilogue",
+            torch_linear_gated_residual,
+            custom_epilogue_linear_gated_residual,
+            make_residual_base(batch, tokens, dim, 3300 + tokens),
+            None,
+            warmup,
+            iters,
+        )
+    if "gated_residual" in cases:
+        compare_case(
+            "gated_residual",
+            torch_gated_residual,
+            custom_gated_residual,
+            make_gated_residual_base(batch, tokens, dim, 3500 + tokens),
+            None,
+            warmup,
+            iters,
+        )
     if "full_mlp" in cases:
         compare_case(
             "full_mlp_branch",
             torch_mlp_branch,
             custom_mlp_branch,
             make_mlp_base(batch, tokens, dim, 4000 + tokens),
+            eps,
+            warmup,
+            iters,
+        )
+    if "full_mlp_epilogue" in cases:
+        compare_case(
+            "full_mlp_branch_epilogue",
+            torch_mlp_branch,
+            custom_epilogue_mlp_branch,
+            make_mlp_base(batch, tokens, dim, 4300 + tokens),
             eps,
             warmup,
             iters,
@@ -395,8 +468,16 @@ def main() -> None:
     parser.add_argument(
         "--cases",
         nargs="+",
-        default=["pre_qkv", "fc1_gelu", "post_residual", "full_mlp"],
-        choices=["pre_qkv", "fc1_gelu", "post_residual", "full_mlp"],
+        default=["pre_qkv", "fc1_gelu", "post_residual", "post_residual_epilogue", "full_mlp", "full_mlp_epilogue"],
+        choices=[
+            "pre_qkv",
+            "fc1_gelu",
+            "post_residual",
+            "post_residual_epilogue",
+            "gated_residual",
+            "full_mlp",
+            "full_mlp_epilogue",
+        ],
     )
     args = parser.parse_args()
 

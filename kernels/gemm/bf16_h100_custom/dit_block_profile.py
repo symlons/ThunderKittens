@@ -42,6 +42,7 @@ def make_block(
     tk_mlp: bool,
     fused_input_projection: bool,
     fused_output_projection: bool,
+    fused_epilogue_only: bool,
     attention_backend: str,
 ) -> DiTBlock:
     cfg = dit_config(model_name)
@@ -53,6 +54,7 @@ def make_block(
         tk_mlp_enabled=tk_mlp,
         fused_input_projection_enabled=fused_input_projection,
         fused_output_projection_enabled=fused_output_projection,
+        fused_epilogue_only_enabled=fused_epilogue_only,
         attention_backend=attention_backend,
     )
     return block.cuda().to(torch.bfloat16).train()
@@ -101,6 +103,7 @@ def profile_shape(
     warmup: int,
     iters: int,
     variants: list[str],
+    compile_fixed_shapes: bool,
 ) -> None:
     cfg = dit_config(model_name)
     dim = cfg["hidden_size"]
@@ -114,13 +117,16 @@ def profile_shape(
         tk_mlp=False,
         fused_input_projection=False,
         fused_output_projection=False,
+        fused_epilogue_only=False,
         attention_backend="timm",
     )
     variant_specs = {
-        "eager": dict(fused=False, fused_residual=False, tk_mlp=False, fused_input_projection=False, fused_output_projection=False),
-        "compile": dict(fused=False, fused_residual=False, tk_mlp=False, fused_input_projection=False, fused_output_projection=False),
-        "custom_adaln_residual_compile": dict(fused=True, fused_residual=True, tk_mlp=False, fused_input_projection=False, fused_output_projection=False),
-        "custom_full_compile": dict(fused=True, fused_residual=True, tk_mlp=True, fused_input_projection=True, fused_output_projection=True),
+        "eager": dict(fused=False, fused_residual=False, tk_mlp=False, fused_input_projection=False, fused_output_projection=False, fused_epilogue_only=False),
+        "compile": dict(fused=False, fused_residual=False, tk_mlp=False, fused_input_projection=False, fused_output_projection=False, fused_epilogue_only=False),
+        "custom_adaln_compile": dict(fused=True, fused_residual=False, tk_mlp=False, fused_input_projection=False, fused_output_projection=False, fused_epilogue_only=False),
+        "custom_adaln_residual_compile": dict(fused=True, fused_residual=True, tk_mlp=False, fused_input_projection=False, fused_output_projection=False, fused_epilogue_only=False),
+        "custom_epilogue_compile": dict(fused=True, fused_residual=True, tk_mlp=False, fused_input_projection=False, fused_output_projection=False, fused_epilogue_only=True),
+        "custom_full_compile": dict(fused=True, fused_residual=True, tk_mlp=True, fused_input_projection=True, fused_output_projection=True, fused_epilogue_only=False),
     }
     results: dict[str, float] = {}
     for variant in variants:
@@ -130,7 +136,11 @@ def profile_shape(
         block.load_state_dict(base.state_dict(), strict=False)
         if variant != "eager":
             check_variant(variant, base, block, groups[0])
-        run_block: torch.nn.Module = torch.compile(block) if variant != "eager" else block
+        if variant != "eager" and compile_fixed_shapes:
+            torch._dynamo.reset()
+        run_block: torch.nn.Module = torch.compile(block, dynamic=False) if variant != "eager" and compile_fixed_shapes else (
+            torch.compile(block) if variant != "eager" else block
+        )
         try:
             result = profile_groups(
                 f"DiTBlock-{model_name} B{batch} T{tokens} {variant} train",
@@ -169,9 +179,10 @@ def main() -> None:
     parser.add_argument(
         "--variants",
         nargs="+",
-        default=["eager", "compile", "custom_adaln_residual_compile", "custom_full_compile"],
-        choices=["eager", "compile", "custom_adaln_residual_compile", "custom_full_compile"],
+        default=["eager", "compile", "custom_adaln_compile", "custom_adaln_residual_compile", "custom_epilogue_compile", "custom_full_compile"],
+        choices=["eager", "compile", "custom_adaln_compile", "custom_adaln_residual_compile", "custom_epilogue_compile", "custom_full_compile"],
     )
+    parser.add_argument("--compile-fixed-shapes", action="store_true")
     args = parser.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -179,7 +190,7 @@ def main() -> None:
     torch.cuda.init()
     print(f"DiTBlock profile gpu={torch.cuda.get_device_name()} model={args.model}", flush=True)
     for batch, tokens in args.shapes:
-        profile_shape(args.model, batch, tokens, args.warmup, args.iters, args.variants)
+        profile_shape(args.model, batch, tokens, args.warmup, args.iters, args.variants, args.compile_fixed_shapes)
 
 
 if __name__ == "__main__":

@@ -5,15 +5,37 @@ import argparse
 import torch
 import transformer_engine  # noqa: F401
 import transformer_engine_torch as tex
+from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
 
-from _C import ln_adaln_quantize_k1024, ln_adaln_quantize_stats_k1024
+from _C import (
+    fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled,
+    ln_adaln_quantize_k1024,
+    ln_adaln_quantize_stats_k1024,
+)
 
 
 def raw_u8(t: torch.Tensor) -> torch.Tensor:
     if t.dtype == torch.uint8:
         return t
     return t.view(torch.uint8)
+
+
+def raw_e4m3(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.float8_e4m3fn:
+        return t
+    return t.view(torch.float8_e4m3fn)
+
+
+def te_general_gemm_tn_bf16(x_fp8: torch.Tensor, w_fp8: torch.Tensor) -> torch.Tensor:
+    try:
+        out, _, _, _ = general_gemm(w_fp8, x_fp8, out_dtype=torch.bfloat16, layout="TN")
+    except TypeError as exc:
+        if "workspace" not in str(exc):
+            raise
+        workspace = torch.empty(4_194_304, dtype=torch.uint8, device=x_fp8.device)
+        out, _, _, _ = general_gemm(w_fp8, x_fp8, workspace, out_dtype=torch.bfloat16, layout="TN")
+    return out
 
 
 def main() -> None:
@@ -96,6 +118,38 @@ def main() -> None:
     print(f"stats_mean_max_abs_diff={(mean_stats - mean_ref).abs().max().item():.8g}")
     print(f"stats_rstd_max_abs_diff={(rstd_stats - rstd_ref).abs().max().item():.8g}")
 
+    gemm_x = torch.randn((128, k), device=device, dtype=torch.bfloat16) * 0.02
+    w = torch.randn((256, k), device=device, dtype=torch.bfloat16) * 0.02
+    x_quantizer = Float8Quantizer(
+        scale=torch.full((1,), args.scale, dtype=torch.float32, device=device),
+        amax=torch.zeros((1,), dtype=torch.float32, device=device),
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=False,
+    )
+    w_quantizer = Float8Quantizer(
+        scale=torch.full((1,), args.scale, dtype=torch.float32, device=device),
+        amax=torch.zeros((1,), dtype=torch.float32, device=device),
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=False,
+    )
+    te_gemm_x = x_quantizer(gemm_x.float() / args.scale)
+    te_w = w_quantizer(w.float() / args.scale)
+    te_gemm_out = te_general_gemm_tn_bf16(te_gemm_x, te_w)
+    tk_gemm_out = fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled(
+        raw_e4m3(te_gemm_x._data),
+        raw_e4m3(te_w._data),
+        float(te_gemm_x._scale_inv.item()),
+        float(te_w._scale_inv.item()),
+    )
+    gemm_ref = raw_e4m3(te_gemm_x._data).float() @ raw_e4m3(te_w._data).float().T
+    gemm_ref = gemm_ref * te_gemm_x._scale_inv.float() * te_w._scale_inv.float()
+    te_gemm_diff = (te_gemm_out.float() - gemm_ref).abs().max()
+    tk_te_gemm_diff = (tk_gemm_out.float() - te_gemm_out.float()).abs().max()
+    print(f"te_gemm_ref_max_abs_diff={te_gemm_diff.item():.8g}")
+    print(f"tk_te_gemm_max_abs_diff={tk_te_gemm_diff.item():.8g}")
+
     if not raw_match:
         mismatches = (tk_raw != te_raw).sum().item()
         raise AssertionError(f"TK FP8 bytes differ from TE: {mismatches} mismatches")
@@ -111,6 +165,10 @@ def main() -> None:
         raise AssertionError("stats TK reduced amax differs from TE amax")
     if (mean_stats - mean_ref).abs().max().item() > 1e-5 or (rstd_stats - rstd_ref).abs().max().item() > 1e-5:
         raise AssertionError("stats mean/rstd differs from PyTorch")
+    if te_gemm_diff.item() > 0.03125:
+        raise AssertionError("TE GEMM differs from dequantized torch reference")
+    if tk_te_gemm_diff.item() > 0.03125:
+        raise AssertionError("TK scaled GEMM differs from TE GEMM")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 
 import _C
 from dit3d_e2e_bench import tk_layernorm_adaln_backward_op, tk_layernorm_adaln_op
@@ -31,6 +34,26 @@ def torch_autograd_forward(x: torch.Tensor, shift: torch.Tensor, scale: torch.Te
     out = torch.nn.functional.layer_norm(x3, (x.shape[1],), eps=eps)
     out = out * (1.0 + scale[:, None, :]) + shift[:, None, :]
     return out.reshape_as(x)
+
+
+def torch_autograd_backward(
+    grad: torch.Tensor,
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    tokens: int,
+    eps: float,
+):
+    with torch.enable_grad():
+        out = torch_autograd_forward(x, shift, scale, tokens, eps)
+        dx, dshift, dscale = torch.autograd.grad(
+            out,
+            (x, shift, scale),
+            grad,
+            retain_graph=False,
+            create_graph=False,
+        )
+    return dx, dshift, dscale
 
 
 class FusedAdaLNAutograd(torch.autograd.Function):
@@ -90,6 +113,20 @@ def run_fused_backward_variant(
     return dx, dshift, dscale
 
 
+def run_fused_fwd_bwd_variant(
+    grad: torch.Tensor,
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    tokens: int,
+    eps: float,
+    variant: str,
+):
+    out, mean, rstd = run_fused_forward_variant(x, shift, scale, tokens, eps, variant)
+    dx, dshift, dscale = run_fused_backward_variant(grad, x, scale, mean, rstd, tokens, variant if variant == "warp4" else "cta")
+    return out, dx, dshift, dscale
+
+
 def make_groups(batch: int, tokens: int, dim: int, eps: float, seed: int):
     rows = batch * tokens
     group_bytes = (
@@ -108,6 +145,73 @@ def make_groups(batch: int, tokens: int, dim: int, eps: float, seed: int):
         out, mean, rstd = run_fused_forward(x, shift, scale, tokens, eps)
         groups.append((x, shift, scale, grad, mean, rstd, out))
     return groups
+
+
+def make_autograd_groups(batch: int, tokens: int, dim: int, seed: int):
+    rows = batch * tokens
+    group_bytes = rows * dim * 2 * 2 + batch * dim * 2 * 2
+    groups_n = min(input_group_count(group_bytes), 8)
+    groups = []
+    for i in range(groups_n):
+        x = uniform_bf16((rows, dim), seed + i * 10 + 0, -2.0, 2.0).requires_grad_(True)
+        shift = uniform_bf16((batch, dim), seed + i * 10 + 1, -0.5, 0.5).requires_grad_(True)
+        scale = uniform_bf16((batch, dim), seed + i * 10 + 2, -0.25, 0.25).requires_grad_(True)
+        grad = uniform_bf16((rows, dim), seed + i * 10 + 3, -1.0, 1.0)
+        groups.append((x, shift, scale, grad))
+    return groups
+
+
+def export_trace(path: Path, name: str, fn: Callable[[], object]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    torch.cuda.synchronize()
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+    trace_path = path / f"{name}.json"
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
+        fn()
+    prof.export_chrome_trace(str(trace_path))
+    summarize_trace(trace_path)
+
+
+def summarize_trace(trace_path: Path) -> None:
+    data = json.loads(trace_path.read_text())
+    events = data.get("traceEvents", [])
+    kernel_names: list[str] = []
+    aten_names: list[str] = []
+    compiled = 0
+    for event in events:
+        name = str(event.get("name", ""))
+        cat = str(event.get("cat", ""))
+        if "kernel" in cat.lower() or name.startswith(("triton_", "void ", "ampere_", "cutlass", "sm90", "_Z")):
+            kernel_names.append(name)
+        if name.startswith("aten::"):
+            aten_names.append(name)
+        if "CompiledFunction" in name:
+            compiled += 1
+    unique_kernels = sorted(set(kernel_names))
+    materializing_aten = [
+        name for name in aten_names
+        if any(token in name for token in ("empty", "zeros", "clone", "copy", "index_add", "sum", "mul", "sub", "add"))
+    ]
+    print(f"\nTrace {trace_path.name}:", flush=True)
+    print(f"  cuda_kernel_events={len(kernel_names)} unique_cuda_kernels={len(unique_kernels)}", flush=True)
+    print(f"  compiled_function_events={compiled}", flush=True)
+    print(f"  aten_events={len(aten_names)} materializing_or_reduction_aten_events={len(materializing_aten)}", flush=True)
+    if unique_kernels:
+        print("  kernel_names:", flush=True)
+        for name in unique_kernels[:20]:
+            print(f"    - {name}", flush=True)
+        if len(unique_kernels) > 20:
+            print(f"    ... {len(unique_kernels) - 20} more", flush=True)
+    if materializing_aten:
+        counts: dict[str, int] = {}
+        for name in materializing_aten:
+            counts[name] = counts.get(name, 0) + 1
+        print("  selected_aten_counts:", flush=True)
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:20]:
+            print(f"    - {name}: {count}", flush=True)
 
 
 def make_train_groups(batch: int, tokens: int, dim: int, seed: int):
@@ -176,6 +280,9 @@ def profile_shape(
     *,
     compile_max_autotune: bool,
     compile_fixed_shapes: bool,
+    include_autograd_baseline: bool,
+    trace_dir: Path | None,
+    trace_shape: str,
 ) -> bool:
     label = f"B{batch}T{tokens}D{dim}"
     print(f"\nLayerNorm+AdaLN profile {label}", flush=True)
@@ -192,10 +299,22 @@ def profile_shape(
         max_autotune=compile_max_autotune,
         fixed_shapes=compile_fixed_shapes,
     )
+    compiled_autograd_bwd = None
+    compiled_autograd_fwd_bwd = None
+    autograd_groups = None
+    if include_autograd_baseline:
+        compiled_autograd_bwd = compile_or_none(
+            lambda grad, x, shift, scale: torch_autograd_backward(grad, x, shift, scale, tokens, eps),
+            max_autotune=compile_max_autotune,
+            fixed_shapes=compile_fixed_shapes,
+        )
+        compiled_autograd_fwd_bwd = compiled_autograd_bwd
+        autograd_groups = make_autograd_groups(batch, tokens, dim, seed=76000 + batch + tokens)
 
     rows = batch * tokens
     bytes_forward = rows * dim * 2 * 2 + batch * dim * 2 * 2 + rows * 4 * 2
     bytes_backward = rows * dim * 2 * 4 + batch * dim * 2 + rows * 4 * 2 + batch * dim * 4 * 2
+    bytes_fwd_bwd = bytes_forward + bytes_backward
     results = [
         profile_groups(
             f"{label} eager forward",
@@ -260,6 +379,17 @@ def profile_shape(
                 bytes_moved=bytes_backward,
             )
         )
+    if compiled_autograd_bwd is not None and autograd_groups is not None:
+        results.append(
+            profile_groups(
+                f"{label} compile autograd fwd+bwd",
+                autograd_groups,
+                lambda g: compiled_autograd_fwd_bwd(g[3], g[0], g[1], g[2]),
+                warmup=warmup,
+                iters=iters,
+                bytes_moved=bytes_fwd_bwd,
+            )
+        )
     results.append(
         profile_groups(
             f"{label} tk fused backward",
@@ -270,6 +400,41 @@ def profile_shape(
             bytes_moved=bytes_backward,
         )
     )
+    results.append(
+        profile_groups(
+            f"{label} tk warp4 fwd+bwd",
+            groups,
+            lambda g: run_fused_fwd_bwd_variant(g[3], g[0], g[1], g[2], tokens, eps, "warp4"),
+            warmup=warmup,
+            iters=iters,
+            bytes_moved=bytes_fwd_bwd,
+        )
+    )
+
+    if trace_dir is not None and label == trace_shape:
+        trace_root = trace_dir / label
+        if compiled_backward is not None:
+            export_trace(
+                trace_root,
+                "compile_manual_backward",
+                lambda: compiled_backward(groups[0][3], groups[0][0], groups[0][2], groups[0][4], groups[0][5]),
+            )
+        if compiled_autograd_fwd_bwd is not None and autograd_groups is not None:
+            export_trace(
+                trace_root,
+                "compile_autograd_fwd_bwd",
+                lambda: compiled_autograd_fwd_bwd(
+                    autograd_groups[0][3],
+                    autograd_groups[0][0],
+                    autograd_groups[0][1],
+                    autograd_groups[0][2],
+                ),
+            )
+        export_trace(
+            trace_root,
+            "tk_warp4_fwd_bwd",
+            lambda: run_fused_fwd_bwd_variant(groups[0][3], groups[0][0], groups[0][1], groups[0][2], tokens, eps, "warp4"),
+        )
     results.append(
         profile_groups(
             f"{label} tk warp4 backward",
@@ -290,11 +455,19 @@ def profile_shape(
     tk_fwd = by_name[f"{label} tk fused forward"]
     tk_bwd = by_name[f"{label} tk fused backward"]
     tk_warp4_bwd = by_name[f"{label} tk warp4 backward"]
+    tk_warp4_fwd_bwd = by_name[f"{label} tk warp4 fwd+bwd"]
     if compile_fwd is not None:
         print(f"RESULT {label} forward_vs_compile_speedup={compile_fwd.us / tk_fwd.us:.3f}x", flush=True)
     if compile_bwd is not None:
         print(f"RESULT {label} backward_vs_compile_speedup={compile_bwd.us / tk_bwd.us:.3f}x", flush=True)
         print(f"RESULT {label} backward_warp4_vs_compile_speedup={compile_bwd.us / tk_warp4_bwd.us:.3f}x", flush=True)
+    compile_autograd_fwd_bwd = by_name.get(f"{label} compile autograd fwd+bwd")
+    if compile_autograd_fwd_bwd is not None:
+        print(
+            f"RESULT {label} fwd_bwd_warp4_vs_compile_autograd_speedup="
+            f"{compile_autograd_fwd_bwd.us / tk_warp4_fwd_bwd.us:.3f}x",
+            flush=True,
+        )
     return ok
 
 
@@ -404,6 +577,9 @@ def main() -> None:
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--compile-max-autotune", action="store_true")
     parser.add_argument("--compile-fixed-shapes", action="store_true")
+    parser.add_argument("--autograd-baseline", action="store_true")
+    parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument("--trace-shape", default="B64T1024D1024")
     args = parser.parse_args()
 
     ok = True
@@ -430,6 +606,9 @@ def main() -> None:
                 args.eps,
                 compile_max_autotune=args.compile_max_autotune,
                 compile_fixed_shapes=args.compile_fixed_shapes,
+                include_autograd_baseline=args.autograd_baseline,
+                trace_dir=args.trace_dir,
+                trace_shape=args.trace_shape,
             ) and ok
     raise SystemExit(0 if ok else 1)
 

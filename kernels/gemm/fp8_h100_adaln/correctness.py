@@ -4,7 +4,18 @@ import argparse
 
 import torch
 
-from _C import fp8_gemm_k1024_fp32_out, ln_adaln_quantize_k1024, ln_adaln_quantize_stats_k1024
+from _C import (
+    fp8_gemm_k1024_bf16_out,
+    fp8_gemm_k1024_bf16_out_deepaccum,
+    fp8_gemm_k1024_bf16_out_deepaccum_n64,
+    fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled,
+    fp8_gemm_k1024_bf16_out_deepaccum_scaled,
+    fp8_gemm_k1024_bf16_out_pipe,
+    fp8_gemm_k1024_bf16_out_pipe64,
+    fp8_gemm_k1024_fp32_out,
+    ln_adaln_quantize_k1024,
+    ln_adaln_quantize_stats_k1024,
+)
 
 
 def main() -> None:
@@ -76,6 +87,67 @@ def main() -> None:
     print(f"fp32_out_gemm_max_abs_diff={gemm_abs:.8g}")
     print(f"fp32_out_gemm_mean_abs_diff={gemm_mean:.8g}")
 
+    gemm_bf16 = fp8_gemm_k1024_bf16_out(q_gemm, w)
+    gemm_bf16_ref = gemm_ref.to(torch.bfloat16)
+    gemm_bf16_diff = (gemm_bf16.float() - gemm_bf16_ref.float()).abs()
+    gemm_bf16_abs = gemm_bf16_diff.max().item()
+    gemm_bf16_mean = gemm_bf16_diff.mean().item()
+    print(f"bf16_out_gemm_max_abs_diff={gemm_bf16_abs:.8g}")
+    print(f"bf16_out_gemm_mean_abs_diff={gemm_bf16_mean:.8g}")
+
+    gemm_bf16_deepaccum = fp8_gemm_k1024_bf16_out_deepaccum(q_gemm, w)
+    gemm_bf16_deepaccum_diff = (gemm_bf16_deepaccum.float() - gemm_bf16_ref.float()).abs()
+    gemm_bf16_deepaccum_abs = gemm_bf16_deepaccum_diff.max().item()
+    gemm_bf16_deepaccum_mean = gemm_bf16_deepaccum_diff.mean().item()
+    print(f"bf16_out_deepaccum_gemm_max_abs_diff={gemm_bf16_deepaccum_abs:.8g}")
+    print(f"bf16_out_deepaccum_gemm_mean_abs_diff={gemm_bf16_deepaccum_mean:.8g}")
+
+    a_dequant_scale = 0.75
+    b_dequant_scale = 1.25
+    gemm_bf16_deepaccum_scaled = fp8_gemm_k1024_bf16_out_deepaccum_scaled(
+        q_gemm, w, a_dequant_scale, b_dequant_scale
+    )
+    gemm_bf16_scaled_ref = (gemm_ref * (a_dequant_scale * b_dequant_scale)).to(torch.bfloat16)
+    gemm_bf16_deepaccum_scaled_diff = (
+        gemm_bf16_deepaccum_scaled.float() - gemm_bf16_scaled_ref.float()
+    ).abs()
+    gemm_bf16_deepaccum_scaled_abs = gemm_bf16_deepaccum_scaled_diff.max().item()
+    gemm_bf16_deepaccum_scaled_mean = gemm_bf16_deepaccum_scaled_diff.mean().item()
+    print(f"bf16_out_deepaccum_scaled_gemm_max_abs_diff={gemm_bf16_deepaccum_scaled_abs:.8g}")
+    print(f"bf16_out_deepaccum_scaled_gemm_mean_abs_diff={gemm_bf16_deepaccum_scaled_mean:.8g}")
+
+    gemm_bf16_deepaccum_n64 = fp8_gemm_k1024_bf16_out_deepaccum_n64(q_gemm, w)
+    gemm_bf16_deepaccum_n64_diff = (gemm_bf16_deepaccum_n64.float() - gemm_bf16_ref.float()).abs()
+    gemm_bf16_deepaccum_n64_abs = gemm_bf16_deepaccum_n64_diff.max().item()
+    gemm_bf16_deepaccum_n64_mean = gemm_bf16_deepaccum_n64_diff.mean().item()
+    print(f"bf16_out_deepaccum_n64_gemm_max_abs_diff={gemm_bf16_deepaccum_n64_abs:.8g}")
+    print(f"bf16_out_deepaccum_n64_gemm_mean_abs_diff={gemm_bf16_deepaccum_n64_mean:.8g}")
+
+    gemm_bf16_deepaccum_n64_scaled = fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled(
+        q_gemm, w, a_dequant_scale, b_dequant_scale
+    )
+    gemm_bf16_deepaccum_n64_scaled_diff = (
+        gemm_bf16_deepaccum_n64_scaled.float() - gemm_bf16_scaled_ref.float()
+    ).abs()
+    gemm_bf16_deepaccum_n64_scaled_abs = gemm_bf16_deepaccum_n64_scaled_diff.max().item()
+    gemm_bf16_deepaccum_n64_scaled_mean = gemm_bf16_deepaccum_n64_scaled_diff.mean().item()
+    print(f"bf16_out_deepaccum_n64_scaled_gemm_max_abs_diff={gemm_bf16_deepaccum_n64_scaled_abs:.8g}")
+    print(f"bf16_out_deepaccum_n64_scaled_gemm_mean_abs_diff={gemm_bf16_deepaccum_n64_scaled_mean:.8g}")
+
+    gemm_bf16_pipe = fp8_gemm_k1024_bf16_out_pipe(q_gemm, w)
+    gemm_bf16_pipe_diff = (gemm_bf16_pipe.float() - gemm_bf16_ref.float()).abs()
+    gemm_bf16_pipe_abs = gemm_bf16_pipe_diff.max().item()
+    gemm_bf16_pipe_mean = gemm_bf16_pipe_diff.mean().item()
+    print(f"bf16_out_pipe_gemm_max_abs_diff={gemm_bf16_pipe_abs:.8g}")
+    print(f"bf16_out_pipe_gemm_mean_abs_diff={gemm_bf16_pipe_mean:.8g}")
+
+    gemm_bf16_pipe64 = fp8_gemm_k1024_bf16_out_pipe64(q_gemm, w)
+    gemm_bf16_pipe64_diff = (gemm_bf16_pipe64.float() - gemm_bf16_ref.float()).abs()
+    gemm_bf16_pipe64_abs = gemm_bf16_pipe64_diff.max().item()
+    gemm_bf16_pipe64_mean = gemm_bf16_pipe64_diff.mean().item()
+    print(f"bf16_out_pipe64_gemm_max_abs_diff={gemm_bf16_pipe64_abs:.8g}")
+    print(f"bf16_out_pipe64_gemm_mean_abs_diff={gemm_bf16_pipe64_mean:.8g}")
+
     if not q_match:
         mismatches = (q.cpu() != q_ref.cpu()).sum().item()
         raise AssertionError(f"FP8 quantized output mismatch: {mismatches} elements")
@@ -90,6 +162,35 @@ def main() -> None:
         raise AssertionError(f"stats mismatch: mean {mean_abs}, rstd {rstd_abs}")
     if gemm_abs > 1e-3 or gemm_mean > 1e-4:
         raise AssertionError(f"FP32 output GEMM mismatch: max abs {gemm_abs}, mean abs {gemm_mean}")
+    if gemm_bf16_abs > 2e-2 or gemm_bf16_mean > 2e-3:
+        raise AssertionError(f"BF16 output GEMM mismatch: max abs {gemm_bf16_abs}, mean abs {gemm_bf16_mean}")
+    if gemm_bf16_deepaccum_abs > 2e-2 or gemm_bf16_deepaccum_mean > 2e-3:
+        raise AssertionError(
+            f"DeepAccum BF16 output GEMM mismatch: max abs {gemm_bf16_deepaccum_abs}, mean abs {gemm_bf16_deepaccum_mean}"
+        )
+    if gemm_bf16_deepaccum_scaled_abs > 2e-2 or gemm_bf16_deepaccum_scaled_mean > 2e-3:
+        raise AssertionError(
+            "DeepAccum scaled BF16 output GEMM mismatch: "
+            f"max abs {gemm_bf16_deepaccum_scaled_abs}, mean abs {gemm_bf16_deepaccum_scaled_mean}"
+        )
+    if gemm_bf16_deepaccum_n64_abs > 2e-2 or gemm_bf16_deepaccum_n64_mean > 2e-3:
+        raise AssertionError(
+            f"DeepAccum N64 BF16 output GEMM mismatch: max abs {gemm_bf16_deepaccum_n64_abs}, "
+            f"mean abs {gemm_bf16_deepaccum_n64_mean}"
+        )
+    if gemm_bf16_deepaccum_n64_scaled_abs > 2e-2 or gemm_bf16_deepaccum_n64_scaled_mean > 2e-3:
+        raise AssertionError(
+            "DeepAccum N64 scaled BF16 output GEMM mismatch: "
+            f"max abs {gemm_bf16_deepaccum_n64_scaled_abs}, mean abs {gemm_bf16_deepaccum_n64_scaled_mean}"
+        )
+    if gemm_bf16_pipe_abs > 2e-2 or gemm_bf16_pipe_mean > 2e-3:
+        raise AssertionError(
+            f"pipelined BF16 output GEMM mismatch: max abs {gemm_bf16_pipe_abs}, mean abs {gemm_bf16_pipe_mean}"
+        )
+    if gemm_bf16_pipe64_abs > 2e-2 or gemm_bf16_pipe64_mean > 2e-3:
+        raise AssertionError(
+            f"pipelined BF16 output GEMM pipe64 mismatch: max abs {gemm_bf16_pipe64_abs}, mean abs {gemm_bf16_pipe64_mean}"
+        )
 
 
 if __name__ == "__main__":
