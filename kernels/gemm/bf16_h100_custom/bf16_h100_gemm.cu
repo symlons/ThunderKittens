@@ -316,6 +316,129 @@ __global__ __launch_bounds__(128, 4) void layernorm_adaln_forward_k1024_vec2_ker
     }
 }
 
+__global__ __launch_bounds__(128, 4) void layernorm_adaln_forward_k1024_vec2_persistent_kernel(
+    bf16 *__restrict__ out,
+    float *__restrict__ mean_out,
+    float *__restrict__ rstd_out,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ shift,
+    const bf16 *__restrict__ scale,
+    int M,
+    int tokens_per_sample,
+    float eps
+) {
+    constexpr int K = 1024;
+    constexpr int K2 = K / 2;
+    using bf16_2 = __nv_bfloat162;
+
+    int tid = threadIdx.x;
+    const bf16_2 *__restrict__ x2 = reinterpret_cast<const bf16_2*>(x);
+    const bf16_2 *__restrict__ shift2 = reinterpret_cast<const bf16_2*>(shift);
+    const bf16_2 *__restrict__ scale2 = reinterpret_cast<const bf16_2*>(scale);
+    bf16_2 *__restrict__ out2 = reinterpret_cast<bf16_2*>(out);
+
+    for (int row = blockIdx.x; row < M; row += gridDim.x) {
+        int batch = row / tokens_per_sample;
+        size_t pair_base = size_t(row) * K2;
+        size_t param_pair_base = size_t(batch) * K2;
+
+        float2 stats = make_float2(0.0f, 0.0f);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int pair_col = tid + j * 128;
+            float2 v = __bfloat1622float2(x2[pair_base + pair_col]);
+            stats.x += v.x + v.y;
+            stats.y += v.x * v.x + v.y * v.y;
+        }
+        stats = block_sum_128_float2(stats);
+        float mean = stats.x * (1.0f / K);
+        float var = stats.y * (1.0f / K) - mean * mean;
+        var = fmaxf(var, 0.0f);
+        float rstd = rsqrtf(var + eps);
+        if (tid == 0) {
+            mean_out[row] = mean;
+            rstd_out[row] = rstd;
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int pair_col = tid + j * 128;
+            size_t pair_idx = pair_base + pair_col;
+            float2 xv = __bfloat1622float2(x2[pair_idx]);
+            float2 sh = __bfloat1622float2(shift2[param_pair_base + pair_col]);
+            float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
+            float out_x = ((xv.x - mean) * rstd) * (1.0f + sc.x) + sh.x;
+            float out_y = ((xv.y - mean) * rstd) * (1.0f + sc.y) + sh.y;
+            out2[pair_idx] = __floats2bfloat162_rn(out_x, out_y);
+        }
+    }
+}
+
+__global__ __launch_bounds__(128, 4) void layernorm_adaln_forward_k1024_warp4_kernel(
+    bf16 *__restrict__ out,
+    float *__restrict__ mean_out,
+    float *__restrict__ rstd_out,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ shift,
+    const bf16 *__restrict__ scale,
+    int M,
+    int tokens_per_sample,
+    float eps
+) {
+    constexpr int K = 1024;
+    constexpr int K2 = K / 2;
+    using bf16_2 = __nv_bfloat162;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row = blockIdx.x * 4 + warp;
+    if (row >= M) {
+        return;
+    }
+
+    int batch = row / tokens_per_sample;
+    size_t pair_base = size_t(row) * K2;
+    size_t param_pair_base = size_t(batch) * K2;
+    const bf16_2 *__restrict__ x2 = reinterpret_cast<const bf16_2*>(x);
+    const bf16_2 *__restrict__ shift2 = reinterpret_cast<const bf16_2*>(shift);
+    const bf16_2 *__restrict__ scale2 = reinterpret_cast<const bf16_2*>(scale);
+    bf16_2 *__restrict__ out2 = reinterpret_cast<bf16_2*>(out);
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        int pair_col = lane + j * 32;
+        float2 v = __bfloat1622float2(x2[pair_base + pair_col]);
+        sum += v.x + v.y;
+        sq += v.x * v.x + v.y * v.y;
+    }
+    sum = warp_sum_float(sum);
+    sq = warp_sum_float(sq);
+    sum = __shfl_sync(0xffffffff, sum, 0);
+    sq = __shfl_sync(0xffffffff, sq, 0);
+    float mean = sum * (1.0f / K);
+    float var = sq * (1.0f / K) - mean * mean;
+    var = fmaxf(var, 0.0f);
+    float rstd = rsqrtf(var + eps);
+    if (lane == 0) {
+        mean_out[row] = mean;
+        rstd_out[row] = rstd;
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        int pair_col = lane + j * 32;
+        size_t pair_idx = pair_base + pair_col;
+        float2 xv = __bfloat1622float2(x2[pair_idx]);
+        float2 sh = __bfloat1622float2(shift2[param_pair_base + pair_col]);
+        float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
+        float out_x = ((xv.x - mean) * rstd) * (1.0f + sc.x) + sh.x;
+        float out_y = ((xv.y - mean) * rstd) * (1.0f + sc.y) + sh.y;
+        out2[pair_idx] = __floats2bfloat162_rn(out_x, out_y);
+    }
+}
+
 __global__ void layernorm_adaln_forward_kernel(
     bf16 *__restrict__ out,
     float *__restrict__ mean_out,
@@ -1872,6 +1995,96 @@ void layernorm_adaln_entrypoint(
     }
 }
 
+void layernorm_adaln_persistent_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &shift,
+    const at::Tensor &scale,
+    const at::Tensor &out,
+    const at::Tensor &mean,
+    const at::Tensor &rstd,
+    int64_t tokens_per_sample,
+    double eps
+) {
+    kittens::py::device_check(A, shift, scale, out, mean, rstd);
+    TORCH_CHECK(A.dtype() == torch::kBFloat16 && shift.dtype() == torch::kBFloat16);
+    TORCH_CHECK(scale.dtype() == torch::kBFloat16 && out.dtype() == torch::kBFloat16);
+    TORCH_CHECK(mean.dtype() == torch::kFloat32 && rstd.dtype() == torch::kFloat32);
+    TORCH_CHECK(A.is_contiguous() && shift.is_contiguous() && scale.is_contiguous());
+    TORCH_CHECK(out.is_contiguous() && mean.is_contiguous() && rstd.is_contiguous());
+    TORCH_CHECK(A.dim() == 2 && out.dim() == 2 && shift.dim() == 2 && scale.dim() == 2);
+    TORCH_CHECK(mean.dim() == 1 && rstd.dim() == 1);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int batch = shift.size(0);
+    TORCH_CHECK(K == 1024);
+    TORCH_CHECK(out.size(0) == M && out.size(1) == K);
+    TORCH_CHECK(scale.size(0) == batch && shift.size(1) == K && scale.size(1) == K);
+    TORCH_CHECK(mean.size(0) == M && rstd.size(0) == M);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    int device = A.get_device();
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, device);
+    int blocks = M < props.multiProcessorCount * 32 ? M : props.multiProcessorCount * 32;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    layernorm_adaln_forward_k1024_vec2_persistent_kernel<<<blocks, 128, 0, stream>>>(
+        reinterpret_cast<bf16*>(out.data_ptr()),
+        reinterpret_cast<float*>(mean.data_ptr()),
+        reinterpret_cast<float*>(rstd.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const bf16*>(shift.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        M,
+        static_cast<int>(tokens_per_sample),
+        static_cast<float>(eps)
+    );
+}
+
+void layernorm_adaln_warp4_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &shift,
+    const at::Tensor &scale,
+    const at::Tensor &out,
+    const at::Tensor &mean,
+    const at::Tensor &rstd,
+    int64_t tokens_per_sample,
+    double eps
+) {
+    kittens::py::device_check(A, shift, scale, out, mean, rstd);
+    TORCH_CHECK(A.dtype() == torch::kBFloat16 && shift.dtype() == torch::kBFloat16);
+    TORCH_CHECK(scale.dtype() == torch::kBFloat16 && out.dtype() == torch::kBFloat16);
+    TORCH_CHECK(mean.dtype() == torch::kFloat32 && rstd.dtype() == torch::kFloat32);
+    TORCH_CHECK(A.is_contiguous() && shift.is_contiguous() && scale.is_contiguous());
+    TORCH_CHECK(out.is_contiguous() && mean.is_contiguous() && rstd.is_contiguous());
+    TORCH_CHECK(A.dim() == 2 && out.dim() == 2 && shift.dim() == 2 && scale.dim() == 2);
+    TORCH_CHECK(mean.dim() == 1 && rstd.dim() == 1);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int batch = shift.size(0);
+    TORCH_CHECK(K == 1024);
+    TORCH_CHECK(out.size(0) == M && out.size(1) == K);
+    TORCH_CHECK(scale.size(0) == batch && shift.size(1) == K && scale.size(1) == K);
+    TORCH_CHECK(mean.size(0) == M && rstd.size(0) == M);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    layernorm_adaln_forward_k1024_warp4_kernel<<<(M + 3) / 4, 128, 0, stream>>>(
+        reinterpret_cast<bf16*>(out.data_ptr()),
+        reinterpret_cast<float*>(mean.data_ptr()),
+        reinterpret_cast<float*>(rstd.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const bf16*>(shift.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        M,
+        static_cast<int>(tokens_per_sample),
+        static_cast<float>(eps)
+    );
+}
+
 void layernorm_stats_entrypoint(
     const at::Tensor &A,
     const at::Tensor &mean,
@@ -2099,6 +2312,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("gated_residual_backward", &gated_residual_backward_entrypoint);
     m.def("gated_residual_backward_no_dx", &gated_residual_backward_no_dx_entrypoint);
     m.def("layernorm_adaln", &layernorm_adaln_entrypoint);
+    m.def("layernorm_adaln_persistent", &layernorm_adaln_persistent_entrypoint);
+    m.def("layernorm_adaln_warp4", &layernorm_adaln_warp4_entrypoint);
     m.def("layernorm_stats", &layernorm_stats_entrypoint);
     m.def("layernorm_adaln_backward", &layernorm_adaln_backward_entrypoint);
     m.def("gemm_linear_ln_adaln", &gemm_ln_adaln_entrypoint<false>);

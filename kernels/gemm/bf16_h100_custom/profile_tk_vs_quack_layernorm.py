@@ -23,6 +23,28 @@ def tk_layernorm(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, toke
     return out
 
 
+def tk_layernorm_variant(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    tokens: int,
+    eps: float,
+    variant: str,
+) -> torch.Tensor:
+    if variant == "cta":
+        return tk_layernorm(x, shift, scale, tokens, eps)
+    out = torch.empty_like(x)
+    mean = torch.empty((x.shape[0],), device=x.device, dtype=torch.float32)
+    rstd = torch.empty_like(mean)
+    if variant == "persistent":
+        _C.layernorm_adaln_persistent(x, shift, scale, out, mean, rstd, tokens, eps)
+    elif variant == "warp4":
+        _C.layernorm_adaln_warp4(x, shift, scale, out, mean, rstd, tokens, eps)
+    else:
+        raise ValueError(f"unsupported TK variant: {variant}")
+    return out
+
+
 def make_groups(batch: int, tokens: int, dim: int, seed: int) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     rows = batch * tokens
     group_bytes = rows * dim * 2 * 2 + batch * dim * 2 * 2
@@ -52,6 +74,10 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
     ok = check_close("tk vs torch", tk_out, ref, atol=2e-2)
     ok = check_close("quack vs torch", quack_out, ref, atol=2e-2) and ok
     ok = check_close("tk vs quack", tk_out, quack_out, atol=2e-2) and ok
+    for variant in ("persistent", "warp4"):
+        variant_out = tk_layernorm_variant(x, shift, scale, tokens, eps, variant)
+        ok = check_close(f"tk {variant} vs torch", variant_out, ref, atol=2e-2) and ok
+        ok = check_close(f"tk {variant} vs quack", variant_out, quack_out, atol=2e-2) and ok
 
     elem_bytes = torch.empty((), dtype=torch.bfloat16).element_size()
     quack_bytes = rows * dim * elem_bytes * 2 + dim * 4 * 2
@@ -65,6 +91,21 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
         iters=iters,
         bytes_moved=tk_bytes,
     )
+    tk_variant_results = []
+    for variant in ("persistent", "warp4"):
+        tk_variant_results.append(
+            (
+                variant,
+                profile_groups(
+                    f"{label} tk {variant} layernorm_adaln zero-shift",
+                    groups,
+                    lambda g, variant=variant: tk_layernorm_variant(g[0], g[1], g[2], tokens, eps, variant),
+                    warmup=warmup,
+                    iters=iters,
+                    bytes_moved=tk_bytes,
+                ),
+            )
+        )
     quack_result = profile_groups(
         f"{label} quack layernorm_fwd",
         groups,
@@ -75,8 +116,12 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
     )
 
     print_bench(tk_result)
+    for _, result in tk_variant_results:
+        print_bench(result)
     print_bench(quack_result)
     print(f"RESULT {label} tk_vs_quack_speedup={quack_result.us / tk_result.us:.3f}x", flush=True)
+    for variant, result in tk_variant_results:
+        print(f"RESULT {label} tk_{variant}_vs_quack_speedup={quack_result.us / result.us:.3f}x", flush=True)
     return ok
 
 

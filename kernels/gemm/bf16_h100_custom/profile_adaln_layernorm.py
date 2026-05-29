@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import torch
 
+import _C
 from dit3d_e2e_bench import tk_layernorm_adaln_backward_op, tk_layernorm_adaln_op
 from harness import reference_backward, reference_forward, run_fused_backward, run_fused_forward
 from tk_bench import check_close, input_group_count, print_bench, profile_groups, uniform_bf16
@@ -45,6 +46,21 @@ class FusedAdaLNAutograd(torch.autograd.Function):
 
 def custom_autograd_forward(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, tokens: int, eps: float):
     return FusedAdaLNAutograd.apply(x, shift, scale, tokens, eps)
+
+
+def run_fused_forward_variant(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, tokens: int, eps: float, variant: str):
+    if variant == "cta":
+        return run_fused_forward(x, shift, scale, tokens, eps)
+    out = torch.empty_like(x)
+    mean = torch.empty((x.shape[0],), device=x.device, dtype=torch.float32)
+    rstd = torch.empty_like(mean)
+    if variant == "persistent":
+        _C.layernorm_adaln_persistent(x, shift, scale, out, mean, rstd, tokens, eps)
+    elif variant == "warp4":
+        _C.layernorm_adaln_warp4(x, shift, scale, out, mean, rstd, tokens, eps)
+    else:
+        raise ValueError(f"unsupported forward variant: {variant}")
+    return out, mean, rstd
 
 
 def make_groups(batch: int, tokens: int, dim: int, eps: float, seed: int):
@@ -105,6 +121,11 @@ def validate_shape(batch: int, tokens: int, dim: int, eps: float) -> bool:
     ok = check_close("forward out", tk_out, ref_out, atol=2e-2)
     ok = check_close("forward mean", tk_mean, ref_mean, atol=2e-3) and ok
     ok = check_close("forward rstd", tk_rstd, ref_rstd, atol=2e-3) and ok
+    for variant in ("persistent", "warp4"):
+        variant_out, variant_mean, variant_rstd = run_fused_forward_variant(x, shift, scale, tokens, eps, variant)
+        ok = check_close(f"{variant} forward out", variant_out, ref_out, atol=2e-2) and ok
+        ok = check_close(f"{variant} forward mean", variant_mean, ref_mean, atol=2e-3) and ok
+        ok = check_close(f"{variant} forward rstd", variant_rstd, ref_rstd, atol=2e-3) and ok
 
     ref_dx, ref_dshift, ref_dscale = reference_backward(grad, x, scale, ref_mean, ref_rstd, tokens)
     tk_dx, tk_dshift, tk_dscale = run_fused_backward(grad, x, scale, tk_mean, tk_rstd, tokens)
@@ -159,6 +180,17 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
             bytes_moved=bytes_forward,
         )
     )
+    for variant in ("persistent", "warp4"):
+        results.append(
+            profile_groups(
+                f"{label} tk {variant} forward",
+                groups,
+                lambda g, variant=variant: run_fused_forward_variant(g[0], g[1], g[2], tokens, eps, variant),
+                warmup=warmup,
+                iters=iters,
+                bytes_moved=bytes_forward,
+            )
+        )
 
     results.append(
         profile_groups(
