@@ -598,6 +598,76 @@ __global__ void layernorm_adaln_backward_kernel(
     }
 }
 
+__global__ __launch_bounds__(128, 4) void layernorm_adaln_backward_k1024_warp4_kernel(
+    bf16 *__restrict__ dx,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ scale,
+    const float *__restrict__ mean,
+    const float *__restrict__ rstd,
+    int M,
+    int tokens_per_sample
+) {
+    constexpr int K = 1024;
+    constexpr int K2 = K / 2;
+    using bf16_2 = __nv_bfloat162;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int row = blockIdx.x * 4 + warp;
+    if (row >= M) {
+        return;
+    }
+
+    int batch = row / tokens_per_sample;
+    float m = mean[row];
+    float rs = rstd[row];
+    size_t pair_base = size_t(row) * K2;
+    size_t param_pair_base = size_t(batch) * K2;
+    const bf16_2 *__restrict__ x2 = reinterpret_cast<const bf16_2*>(x);
+    const bf16_2 *__restrict__ grad2 = reinterpret_cast<const bf16_2*>(grad);
+    const bf16_2 *__restrict__ scale2 = reinterpret_cast<const bf16_2*>(scale);
+    bf16_2 *__restrict__ dx2 = reinterpret_cast<bf16_2*>(dx);
+
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        int pair_col = lane + j * 32;
+        size_t pair_idx = pair_base + pair_col;
+        float2 xv = __bfloat1622float2(x2[pair_idx]);
+        float2 gv = __bfloat1622float2(grad2[pair_idx]);
+        float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
+        float xhat_x = (xv.x - m) * rs;
+        float xhat_y = (xv.y - m) * rs;
+        float dnorm_x = gv.x * (1.0f + sc.x);
+        float dnorm_y = gv.y * (1.0f + sc.y);
+        s1 += dnorm_x + dnorm_y;
+        s2 += dnorm_x * xhat_x + dnorm_y * xhat_y;
+    }
+    s1 = warp_sum_float(s1);
+    s2 = warp_sum_float(s2);
+    s1 = __shfl_sync(0xffffffff, s1, 0);
+    s2 = __shfl_sync(0xffffffff, s2, 0);
+
+    float inv_k = 1.0f / K;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        int pair_col = lane + j * 32;
+        size_t pair_idx = pair_base + pair_col;
+        float2 xv = __bfloat1622float2(x2[pair_idx]);
+        float2 gv = __bfloat1622float2(grad2[pair_idx]);
+        float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
+        float xhat_x = (xv.x - m) * rs;
+        float xhat_y = (xv.y - m) * rs;
+        float dnorm_x = gv.x * (1.0f + sc.x);
+        float dnorm_y = gv.y * (1.0f + sc.y);
+        float dx_x = (dnorm_x - s1 * inv_k - xhat_x * s2 * inv_k) * rs;
+        float dx_y = (dnorm_y - s1 * inv_k - xhat_y * s2 * inv_k) * rs;
+        dx2[pair_idx] = __floats2bfloat162_rn(dx_x, dx_y);
+    }
+}
+
 __global__ void layernorm_adaln_param_backward_kernel(
     float *__restrict__ dshift,
     float *__restrict__ dscale,
@@ -2177,6 +2247,67 @@ void layernorm_adaln_backward_entrypoint(
     );
 }
 
+void layernorm_adaln_backward_warp4_entrypoint(
+    const at::Tensor &grad,
+    const at::Tensor &A,
+    const at::Tensor &scale,
+    const at::Tensor &mean,
+    const at::Tensor &rstd,
+    const at::Tensor &dA,
+    const at::Tensor &dshift,
+    const at::Tensor &dscale,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(grad, A, scale, mean, rstd, dA, dshift, dscale);
+    TORCH_CHECK(grad.dtype() == torch::kBFloat16 && A.dtype() == torch::kBFloat16);
+    TORCH_CHECK(scale.dtype() == torch::kBFloat16 && dA.dtype() == torch::kBFloat16);
+    TORCH_CHECK(mean.dtype() == torch::kFloat32 && rstd.dtype() == torch::kFloat32);
+    TORCH_CHECK(dshift.dtype() == torch::kFloat32 && dscale.dtype() == torch::kFloat32);
+    TORCH_CHECK(grad.is_contiguous() && A.is_contiguous() && scale.is_contiguous());
+    TORCH_CHECK(mean.is_contiguous() && rstd.is_contiguous() && dA.is_contiguous());
+    TORCH_CHECK(dshift.is_contiguous() && dscale.is_contiguous());
+    TORCH_CHECK(grad.dim() == 2 && A.dim() == 2 && dA.dim() == 2);
+    TORCH_CHECK(scale.dim() == 2 && dshift.dim() == 2 && dscale.dim() == 2);
+    TORCH_CHECK(mean.dim() == 1 && rstd.dim() == 1);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int batch = scale.size(0);
+    TORCH_CHECK(K == 1024);
+    TORCH_CHECK(grad.size(0) == M && grad.size(1) == K);
+    TORCH_CHECK(dA.size(0) == M && dA.size(1) == K);
+    TORCH_CHECK(mean.size(0) == M && rstd.size(0) == M);
+    TORCH_CHECK(scale.size(1) == K);
+    TORCH_CHECK(dshift.size(0) == batch && dshift.size(1) == K);
+    TORCH_CHECK(dscale.size(0) == batch && dscale.size(1) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    layernorm_adaln_backward_k1024_warp4_kernel<<<(M + 3) / 4, 128, 0, stream>>>(
+        reinterpret_cast<bf16*>(dA.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const bf16*>(scale.data_ptr()),
+        reinterpret_cast<const float*>(mean.data_ptr()),
+        reinterpret_cast<const float*>(rstd.data_ptr()),
+        M,
+        static_cast<int>(tokens_per_sample)
+    );
+    dim3 param_block(16, 16);
+    dim3 param_grid((K + param_block.x - 1) / param_block.x, batch);
+    layernorm_adaln_param_backward_kernel<<<param_grid, param_block, 0, stream>>>(
+        reinterpret_cast<float*>(dshift.data_ptr()),
+        reinterpret_cast<float*>(dscale.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(A.data_ptr()),
+        reinterpret_cast<const float*>(mean.data_ptr()),
+        reinterpret_cast<const float*>(rstd.data_ptr()),
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
 template<bool APPLY_GELU>
 void gemm_ln_adaln_entrypoint(
     const at::Tensor &A,
@@ -2316,6 +2447,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("layernorm_adaln_warp4", &layernorm_adaln_warp4_entrypoint);
     m.def("layernorm_stats", &layernorm_stats_entrypoint);
     m.def("layernorm_adaln_backward", &layernorm_adaln_backward_entrypoint);
+    m.def("layernorm_adaln_backward_warp4", &layernorm_adaln_backward_warp4_entrypoint);
     m.def("gemm_linear_ln_adaln", &gemm_ln_adaln_entrypoint<false>);
     m.def("gemm_gelu_ln_adaln", &gemm_ln_adaln_entrypoint<true>);
     m.def("gemm_custom_adaln", &gemm_custom_adaln_entrypoint);

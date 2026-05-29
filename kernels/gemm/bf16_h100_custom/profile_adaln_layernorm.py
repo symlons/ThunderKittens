@@ -63,6 +63,27 @@ def run_fused_forward_variant(x: torch.Tensor, shift: torch.Tensor, scale: torch
     return out, mean, rstd
 
 
+def run_fused_backward_variant(
+    grad: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    tokens: int,
+    variant: str,
+):
+    if variant == "cta":
+        return run_fused_backward(grad, x, scale, mean, rstd, tokens)
+    dx = torch.empty_like(x)
+    dshift = torch.empty_like(scale, dtype=torch.float32)
+    dscale = torch.empty_like(scale, dtype=torch.float32)
+    if variant == "warp4":
+        _C.layernorm_adaln_backward_warp4(grad, x, scale, mean, rstd, dx, dshift, dscale, tokens)
+    else:
+        raise ValueError(f"unsupported backward variant: {variant}")
+    return dx, dshift, dscale
+
+
 def make_groups(batch: int, tokens: int, dim: int, eps: float, seed: int):
     rows = batch * tokens
     group_bytes = (
@@ -132,6 +153,10 @@ def validate_shape(batch: int, tokens: int, dim: int, eps: float) -> bool:
     ok = check_close("backward dx", tk_dx, ref_dx, atol=2e-2) and ok
     ok = check_close("backward dshift", tk_dshift, ref_dshift, atol=5e-2) and ok
     ok = check_close("backward dscale", tk_dscale, ref_dscale, atol=5e-2) and ok
+    warp4_dx, warp4_dshift, warp4_dscale = run_fused_backward_variant(grad, x, scale, tk_mean, tk_rstd, tokens, "warp4")
+    ok = check_close("warp4 backward dx", warp4_dx, ref_dx, atol=2e-2) and ok
+    ok = check_close("warp4 backward dshift", warp4_dshift, ref_dshift, atol=5e-2) and ok
+    ok = check_close("warp4 backward dscale", warp4_dscale, ref_dscale, atol=5e-2) and ok
     return ok
 
 
@@ -223,6 +248,16 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
             bytes_moved=bytes_backward,
         )
     )
+    results.append(
+        profile_groups(
+            f"{label} tk warp4 backward",
+            groups,
+            lambda g: run_fused_backward_variant(g[3], g[0], g[2], g[4], g[5], tokens, "warp4"),
+            warmup=warmup,
+            iters=iters,
+            bytes_moved=bytes_backward,
+        )
+    )
 
     for result in results:
         print_bench(result)
@@ -232,10 +267,12 @@ def profile_shape(batch: int, tokens: int, dim: int, warmup: int, iters: int, ep
     compile_bwd = by_name.get(f"{label} compile backward")
     tk_fwd = by_name[f"{label} tk fused forward"]
     tk_bwd = by_name[f"{label} tk fused backward"]
+    tk_warp4_bwd = by_name[f"{label} tk warp4 backward"]
     if compile_fwd is not None:
         print(f"RESULT {label} forward_vs_compile_speedup={compile_fwd.us / tk_fwd.us:.3f}x", flush=True)
     if compile_bwd is not None:
         print(f"RESULT {label} backward_vs_compile_speedup={compile_bwd.us / tk_bwd.us:.3f}x", flush=True)
+        print(f"RESULT {label} backward_warp4_vs_compile_speedup={compile_bwd.us / tk_warp4_bwd.us:.3f}x", flush=True)
     return ok
 
 
