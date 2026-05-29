@@ -239,6 +239,28 @@ __device__ __forceinline__ float block_sum_128_float(float value) {
     return warp_sums[0];
 }
 
+__device__ __forceinline__ float2 block_sum_128_float2(float2 value) {
+    __shared__ float2 warp_sums[4];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    value.x = warp_sum_float(value.x);
+    value.y = warp_sum_float(value.y);
+    if (lane == 0) {
+        warp_sums[warp] = value;
+    }
+    __syncthreads();
+    value = threadIdx.x < 4 ? warp_sums[lane] : make_float2(0.0f, 0.0f);
+    if (warp == 0) {
+        value.x = warp_sum_float(value.x);
+        value.y = warp_sum_float(value.y);
+    }
+    if (threadIdx.x == 0) {
+        warp_sums[0] = value;
+    }
+    __syncthreads();
+    return warp_sums[0];
+}
+
 __global__ __launch_bounds__(128, 4) void layernorm_adaln_forward_k1024_vec2_kernel(
     bf16 *__restrict__ out,
     float *__restrict__ mean_out,
@@ -261,20 +283,19 @@ __global__ __launch_bounds__(128, 4) void layernorm_adaln_forward_k1024_vec2_ker
     const bf16_2 *__restrict__ x2 = reinterpret_cast<const bf16_2*>(x);
     const bf16_2 *__restrict__ shift2 = reinterpret_cast<const bf16_2*>(shift);
     const bf16_2 *__restrict__ scale2 = reinterpret_cast<const bf16_2*>(scale);
+    bf16_2 *__restrict__ out2 = reinterpret_cast<bf16_2*>(out);
 
-    float sum = 0.0f;
-    float sq = 0.0f;
+    float2 stats = make_float2(0.0f, 0.0f);
     #pragma unroll
     for (int j = 0; j < 4; j++) {
         int pair_col = tid + j * 128;
         float2 v = __bfloat1622float2(x2[pair_base + pair_col]);
-        sum += v.x + v.y;
-        sq += v.x * v.x + v.y * v.y;
+        stats.x += v.x + v.y;
+        stats.y += v.x * v.x + v.y * v.y;
     }
-    sum = block_sum_128_float(sum);
-    sq = block_sum_128_float(sq);
-    float mean = sum * (1.0f / K);
-    float var = sq * (1.0f / K) - mean * mean;
+    stats = block_sum_128_float2(stats);
+    float mean = stats.x * (1.0f / K);
+    float var = stats.y * (1.0f / K) - mean * mean;
     var = fmaxf(var, 0.0f);
     float rstd = rsqrtf(var + eps);
     if (tid == 0) {
@@ -286,15 +307,12 @@ __global__ __launch_bounds__(128, 4) void layernorm_adaln_forward_k1024_vec2_ker
     for (int j = 0; j < 4; j++) {
         int pair_col = tid + j * 128;
         size_t pair_idx = pair_base + pair_col;
-        int col = pair_col * 2;
-        size_t scalar_idx = size_t(row) * K + col;
         float2 xv = __bfloat1622float2(x2[pair_idx]);
         float2 sh = __bfloat1622float2(shift2[param_pair_base + pair_col]);
         float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
         float out_x = ((xv.x - mean) * rstd) * (1.0f + sc.x) + sh.x;
         float out_y = ((xv.y - mean) * rstd) * (1.0f + sc.y) + sh.y;
-        out[scalar_idx] = __float2bfloat16(out_x);
-        out[scalar_idx + 1] = __float2bfloat16(out_y);
+        out2[pair_idx] = __floats2bfloat162_rn(out_x, out_y);
     }
 }
 
