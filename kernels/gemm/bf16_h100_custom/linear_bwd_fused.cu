@@ -141,7 +141,7 @@ struct dw_gemm_template {
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=_PIPE_STAGES, PRODUCER_BARRIER_ARRIVALS=1;
 
     template<bool PERSISTENT_GRID=true> __host__ static inline dim3 grid(int K, int N, int M) {
-        return dim3(PERSISTENT_GRID ? 132 : K*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        return dim3(PERSISTENT_GRID ? 128 : K*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
@@ -246,7 +246,7 @@ struct dx_gemm_template {
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=_PIPE_STAGES, PRODUCER_BARRIER_ARRIVALS=1;
 
     template<bool PERSISTENT_GRID=true> __host__ static inline dim3 grid(int M, int K, int N) {
-        return dim3(PERSISTENT_GRID ? 132 : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        return dim3(PERSISTENT_GRID ? 128 : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
@@ -335,7 +335,7 @@ struct dx_native_gemm_template {
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=_PIPE_STAGES, PRODUCER_BARRIER_ARRIVALS=1;
 
     template<bool PERSISTENT_GRID=true> __host__ static inline dim3 grid(int M, int K, int N) {
-        return dim3(PERSISTENT_GRID ? 132 : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        return dim3(PERSISTENT_GRID ? 128 : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
@@ -488,7 +488,7 @@ void dw_gemm_entrypoint(
     const at::Tensor &dz,
     const at::Tensor &dW
 ) {
-    using mmt = dw_gemm_template<2, 4, 16>;
+    using mmt = dw_gemm_template<2, 4, 8>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 
@@ -513,7 +513,7 @@ void dx_gemm_entrypoint(
     const at::Tensor &W,
     const at::Tensor &dx
 ) {
-    using mmt = dx_gemm_template<2, 4, 16>;
+    using mmt = dx_gemm_template<2, 4, 8>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 
@@ -538,7 +538,7 @@ void dx_gemm_native_entrypoint(
     const at::Tensor &W,
     const at::Tensor &dx
 ) {
-    using mmt = dx_native_gemm_template<2, 4, 16>;
+    using mmt = dx_native_gemm_template<2, 4, 8>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 

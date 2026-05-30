@@ -145,19 +145,22 @@ struct ln_adaln_matmul_layout {
 template<int M_BLOCK, int N_BLOCK>
 struct gated_linear_layout {
     using  base_tile      = st_bf<64, 64>;
+    using  wide_tile      = st_bf<64, 64*N_BLOCK>;
     using  bias_vec       = sv_bf<64*N_BLOCK>;
     using  global_layout  = gl<bf16, 1, 1, -1, -1, base_tile>;
+    using  wide_global    = gl<bf16, 1, 1, -1, -1, wide_tile>;
     using  bias_global    = gl<bf16, 1, 1, 1, -1, bias_vec>;
+    using  gate_global    = gl<bf16, 1, 1, -1, -1, bias_vec>;
     struct globals        {
-        global_layout A, B, C, preact, residual;
+        global_layout A, B;
+        wide_global C, preact, residual;
         bias_global bias;
-        const bf16 *gate;
+        gate_global gate;
         int tokens_per_sample;
-        int N;
     };
     struct input_block    { base_tile a[M_BLOCK], b[N_BLOCK]; };
-    struct scratch_block  { bias_vec bias; };
-    struct finish_block   { base_tile c[M_BLOCK][N_BLOCK]; };
+    struct scratch_block  { bias_vec bias, gate; };
+    struct finish_block   { wide_tile c[M_BLOCK]; };
     struct common_state   { int2 coord; };
     struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> accum; };
 };
@@ -785,7 +788,7 @@ __global__ __launch_bounds__(512, 2) void layernorm_adaln_param_backward_k1024_c
     int tokens_per_sample
 ) {
     constexpr int K = 1024;
-    constexpr int COLS = 32;
+    constexpr int COLS = 16;
     constexpr int TOK_THREADS = 16;
     __shared__ float shift_sums[TOK_THREADS][COLS];
     __shared__ float scale_sums[TOK_THREADS][COLS];
@@ -1093,6 +1096,60 @@ __global__ void gated_residual_backward_no_dx_kernel(
     }
 }
 
+__global__ void gated_residual_backward_no_dx_db_kernel(
+    bf16 *__restrict__ dh,
+    float *__restrict__ dgate,
+    float *__restrict__ dbias,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ h,
+    const bf16 *__restrict__ gate,
+    int K,
+    int tokens_per_sample
+) {
+    constexpr int COLS = 16;
+    constexpr int TOK_THREADS = 16;
+    __shared__ float gate_sums[TOK_THREADS][COLS];
+    __shared__ float bias_sums[TOK_THREADS][COLS];
+
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int batch = blockIdx.y;
+    int ty = threadIdx.y;
+
+    float gate_acc = 0.0f;
+    float bias_acc = 0.0f;
+    if (col < K) {
+        float gv = __bfloat162float(gate[batch * K + col]);
+        int row_base = batch * tokens_per_sample;
+        for (int tok = ty; tok < tokens_per_sample; tok += TOK_THREADS) {
+            int row = row_base + tok;
+            size_t idx = size_t(row) * K + col;
+            float go = __bfloat162float(grad[idx]);
+            float hv = __bfloat162float(h[idx]);
+            float dhv = go * gv;
+            bf16 dh_bf16 = __float2bfloat16(dhv);
+            dh[idx] = dh_bf16;
+            gate_acc += go * hv;
+            bias_acc += __bfloat162float(dh_bf16);
+        }
+    }
+
+    gate_sums[ty][threadIdx.x] = gate_acc;
+    bias_sums[ty][threadIdx.x] = bias_acc;
+    __syncthreads();
+
+    if (ty == 0 && col < K) {
+        float dg = 0.0f;
+        float db = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TOK_THREADS; i++) {
+            dg += gate_sums[i][threadIdx.x];
+            db += bias_sums[i][threadIdx.x];
+        }
+        dgate[batch * K + col] = dg;
+        atomicAdd(&dbias[col], db);
+    }
+}
+
 template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
 struct matmul_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
@@ -1364,8 +1421,9 @@ struct gated_linear_template {
         if (threadIdx.x == 0) {
             args.globals.A.template prefetch_tma<typename layout::base_tile>();
             args.globals.B.template prefetch_tma<typename layout::base_tile>();
-            args.globals.C.template prefetch_tma<typename layout::base_tile>();
-            args.globals.residual.template prefetch_tma<typename layout::base_tile>();
+            args.globals.C.template prefetch_tma<typename layout::wide_tile>();
+            args.globals.preact.template prefetch_tma<typename layout::wide_tile>();
+            args.globals.residual.template prefetch_tma<typename layout::wide_tile>();
         }
         int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
         int super_rows = (Rblocks/SUPER_M)*SUPER_M,
@@ -1405,7 +1463,9 @@ struct gated_linear_template {
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
             warpgroup::increase_registers<232>();
+            int batch = (args.common.coord.x * 64) / args.globals.tokens_per_sample;
             group<NUM_CONSUMER_WARPS>::load(args.scratch.bias, args.globals.bias, {args.common.coord.y / N_BLOCK});
+            group<NUM_CONSUMER_WARPS>::load(args.scratch.gate, args.globals.gate, {batch, args.common.coord.y / N_BLOCK});
             group<NUM_CONSUMER_WARPS>::sync(0);
             init_bias(args.state.accum, args.scratch.bias);
         }
@@ -1416,22 +1476,21 @@ struct gated_linear_template {
             if (warp::elect_leader()) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
-            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
-            warpgroup::sync(warpgroup::groupid() + 4);
-            apply_gated_residual_epilogue(
-                reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]),
-                reinterpret_cast<bf16*>(args.globals.preact.raw_ptr),
-                reinterpret_cast<const bf16*>(args.globals.residual.raw_ptr),
-                args.globals.gate,
-                args.common.coord.x,
-                args.common.coord.y,
-                args.globals.tokens_per_sample,
-                args.globals.N
-            );
+            int wide_col = args.common.coord.y / N_BLOCK;
+            warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.accum);
             warpgroup::sync(warpgroup::groupid() + 4);
             if (warpgroup::elect_leader()) {
-                for (int i = 0; i < N_BLOCK; i++)
-                    tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
+                tma::store_async(args.globals.preact, args.finish.c[warpgroup::groupid()], {args.common.coord.x, wide_col});
+                tma::store_async_read_wait();
+            }
+            rt_sv_op<base_ops::mul>(args.state.accum, args.scratch.gate);
+            warpgroup::load_async(args.finish.c[warpgroup::groupid()], args.globals.residual, {args.common.coord.x, wide_col});
+            warpgroup::load_async_wait(warpgroup::groupid());
+            wg_rt_sv_op<base_ops::sum>(args.state.accum, args.finish.c[warpgroup::groupid()]);
+            warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.accum);
+            warpgroup::sync(warpgroup::groupid() + 4);
+            if (warpgroup::elect_leader()) {
+                tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()], {args.common.coord.x, wide_col});
                 tma::store_async_read_wait();
             }
             init_bias(args.state.accum, args.scratch.bias);
@@ -1982,7 +2041,9 @@ void gemm_linear_gated_residual_entrypoint(
     using mmt = gated_linear_template<2,4,8>;
     using globals = typename mmt::layout::globals;
     using global_layout = typename mmt::layout::global_layout;
+    using wide_global = typename mmt::layout::wide_global;
     using bias_global = typename mmt::layout::bias_global;
+    using gate_global = typename mmt::layout::gate_global;
 
     kittens::py::device_check(A, B, residual, gate, C, projected, bias);
     TORCH_CHECK(A.dtype() == torch::kBFloat16 && B.dtype() == torch::kBFloat16);
@@ -2010,13 +2071,12 @@ void gemm_linear_gated_residual_entrypoint(
     globals G{
         kittens::py::tensor_to_gl<global_layout>(A),
         kittens::py::tensor_to_gl<global_layout>(B),
-        kittens::py::tensor_to_gl<global_layout>(C),
-        kittens::py::tensor_to_gl<global_layout>(projected),
-        kittens::py::tensor_to_gl<global_layout>(residual),
+        kittens::py::tensor_to_gl<wide_global>(C),
+        kittens::py::tensor_to_gl<wide_global>(projected),
+        kittens::py::tensor_to_gl<wide_global>(residual),
         kittens::py::tensor_to_gl<bias_global>(bias),
-        reinterpret_cast<const bf16*>(gate.data_ptr()),
-        static_cast<int>(tokens_per_sample),
-        N
+        kittens::py::tensor_to_gl<gate_global>(gate),
+        static_cast<int>(tokens_per_sample)
     };
 
     dim3 grid = mmt::grid(M, N, K);
@@ -2293,6 +2353,50 @@ void gated_residual_backward_no_dx_entrypoint(
     gated_residual_backward_no_dx_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<bf16*>(dh.data_ptr()),
         reinterpret_cast<float*>(dgate.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(h.data_ptr()),
+        reinterpret_cast<const bf16*>(gate.data_ptr()),
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
+void gated_residual_backward_no_dx_db_entrypoint(
+    const at::Tensor &grad,
+    const at::Tensor &h,
+    const at::Tensor &gate,
+    const at::Tensor &dh,
+    const at::Tensor &dgate,
+    const at::Tensor &dbias,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(grad, h, gate, dh, dgate, dbias);
+    TORCH_CHECK(grad.dtype() == torch::kBFloat16 && h.dtype() == torch::kBFloat16);
+    TORCH_CHECK(gate.dtype() == torch::kBFloat16 && dh.dtype() == torch::kBFloat16);
+    TORCH_CHECK(dgate.dtype() == torch::kFloat32 && dbias.dtype() == torch::kFloat32);
+    TORCH_CHECK(grad.is_contiguous() && h.is_contiguous() && gate.is_contiguous());
+    TORCH_CHECK(dh.is_contiguous() && dgate.is_contiguous() && dbias.is_contiguous());
+    TORCH_CHECK(grad.dim() == 2 && h.dim() == 2 && dh.dim() == 2 && gate.dim() == 2 && dgate.dim() == 2 && dbias.dim() == 1);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = grad.size(0);
+    int K = grad.size(1);
+    int batch = gate.size(0);
+    TORCH_CHECK(h.size(0) == M && h.size(1) == K);
+    TORCH_CHECK(dh.size(0) == M && dh.size(1) == K);
+    TORCH_CHECK(gate.size(1) == K);
+    TORCH_CHECK(dgate.size(0) == batch && dgate.size(1) == K);
+    TORCH_CHECK(dbias.size(0) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, batch);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaMemsetAsync(dbias.data_ptr(), 0, K * sizeof(float), stream);
+    gated_residual_backward_no_dx_db_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<bf16*>(dh.data_ptr()),
+        reinterpret_cast<float*>(dgate.data_ptr()),
+        reinterpret_cast<float*>(dbias.data_ptr()),
         reinterpret_cast<const bf16*>(grad.data_ptr()),
         reinterpret_cast<const bf16*>(h.data_ptr()),
         reinterpret_cast<const bf16*>(gate.data_ptr()),
@@ -2779,6 +2883,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("gated_residual", &gated_residual_entrypoint);
     m.def("gated_residual_backward", &gated_residual_backward_entrypoint);
     m.def("gated_residual_backward_no_dx", &gated_residual_backward_no_dx_entrypoint);
+    m.def("gated_residual_backward_no_dx_db", &gated_residual_backward_no_dx_db_entrypoint);
     m.def("layernorm_adaln", &layernorm_adaln_entrypoint);
     m.def("layernorm_adaln_persistent", &layernorm_adaln_persistent_entrypoint);
     m.def("layernorm_adaln_warp4", &layernorm_adaln_warp4_entrypoint);
