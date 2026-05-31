@@ -12,6 +12,8 @@ from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
 from _C import (
     fp8_gemm_k1024,
     fp8_gemm_k1024_bf16_out,
+    fp8_gemm_k1024_bf16_out_scaled,
+    fp8_gemm_k1024_bf16_out_wide_scaled,
     fp8_gemm_k1024_bf16_out_deepaccum,
     fp8_gemm_k1024_bf16_out_deepaccum_n64,
     fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled,
@@ -128,6 +130,10 @@ def main() -> None:
         stats_fp32_fused_q = event_bench(lambda: fp8_gemm_k1024_fp32_out(q_stats, w), warmup=args.warmup, iters=args.iters)
         stats_bf16 = event_bench(lambda: fp8_gemm_k1024_bf16_out(q, w), warmup=args.warmup, iters=args.iters)
         stats_bf16_fused_q = event_bench(lambda: fp8_gemm_k1024_bf16_out(q_stats, w), warmup=args.warmup, iters=args.iters)
+        stats_bf16_scaled = event_bench(lambda: fp8_gemm_k1024_bf16_out_scaled(q, w, 1.0, 1.0), warmup=args.warmup, iters=args.iters)
+        stats_bf16_scaled_fused_q = event_bench(lambda: fp8_gemm_k1024_bf16_out_scaled(q_stats, w, 1.0, 1.0), warmup=args.warmup, iters=args.iters)
+        stats_bf16_wide_scaled = event_bench(lambda: fp8_gemm_k1024_bf16_out_wide_scaled(q, w, 1.0, 1.0), warmup=args.warmup, iters=args.iters)
+        stats_bf16_wide_scaled_fused_q = event_bench(lambda: fp8_gemm_k1024_bf16_out_wide_scaled(q_stats, w, 1.0, 1.0), warmup=args.warmup, iters=args.iters)
         stats_bf16_deepaccum = event_bench(lambda: fp8_gemm_k1024_bf16_out_deepaccum(q, w), warmup=args.warmup, iters=args.iters)
         stats_bf16_deepaccum_fused_q = event_bench(lambda: fp8_gemm_k1024_bf16_out_deepaccum(q_stats, w), warmup=args.warmup, iters=args.iters)
         stats_bf16_deepaccum_n64 = event_bench(lambda: fp8_gemm_k1024_bf16_out_deepaccum_n64(q, w), warmup=args.warmup, iters=args.iters)
@@ -137,7 +143,7 @@ def main() -> None:
         stats_bf16_pipe64 = event_bench(lambda: fp8_gemm_k1024_bf16_out_pipe64(q, w), warmup=args.warmup, iters=args.iters)
         stats_te = event_bench(lambda: te_general_gemm_tn_bf16(te_x, te_w), warmup=args.warmup, iters=args.iters)
         stats_tk_te_raw = event_bench(
-            lambda: fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled(te_raw_e4m3(te_x._data), te_raw_e4m3(te_w._data), te_a_inv, te_b_inv),
+            lambda: fp8_gemm_k1024_bf16_out_wide_scaled(te_raw_e4m3(te_x._data), te_raw_e4m3(te_w._data), te_a_inv, te_b_inv),
             warmup=args.warmup,
             iters=args.iters,
         )
@@ -148,6 +154,10 @@ def main() -> None:
         stats_fp32_fused_q["tflops"] = flops / (stats_fp32_fused_q["mean_ms"] * 1e-3) / 1e12
         stats_bf16["tflops"] = flops / (stats_bf16["mean_ms"] * 1e-3) / 1e12
         stats_bf16_fused_q["tflops"] = flops / (stats_bf16_fused_q["mean_ms"] * 1e-3) / 1e12
+        stats_bf16_scaled["tflops"] = flops / (stats_bf16_scaled["mean_ms"] * 1e-3) / 1e12
+        stats_bf16_scaled_fused_q["tflops"] = flops / (stats_bf16_scaled_fused_q["mean_ms"] * 1e-3) / 1e12
+        stats_bf16_wide_scaled["tflops"] = flops / (stats_bf16_wide_scaled["mean_ms"] * 1e-3) / 1e12
+        stats_bf16_wide_scaled_fused_q["tflops"] = flops / (stats_bf16_wide_scaled_fused_q["mean_ms"] * 1e-3) / 1e12
         stats_bf16_deepaccum["tflops"] = flops / (stats_bf16_deepaccum["mean_ms"] * 1e-3) / 1e12
         stats_bf16_deepaccum_fused_q["tflops"] = flops / (stats_bf16_deepaccum_fused_q["mean_ms"] * 1e-3) / 1e12
         stats_bf16_deepaccum_n64["tflops"] = flops / (stats_bf16_deepaccum_n64["mean_ms"] * 1e-3) / 1e12
@@ -163,6 +173,10 @@ def main() -> None:
         print(f"fp8_gemm_k1024_fp32_out_fused_stats_q M={m} N={n} K=1024: {stats_fp32_fused_q}")
         print(f"fp8_gemm_k1024_bf16_out M={m} N={n} K=1024: {stats_bf16}")
         print(f"fp8_gemm_k1024_bf16_out_fused_stats_q M={m} N={n} K=1024: {stats_bf16_fused_q}")
+        print(f"fp8_gemm_k1024_bf16_out_scaled M={m} N={n} K=1024: {stats_bf16_scaled}")
+        print(f"fp8_gemm_k1024_bf16_out_scaled_fused_stats_q M={m} N={n} K=1024: {stats_bf16_scaled_fused_q}")
+        print(f"fp8_gemm_k1024_bf16_out_wide_scaled M={m} N={n} K=1024: {stats_bf16_wide_scaled}")
+        print(f"fp8_gemm_k1024_bf16_out_wide_scaled_fused_stats_q M={m} N={n} K=1024: {stats_bf16_wide_scaled_fused_q}")
         print(f"fp8_gemm_k1024_bf16_out_deepaccum M={m} N={n} K=1024: {stats_bf16_deepaccum}")
         print(f"fp8_gemm_k1024_bf16_out_deepaccum_fused_stats_q M={m} N={n} K=1024: {stats_bf16_deepaccum_fused_q}")
         print(f"fp8_gemm_k1024_bf16_out_deepaccum_n64 M={m} N={n} K=1024: {stats_bf16_deepaccum_n64}")
@@ -171,7 +185,7 @@ def main() -> None:
         print(f"fp8_gemm_k1024_bf16_out_pipe_fused_stats_q M={m} N={n} K=1024: {stats_bf16_pipe_fused_q}")
         print(f"fp8_gemm_k1024_bf16_out_pipe64 M={m} N={n} K=1024: {stats_bf16_pipe64}")
         print(f"te_general_gemm_fp8_tn_bf16_out_per_tensor M={m} N={n} K=1024: {stats_te}")
-        print(f"tk_deepaccum_n64_scaled_te_raw M={m} N={n} K=1024: {stats_tk_te_raw}")
+        print(f"tk_bf16_out_wide_scaled_te_raw M={m} N={n} K=1024: {stats_tk_te_raw}")
 
 
 if __name__ == "__main__":

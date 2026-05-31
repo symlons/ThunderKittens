@@ -6,6 +6,8 @@ import torch
 
 from _C import (
     fp8_gemm_k1024_bf16_out,
+    fp8_gemm_k1024_bf16_out_scaled,
+    fp8_gemm_k1024_bf16_out_wide_scaled,
     fp8_gemm_k1024_bf16_out_deepaccum,
     fp8_gemm_k1024_bf16_out_deepaccum_n64,
     fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled,
@@ -95,6 +97,27 @@ def main() -> None:
     print(f"bf16_out_gemm_max_abs_diff={gemm_bf16_abs:.8g}")
     print(f"bf16_out_gemm_mean_abs_diff={gemm_bf16_mean:.8g}")
 
+    a_dequant_scale = 0.75
+    b_dequant_scale = 1.25
+    gemm_bf16_scaled = fp8_gemm_k1024_bf16_out_scaled(
+        q_gemm, w, a_dequant_scale, b_dequant_scale
+    )
+    gemm_bf16_scaled_ref = (gemm_ref * (a_dequant_scale * b_dequant_scale)).to(torch.bfloat16)
+    gemm_bf16_scaled_diff = (gemm_bf16_scaled.float() - gemm_bf16_scaled_ref.float()).abs()
+    gemm_bf16_scaled_abs = gemm_bf16_scaled_diff.max().item()
+    gemm_bf16_scaled_mean = gemm_bf16_scaled_diff.mean().item()
+    print(f"bf16_out_scaled_gemm_max_abs_diff={gemm_bf16_scaled_abs:.8g}")
+    print(f"bf16_out_scaled_gemm_mean_abs_diff={gemm_bf16_scaled_mean:.8g}")
+
+    gemm_bf16_wide_scaled = fp8_gemm_k1024_bf16_out_wide_scaled(
+        q_gemm, w, a_dequant_scale, b_dequant_scale
+    )
+    gemm_bf16_wide_scaled_diff = (gemm_bf16_wide_scaled.float() - gemm_bf16_scaled_ref.float()).abs()
+    gemm_bf16_wide_scaled_abs = gemm_bf16_wide_scaled_diff.max().item()
+    gemm_bf16_wide_scaled_mean = gemm_bf16_wide_scaled_diff.mean().item()
+    print(f"bf16_out_wide_scaled_gemm_max_abs_diff={gemm_bf16_wide_scaled_abs:.8g}")
+    print(f"bf16_out_wide_scaled_gemm_mean_abs_diff={gemm_bf16_wide_scaled_mean:.8g}")
+
     gemm_bf16_deepaccum = fp8_gemm_k1024_bf16_out_deepaccum(q_gemm, w)
     gemm_bf16_deepaccum_diff = (gemm_bf16_deepaccum.float() - gemm_bf16_ref.float()).abs()
     gemm_bf16_deepaccum_abs = gemm_bf16_deepaccum_diff.max().item()
@@ -102,12 +125,9 @@ def main() -> None:
     print(f"bf16_out_deepaccum_gemm_max_abs_diff={gemm_bf16_deepaccum_abs:.8g}")
     print(f"bf16_out_deepaccum_gemm_mean_abs_diff={gemm_bf16_deepaccum_mean:.8g}")
 
-    a_dequant_scale = 0.75
-    b_dequant_scale = 1.25
     gemm_bf16_deepaccum_scaled = fp8_gemm_k1024_bf16_out_deepaccum_scaled(
         q_gemm, w, a_dequant_scale, b_dequant_scale
     )
-    gemm_bf16_scaled_ref = (gemm_ref * (a_dequant_scale * b_dequant_scale)).to(torch.bfloat16)
     gemm_bf16_deepaccum_scaled_diff = (
         gemm_bf16_deepaccum_scaled.float() - gemm_bf16_scaled_ref.float()
     ).abs()
@@ -164,6 +184,15 @@ def main() -> None:
         raise AssertionError(f"FP32 output GEMM mismatch: max abs {gemm_abs}, mean abs {gemm_mean}")
     if gemm_bf16_abs > 2e-2 or gemm_bf16_mean > 2e-3:
         raise AssertionError(f"BF16 output GEMM mismatch: max abs {gemm_bf16_abs}, mean abs {gemm_bf16_mean}")
+    if gemm_bf16_scaled_abs > 2e-2 or gemm_bf16_scaled_mean > 2e-3:
+        raise AssertionError(
+            f"Scaled BF16 output GEMM mismatch: max abs {gemm_bf16_scaled_abs}, mean abs {gemm_bf16_scaled_mean}"
+        )
+    if gemm_bf16_wide_scaled_abs > 2e-2 or gemm_bf16_wide_scaled_mean > 2e-3:
+        raise AssertionError(
+            "Wide scaled BF16 output GEMM mismatch: "
+            f"max abs {gemm_bf16_wide_scaled_abs}, mean abs {gemm_bf16_wide_scaled_mean}"
+        )
     if gemm_bf16_deepaccum_abs > 2e-2 or gemm_bf16_deepaccum_mean > 2e-3:
         raise AssertionError(
             f"DeepAccum BF16 output GEMM mismatch: max abs {gemm_bf16_deepaccum_abs}, mean abs {gemm_bf16_deepaccum_mean}"

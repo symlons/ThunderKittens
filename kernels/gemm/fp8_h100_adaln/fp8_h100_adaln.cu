@@ -598,6 +598,222 @@ void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, bf16 *d_C, size_t M, size_t N, size_t
 
 } // namespace fp8_bf16out
 
+namespace fp8_bf16out_scaled {
+
+struct matmul_layout {
+    using  a_tile         = st_fp8e4m3<64,  128>;
+    using  b_tile         = st_fp8e4m3<128, 128>;
+    using  c_tile         = st_bf<64,  128>;
+    using  a_layout       = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
+    using  b_layout       = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
+    using  c_layout       = gl<bf16, 1, 1, -1, -1, c_tile>;
+    struct globals        { a_layout A; b_layout B; c_layout C; float dequant_scale; };
+    struct input_block    { a_tile a[2]; b_tile b; };
+    struct finish_block   { c_tile c[2]; };
+    struct common_state   { int2 coord; };
+    struct consumer_state {
+        rt_fl<16, c_tile::cols> tc_accum;
+        rt_fl<16, c_tile::cols> fp32_accum;
+    };
+};
+
+template<int _SUPER_M=12>
+struct matmul_template {
+    static constexpr int SUPER_M = _SUPER_M;
+    using layout = matmul_layout;
+    static constexpr int NUM_CONSUMER_WARPS=8, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        return dim3(PERISISTENT_GRID ? 128 : M*N/(2*layout::c_tile::num_elements));
+    }
+
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        int Rblocks = args.globals.C.rows() / (2*layout::c_tile::rows), Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+        int super_rows = (Rblocks/SUPER_M)*SUPER_M,
+            final_rows = Rblocks - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        if (task_id < super_rows * Cblocks) {
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
+        } else if (task_id < Rblocks*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        } else {
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/layout::a_tile::cols;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid();
+        args.common.coord = { args.common.coord.x*2 + id, args.common.coord.y };
+    }
+
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::laneid() == 0) {
+                tma::expect(args.inputs_arrived, args.input);
+                for (int i = 0; i < 2; i++) {
+                    tma::load_async(args.input.a[i], args.globals.A, {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                }
+                tma::load_async(args.input.b, args.globals.B, {args.common.coord.y, args.iter}, args.inputs_arrived);
+            }
+        }
+    };
+
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>();
+            warp::zero(args.state.tc_accum);
+            warp::zero(args.state.fp32_accum);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            warpgroup::mma_ABt(
+                args.state.tc_accum,
+                args.input.a[warpgroup::groupid()],
+                args.input.b
+            );
+            warpgroup::mma_async_wait();
+            warp::add(args.state.fp32_accum, args.state.fp32_accum, args.state.tc_accum);
+            warp::zero(args.state.tc_accum);
+            if (warp::laneid() == 0) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            warp::mul(args.state.fp32_accum, args.state.fp32_accum, args.globals.dequant_scale);
+            warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.fp32_accum);
+            warpgroup::sync(warpgroup::groupid()+4);
+            if (warpgroup::laneid() == 0) {
+                tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()], {args.common.coord.x, args.common.coord.y});
+                tma::store_async_read_wait();
+            }
+            warp::zero(args.state.fp32_accum);
+            if (warp::laneid() == 0) arrive(args.finish_finished);
+        }
+    };
+};
+
+template<typename mmt>
+void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, float dequant_scale, dim3 grid, dim3 block) {
+    using a_layout = typename mmt::layout::a_layout;
+    using b_layout = typename mmt::layout::b_layout;
+    using c_layout = typename mmt::layout::c_layout;
+    using globals  = typename mmt::layout::globals;
+    a_layout Ag{d_A, nullptr, nullptr, M, K};
+    b_layout Bg{d_B, nullptr, nullptr, N, K};
+    c_layout Cg{d_C, nullptr, nullptr, M, N};
+    globals G{Ag, Bg, Cg, dequant_scale};
+    prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
+}
+
+} // namespace fp8_bf16out_scaled
+
+namespace fp8_bf16out_wide_scaled {
+
+struct matmul_layout {
+    using  a_tile         = st_fp8e4m3<64,  128>;
+    using  b_tile         = st_fp8e4m3<256, 128>;
+    using  c_tile         = st_bf<64,  256>;
+    using  a_layout       = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
+    using  b_layout       = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
+    using  c_layout       = gl<bf16, 1, 1, -1, -1, c_tile>;
+    struct globals        { a_layout A; b_layout B; c_layout C; float dequant_scale; };
+    struct input_block    { a_tile a[2]; b_tile b; };
+    struct finish_block   { c_tile c[2]; };
+    struct common_state   { int2 coord; };
+    struct consumer_state {
+        rt_fl<16, c_tile::cols> accum;
+    };
+};
+
+template<int _SUPER_M=12>
+struct matmul_template {
+    static constexpr int SUPER_M = _SUPER_M;
+    using layout = matmul_layout;
+    static constexpr int NUM_CONSUMER_WARPS=8, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        return dim3(PERISISTENT_GRID ? 128 : M*N/(2*layout::c_tile::num_elements));
+    }
+
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        int Rblocks = args.globals.C.rows() / (2*layout::c_tile::rows), Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+        int super_rows = (Rblocks/SUPER_M)*SUPER_M,
+            final_rows = Rblocks - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        if (task_id < super_rows * Cblocks) {
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
+        } else if (task_id < Rblocks*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        } else {
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/layout::a_tile::cols;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid();
+        args.common.coord = { args.common.coord.x*2 + id, args.common.coord.y };
+    }
+
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::laneid() == 0) {
+                tma::expect(args.inputs_arrived, args.input);
+                for (int i = 0; i < 2; i++) {
+                    tma::load_async(args.input.a[i], args.globals.A, {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                }
+                tma::load_async(args.input.b, args.globals.B, {args.common.coord.y, args.iter}, args.inputs_arrived);
+            }
+        }
+    };
+
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>();
+            warp::zero(args.state.accum);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            warpgroup::mma_ABt(
+                args.state.accum,
+                args.input.a[warpgroup::groupid()],
+                args.input.b
+            );
+            warpgroup::mma_async_wait();
+            if (warp::laneid() == 0) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            warp::mul(args.state.accum, args.state.accum, args.globals.dequant_scale);
+            warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.accum);
+            warpgroup::sync(warpgroup::groupid()+4);
+            if (warpgroup::laneid() == 0) {
+                tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()], {args.common.coord.x, args.common.coord.y});
+                tma::store_async_read_wait();
+            }
+            warp::zero(args.state.accum);
+            if (warp::laneid() == 0) arrive(args.finish_finished);
+        }
+    };
+};
+
+template<typename mmt>
+void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, float dequant_scale, dim3 grid, dim3 block) {
+    using a_layout = typename mmt::layout::a_layout;
+    using b_layout = typename mmt::layout::b_layout;
+    using c_layout = typename mmt::layout::c_layout;
+    using globals  = typename mmt::layout::globals;
+    a_layout Ag{d_A, nullptr, nullptr, M, K};
+    b_layout Bg{d_B, nullptr, nullptr, N, K};
+    c_layout Cg{d_C, nullptr, nullptr, M, N};
+    globals G{Ag, Bg, Cg, dequant_scale};
+    prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
+}
+
+} // namespace fp8_bf16out_wide_scaled
+
 namespace fp8_bf16out_deepaccum {
 
 struct matmul_layout {
@@ -1260,6 +1476,66 @@ at::Tensor fp8_gemm_k1024_bf16_out(const at::Tensor &A, const at::Tensor &B) {
     return C;
 }
 
+at::Tensor fp8_gemm_k1024_bf16_out_scaled(const at::Tensor &A, const at::Tensor &B, double a_dequant_scale, double b_dequant_scale) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+    TORCH_CHECK(A.scalar_type() == at::ScalarType::Float8_e4m3fn, "A must be fp8 e4m3");
+    TORCH_CHECK(B.scalar_type() == at::ScalarType::Float8_e4m3fn, "B must be fp8 e4m3");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(A.size(1) == K1024 && B.size(1) == K1024, "A and B must have K=1024");
+    TORCH_CHECK((A.size(0) % 128) == 0 && (B.size(0) % 256) == 0, "M must be multiple of 128 and N multiple of 256");
+
+    auto M = A.size(0);
+    auto N = B.size(0);
+    auto K = A.size(1);
+    at::Tensor C = at::empty({M, N}, A.options().dtype(at::ScalarType::BFloat16));
+
+    fp8e4m3 *d_A = reinterpret_cast<fp8e4m3 *>(A.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_B = reinterpret_cast<fp8e4m3 *>(B.data_ptr<c10::Float8_e4m3fn>());
+    bf16 *d_C = reinterpret_cast<bf16 *>(C.data_ptr<at::BFloat16>());
+
+    using mmt = fp8_bf16out_scaled::matmul_template<8>;
+    dim3 grid(mmt::grid(M, N, K));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fp8_bf16out_scaled::inner_run<mmt>(
+        d_A, d_B, d_C, M, N, K, static_cast<float>(a_dequant_scale * b_dequant_scale), grid, block
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return C;
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_wide_scaled(const at::Tensor &A, const at::Tensor &B, double a_dequant_scale, double b_dequant_scale) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+    TORCH_CHECK(A.scalar_type() == at::ScalarType::Float8_e4m3fn, "A must be fp8 e4m3");
+    TORCH_CHECK(B.scalar_type() == at::ScalarType::Float8_e4m3fn, "B must be fp8 e4m3");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(A.size(1) == K1024 && B.size(1) == K1024, "A and B must have K=1024");
+    TORCH_CHECK((A.size(0) % 128) == 0 && (B.size(0) % 256) == 0, "M must be multiple of 128 and N multiple of 256");
+
+    auto M = A.size(0);
+    auto N = B.size(0);
+    auto K = A.size(1);
+    at::Tensor C = at::empty({M, N}, A.options().dtype(at::ScalarType::BFloat16));
+
+    fp8e4m3 *d_A = reinterpret_cast<fp8e4m3 *>(A.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_B = reinterpret_cast<fp8e4m3 *>(B.data_ptr<c10::Float8_e4m3fn>());
+    bf16 *d_C = reinterpret_cast<bf16 *>(C.data_ptr<at::BFloat16>());
+
+    using mmt = fp8_bf16out_wide_scaled::matmul_template<8>;
+    dim3 grid(mmt::grid(M, N, K));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fp8_bf16out_wide_scaled::inner_run<mmt>(
+        d_A, d_B, d_C, M, N, K, static_cast<float>(a_dequant_scale * b_dequant_scale), grid, block
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return C;
+}
+
 at::Tensor fp8_gemm_k1024_bf16_out_deepaccum_scaled(const at::Tensor &A, const at::Tensor &B, double a_dequant_scale, double b_dequant_scale) {
     CHECK_INPUT(A);
     CHECK_INPUT(B);
@@ -1396,6 +1672,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("fp8_gemm_k1024", &fp8_gemm_k1024);
     m.def("fp8_gemm_k1024_fp32_out", &fp8_gemm_k1024_fp32_out);
     m.def("fp8_gemm_k1024_bf16_out", &fp8_gemm_k1024_bf16_out);
+    m.def("fp8_gemm_k1024_bf16_out_scaled", &fp8_gemm_k1024_bf16_out_scaled);
+    m.def("fp8_gemm_k1024_bf16_out_wide_scaled", &fp8_gemm_k1024_bf16_out_wide_scaled);
     m.def("fp8_gemm_k1024_bf16_out_deepaccum", &fp8_gemm_k1024_bf16_out_deepaccum);
     m.def("fp8_gemm_k1024_bf16_out_deepaccum_scaled", &fp8_gemm_k1024_bf16_out_deepaccum_scaled);
     m.def("fp8_gemm_k1024_bf16_out_deepaccum_n64", &fp8_gemm_k1024_bf16_out_deepaccum_n64);

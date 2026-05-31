@@ -9,6 +9,8 @@ from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
 
 from _C import (
+    fp8_gemm_k1024_bf16_out_scaled,
+    fp8_gemm_k1024_bf16_out_wide_scaled,
     fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled,
     ln_adaln_quantize_k1024,
     ln_adaln_quantize_stats_k1024,
@@ -145,10 +147,26 @@ def main() -> None:
     )
     gemm_ref = raw_e4m3(te_gemm_x._data).float() @ raw_e4m3(te_w._data).float().T
     gemm_ref = gemm_ref * te_gemm_x._scale_inv.float() * te_w._scale_inv.float()
+    tk_fast_gemm_out = fp8_gemm_k1024_bf16_out_scaled(
+        raw_e4m3(te_gemm_x._data),
+        raw_e4m3(te_w._data),
+        float(te_gemm_x._scale_inv.item()),
+        float(te_w._scale_inv.item()),
+    )
+    tk_wide_gemm_out = fp8_gemm_k1024_bf16_out_wide_scaled(
+        raw_e4m3(te_gemm_x._data),
+        raw_e4m3(te_w._data),
+        float(te_gemm_x._scale_inv.item()),
+        float(te_w._scale_inv.item()),
+    )
     te_gemm_diff = (te_gemm_out.float() - gemm_ref).abs().max()
     tk_te_gemm_diff = (tk_gemm_out.float() - te_gemm_out.float()).abs().max()
+    tk_fast_te_gemm_diff = (tk_fast_gemm_out.float() - te_gemm_out.float()).abs().max()
+    tk_wide_te_gemm_diff = (tk_wide_gemm_out.float() - te_gemm_out.float()).abs().max()
     print(f"te_gemm_ref_max_abs_diff={te_gemm_diff.item():.8g}")
     print(f"tk_te_gemm_max_abs_diff={tk_te_gemm_diff.item():.8g}")
+    print(f"tk_fast_te_gemm_max_abs_diff={tk_fast_te_gemm_diff.item():.8g}")
+    print(f"tk_wide_te_gemm_max_abs_diff={tk_wide_te_gemm_diff.item():.8g}")
 
     if not raw_match:
         mismatches = (tk_raw != te_raw).sum().item()
@@ -169,6 +187,10 @@ def main() -> None:
         raise AssertionError("TE GEMM differs from dequantized torch reference")
     if tk_te_gemm_diff.item() > 0.03125:
         raise AssertionError("TK scaled GEMM differs from TE GEMM")
+    if tk_fast_te_gemm_diff.item() > 0.03125:
+        raise AssertionError("TK fast scaled GEMM differs from TE GEMM")
+    if tk_wide_te_gemm_diff.item() > 0.03125:
+        raise AssertionError("TK wide scaled GEMM differs from TE GEMM")
 
 
 if __name__ == "__main__":

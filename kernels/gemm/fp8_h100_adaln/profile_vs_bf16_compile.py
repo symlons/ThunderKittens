@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from _C import (
     fp8_gemm_k1024,
     fp8_gemm_k1024_bf16_out,
+    fp8_gemm_k1024_bf16_out_scaled,
+    fp8_gemm_k1024_bf16_out_wide_scaled,
     fp8_gemm_k1024_bf16_out_deepaccum,
     fp8_gemm_k1024_bf16_out_deepaccum_n64,
     fp8_gemm_k1024_bf16_out_pipe,
@@ -177,6 +179,16 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
         )
+        fp8_gemm_bf16_scaled = event_bench(
+            lambda: fp8_gemm_k1024_bf16_out_scaled(q, w_fp8, 1.0, 1.0),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        fp8_gemm_bf16_wide_scaled = event_bench(
+            lambda: fp8_gemm_k1024_bf16_out_wide_scaled(q, w_fp8, 1.0, 1.0),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
         fp8_gemm_bf16_deepaccum_n64 = event_bench(
             lambda: fp8_gemm_k1024_bf16_out_deepaccum_n64(q, w_fp8),
             warmup=args.warmup,
@@ -210,6 +222,26 @@ def main() -> None:
             lambda: fp8_gemm_k1024_bf16_out(
                 ln_adaln_quantize_stats_k1024(x2, shift, scale, tokens, quant_scale, args.eps)[0],
                 w_fp8,
+            ),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        fp8_fused_stats_quant_gemm_bf16_scaled = event_bench(
+            lambda: fp8_gemm_k1024_bf16_out_scaled(
+                ln_adaln_quantize_stats_k1024(x2, shift, scale, tokens, quant_scale, args.eps)[0],
+                w_fp8,
+                1.0,
+                1.0,
+            ),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        fp8_fused_stats_quant_gemm_bf16_wide_scaled = event_bench(
+            lambda: fp8_gemm_k1024_bf16_out_wide_scaled(
+                ln_adaln_quantize_stats_k1024(x2, shift, scale, tokens, quant_scale, args.eps)[0],
+                w_fp8,
+                1.0,
+                1.0,
             ),
             warmup=args.warmup,
             iters=args.iters,
@@ -253,6 +285,8 @@ def main() -> None:
         print_stats("tk_fp8_gemm_only_fused_stats_quantized_input", fp8_gemm_fused_stats_q)
         print_stats("tk_fp8_gemm_only_bf16_out_pipe_prequantized_input", fp8_gemm_bf16_pipe)
         print_stats("tk_fp8_gemm_only_bf16_out_pipe64_prequantized_input", fp8_gemm_bf16_pipe64)
+        print_stats("tk_fp8_gemm_only_bf16_out_scaled_prequantized_input", fp8_gemm_bf16_scaled)
+        print_stats("tk_fp8_gemm_only_bf16_out_wide_scaled_prequantized_input", fp8_gemm_bf16_wide_scaled)
         print_stats("tk_fp8_gemm_only_bf16_out_deepaccum_prequantized_input", fp8_gemm_bf16_deepaccum)
         print_stats("tk_fp8_gemm_only_bf16_out_deepaccum_n64_prequantized_input", fp8_gemm_bf16_deepaccum_n64)
         print_stats("tk_fp8_quant_plus_gemm_precomputed_stats", fp8_quant_gemm)
@@ -260,6 +294,8 @@ def main() -> None:
         print_stats("tk_fused_stats_quant_plus_fp8_gemm", fp8_fused_stats_quant_gemm)
         print_stats("tk_fused_stats_quant_plus_fp8_gemm_fp32_out", fp8_fused_stats_quant_gemm_fp32)
         print_stats("tk_fused_stats_quant_plus_fp8_gemm_bf16_out", fp8_fused_stats_quant_gemm_bf16)
+        print_stats("tk_fused_stats_quant_plus_fp8_gemm_bf16_out_scaled", fp8_fused_stats_quant_gemm_bf16_scaled)
+        print_stats("tk_fused_stats_quant_plus_fp8_gemm_bf16_out_wide_scaled", fp8_fused_stats_quant_gemm_bf16_wide_scaled)
         print_stats("tk_fused_stats_quant_plus_fp8_gemm_bf16_out_deepaccum", fp8_fused_stats_quant_gemm_bf16_deepaccum)
         print_stats("tk_fused_stats_quant_plus_fp8_gemm_bf16_out_deepaccum_n64", fp8_fused_stats_quant_gemm_bf16_deepaccum_n64)
         print_stats("tk_fused_stats_quant_plus_fp8_gemm_bf16_out_pipe", fp8_fused_stats_quant_gemm_bf16_pipe)
@@ -268,6 +304,8 @@ def main() -> None:
             f"gemm_only={bf16_full['mean_ms'] / fp8_gemm['mean_ms']:.3f}x "
             f"gemm_only_bf16_pipe={bf16_full['mean_ms'] / fp8_gemm_bf16_pipe['mean_ms']:.3f}x "
             f"gemm_only_bf16_pipe64={bf16_full['mean_ms'] / fp8_gemm_bf16_pipe64['mean_ms']:.3f}x "
+            f"gemm_only_bf16_scaled={bf16_full['mean_ms'] / fp8_gemm_bf16_scaled['mean_ms']:.3f}x "
+            f"gemm_only_bf16_wide_scaled={bf16_full['mean_ms'] / fp8_gemm_bf16_wide_scaled['mean_ms']:.3f}x "
             f"gemm_only_bf16_deepaccum={bf16_full['mean_ms'] / fp8_gemm_bf16_deepaccum['mean_ms']:.3f}x "
             f"gemm_only_bf16_deepaccum_n64={bf16_full['mean_ms'] / fp8_gemm_bf16_deepaccum_n64['mean_ms']:.3f}x "
             f"quant_gemm={bf16_full['mean_ms'] / fp8_quant_gemm['mean_ms']:.3f}x "
@@ -275,6 +313,8 @@ def main() -> None:
             f"tk_fused_stats_quant_gemm={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm['mean_ms']:.3f}x "
             f"tk_fused_stats_quant_gemm_fp32={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm_fp32['mean_ms']:.3f}x "
             f"tk_fused_stats_quant_gemm_bf16={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm_bf16['mean_ms']:.3f}x "
+            f"tk_fused_stats_quant_gemm_bf16_scaled={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm_bf16_scaled['mean_ms']:.3f}x "
+            f"tk_fused_stats_quant_gemm_bf16_wide_scaled={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm_bf16_wide_scaled['mean_ms']:.3f}x "
             f"tk_fused_stats_quant_gemm_bf16_deepaccum={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm_bf16_deepaccum['mean_ms']:.3f}x "
             f"tk_fused_stats_quant_gemm_bf16_deepaccum_n64={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm_bf16_deepaccum_n64['mean_ms']:.3f}x "
             f"tk_fused_stats_quant_gemm_bf16_pipe={bf16_full['mean_ms'] / fp8_fused_stats_quant_gemm_bf16_pipe['mean_ms']:.3f}x "
