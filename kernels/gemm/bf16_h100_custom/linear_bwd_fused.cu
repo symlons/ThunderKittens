@@ -508,12 +508,13 @@ void bias_reduce_entrypoint(
     );
 }
 
-void dw_gemm_entrypoint(
+template<int M_BLOCK, int N_BLOCK, int SUPER_M, int PIPE_STAGES, int GRID_BLOCKS>
+static inline void launch_dw_gemm_variant(
     const at::Tensor &x,
     const at::Tensor &dz,
     const at::Tensor &dW
 ) {
-    using mmt = dw_gemm_template<2, 4, 4, 4, 128>;
+    using mmt = dw_gemm_template<M_BLOCK, N_BLOCK, SUPER_M, PIPE_STAGES, GRID_BLOCKS>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 
@@ -531,6 +532,19 @@ void dw_gemm_entrypoint(
     cudaFuncSetAttribute(prototype::lcf::kernel<mmt>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
+void dw_gemm_entrypoint(
+    const at::Tensor &x,
+    const at::Tensor &dz,
+    const at::Tensor &dW
+) {
+    int K = x.size(1), N = dz.size(1);
+    if (K == 1024 && N == 1024) {
+        launch_dw_gemm_variant<1, 2, 8, 4, 128>(x, dz, dW);
+        return;
+    }
+    launch_dw_gemm_variant<2, 4, 16, 4, 128>(x, dz, dW);
 }
 
 template<int M_BLOCK, int N_BLOCK, int SUPER_M, int PIPE_STAGES, int GRID_BLOCKS>
@@ -589,7 +603,7 @@ void dx_gemm_native_entrypoint(
     const at::Tensor &W,
     const at::Tensor &dx
 ) {
-    using mmt = dx_native_gemm_template<2, 4, 8, 4, 128>;
+    using mmt = dx_native_gemm_template<2, 4, 16, 4, 128>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 
@@ -654,5 +668,18 @@ PYBIND11_MODULE(_linear_bwd_fused, m) {
     m.def("dx_gemm_native_g120", &dx_gemm_native_variant_entrypoint<2,4,8,4,120>);
     m.def("dx_gemm_native_g132", &dx_gemm_native_variant_entrypoint<2,4,8,4,132>);
     m.def("dx_gemm_native_p3", &dx_gemm_native_variant_entrypoint<2,4,8,3,128>);
+    m.def("dx_gemm_native_m2n2s8", &dx_gemm_native_variant_entrypoint<2,2,8,4,128>);
+    m.def("dx_gemm_native_m1n4s8", &dx_gemm_native_variant_entrypoint<1,4,8,4,128>);
+    m.def("dx_gemm_native_m1n4s4", &dx_gemm_native_variant_entrypoint<1,4,4,4,128>);
+    m.def("dw_gemm_m2n2s4", &dw_gemm_variant_entrypoint<2,2,4,4,128>);
+    m.def("dw_gemm_m2n2s8", &dw_gemm_variant_entrypoint<2,2,8,4,128>);
+    m.def("dw_gemm_m2n2s16", &dw_gemm_variant_entrypoint<2,2,16,4,128>);
+    m.def("dw_gemm_m2n2g120", &dw_gemm_variant_entrypoint<2,2,8,4,120>);
+    m.def("dw_gemm_m2n2g132", &dw_gemm_variant_entrypoint<2,2,8,4,132>);
+    m.def("dw_gemm_m2n2p3", &dw_gemm_variant_entrypoint<2,2,8,3,128>);
+    m.def("dw_gemm_m1n1s8", &dw_gemm_variant_entrypoint<1,1,8,4,128>);
+    m.def("dw_gemm_m1n2s8", &dw_gemm_variant_entrypoint<1,2,8,4,128>);
+    m.def("dw_gemm_m2n1s8", &dw_gemm_variant_entrypoint<2,1,8,4,128>);
+    m.def("dw_gemm_m1n4s8", &dw_gemm_variant_entrypoint<1,4,8,4,128>);
 }
 #endif

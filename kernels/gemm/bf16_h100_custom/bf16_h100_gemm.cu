@@ -1096,6 +1096,7 @@ __global__ void gated_residual_backward_no_dx_kernel(
     }
 }
 
+template<int COLS, int TOK_THREADS>
 __global__ void gated_residual_backward_no_dx_db_kernel(
     bf16 *__restrict__ dh,
     float *__restrict__ dgate,
@@ -1106,8 +1107,6 @@ __global__ void gated_residual_backward_no_dx_db_kernel(
     int K,
     int tokens_per_sample
 ) {
-    constexpr int COLS = 16;
-    constexpr int TOK_THREADS = 16;
     __shared__ float gate_sums[TOK_THREADS][COLS];
     __shared__ float bias_sums[TOK_THREADS][COLS];
 
@@ -1249,7 +1248,7 @@ struct native_matmul_template {
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        return dim3(PERISISTENT_GRID ? ((M >= 81920) ? 132 : PERSISTENT_GRID_BLOCKS) : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -2000,6 +1999,12 @@ void gemm_custom_native_entrypoint(
     const at::Tensor &bias,
     const at::Tensor &preact
 ) {
+    int K = A.size(1);
+    int N = B.size(0);
+    if (K >= 4 * N) {
+        gemm_custom_native_variant_entrypoint<2, 4, 4>(A, B, C, bias, preact);
+        return;
+    }
     gemm_custom_native_variant_entrypoint<2, 4, 8>(A, B, C, bias, preact);
 }
 
@@ -2049,7 +2054,8 @@ void gemm_linear_native_entrypoint(
     gemm_linear_native_variant_entrypoint<2, 4, 8>(A, B, C, bias);
 }
 
-void gemm_linear_gated_residual_entrypoint(
+template<int M_BLOCK, int N_BLOCK, int SUPER_M>
+void gemm_linear_gated_residual_variant_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
     const at::Tensor &residual,
@@ -2059,7 +2065,7 @@ void gemm_linear_gated_residual_entrypoint(
     const at::Tensor &bias,
     int64_t tokens_per_sample
 ) {
-    using mmt = gated_linear_template<2,4,8>;
+    using mmt = gated_linear_template<M_BLOCK, N_BLOCK, SUPER_M>;
     using globals = typename mmt::layout::globals;
     using global_layout = typename mmt::layout::global_layout;
     using wide_global = typename mmt::layout::wide_global;
@@ -2107,6 +2113,33 @@ void gemm_linear_gated_residual_entrypoint(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
+void gemm_linear_gated_residual_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &residual,
+    const at::Tensor &gate,
+    const at::Tensor &C,
+    const at::Tensor &projected,
+    const at::Tensor &bias,
+    int64_t tokens_per_sample
+) {
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(0);
+    if (K >= 4 * N && tokens_per_sample >= 4096) {
+        if (M >= 81920) {
+            gemm_linear_gated_residual_variant_entrypoint<2, 4, 16>(
+                A, B, residual, gate, C, projected, bias, tokens_per_sample);
+            return;
+        }
+        gemm_linear_gated_residual_variant_entrypoint<2, 4, 4>(
+            A, B, residual, gate, C, projected, bias, tokens_per_sample);
+        return;
+    }
+    gemm_linear_gated_residual_variant_entrypoint<2, 4, 8>(
+        A, B, residual, gate, C, projected, bias, tokens_per_sample);
 }
 
 void gemm_linear_gated_residual_out_entrypoint(
@@ -2410,11 +2443,89 @@ void gated_residual_backward_no_dx_db_entrypoint(
     TORCH_CHECK(dbias.size(0) == K);
     TORCH_CHECK(M == batch * tokens_per_sample);
 
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaMemsetAsync(dbias.data_ptr(), 0, K * sizeof(float), stream);
+
+    if (K == 1024 && tokens_per_sample >= 4096 && batch >= 20) {
+        dim3 block(16, 32);
+        dim3 grid((K + block.x - 1) / block.x, batch);
+        gated_residual_backward_no_dx_db_kernel<16, 32><<<grid, block, 0, stream>>>(
+            reinterpret_cast<bf16*>(dh.data_ptr()),
+            reinterpret_cast<float*>(dgate.data_ptr()),
+            reinterpret_cast<float*>(dbias.data_ptr()),
+            reinterpret_cast<const bf16*>(grad.data_ptr()),
+            reinterpret_cast<const bf16*>(h.data_ptr()),
+            reinterpret_cast<const bf16*>(gate.data_ptr()),
+            K,
+            static_cast<int>(tokens_per_sample)
+        );
+        return;
+    }
+
+    if (K == 1024) {
+        dim3 block(32, 16);
+        dim3 grid((K + block.x - 1) / block.x, batch);
+        gated_residual_backward_no_dx_db_kernel<32, 16><<<grid, block, 0, stream>>>(
+            reinterpret_cast<bf16*>(dh.data_ptr()),
+            reinterpret_cast<float*>(dgate.data_ptr()),
+            reinterpret_cast<float*>(dbias.data_ptr()),
+            reinterpret_cast<const bf16*>(grad.data_ptr()),
+            reinterpret_cast<const bf16*>(h.data_ptr()),
+            reinterpret_cast<const bf16*>(gate.data_ptr()),
+            K,
+            static_cast<int>(tokens_per_sample)
+        );
+        return;
+    }
+
     dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, batch);
+    gated_residual_backward_no_dx_db_kernel<16, 16><<<grid, block, 0, stream>>>(
+        reinterpret_cast<bf16*>(dh.data_ptr()),
+        reinterpret_cast<float*>(dgate.data_ptr()),
+        reinterpret_cast<float*>(dbias.data_ptr()),
+        reinterpret_cast<const bf16*>(grad.data_ptr()),
+        reinterpret_cast<const bf16*>(h.data_ptr()),
+        reinterpret_cast<const bf16*>(gate.data_ptr()),
+        K,
+        static_cast<int>(tokens_per_sample)
+    );
+}
+
+template<int COLS, int TOK_THREADS>
+void gated_residual_backward_no_dx_db_variant_entrypoint(
+    const at::Tensor &grad,
+    const at::Tensor &h,
+    const at::Tensor &gate,
+    const at::Tensor &dh,
+    const at::Tensor &dgate,
+    const at::Tensor &dbias,
+    int64_t tokens_per_sample
+) {
+    kittens::py::device_check(grad, h, gate, dh, dgate, dbias);
+    TORCH_CHECK(grad.dtype() == torch::kBFloat16 && h.dtype() == torch::kBFloat16);
+    TORCH_CHECK(gate.dtype() == torch::kBFloat16 && dh.dtype() == torch::kBFloat16);
+    TORCH_CHECK(dgate.dtype() == torch::kFloat32 && dbias.dtype() == torch::kFloat32);
+    TORCH_CHECK(grad.is_contiguous() && h.is_contiguous() && gate.is_contiguous());
+    TORCH_CHECK(dh.is_contiguous() && dgate.is_contiguous() && dbias.is_contiguous());
+    TORCH_CHECK(grad.dim() == 2 && h.dim() == 2 && dh.dim() == 2 && gate.dim() == 2 && dgate.dim() == 2 && dbias.dim() == 1);
+    TORCH_CHECK(tokens_per_sample > 0);
+
+    int M = grad.size(0);
+    int K = grad.size(1);
+    int batch = gate.size(0);
+    TORCH_CHECK(h.size(0) == M && h.size(1) == K);
+    TORCH_CHECK(dh.size(0) == M && dh.size(1) == K);
+    TORCH_CHECK(gate.size(1) == K);
+    TORCH_CHECK(dgate.size(0) == batch && dgate.size(1) == K);
+    TORCH_CHECK(dbias.size(0) == K);
+    TORCH_CHECK(M == batch * tokens_per_sample);
+
+    dim3 block(COLS, TOK_THREADS);
     dim3 grid((K + block.x - 1) / block.x, batch);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     cudaMemsetAsync(dbias.data_ptr(), 0, K * sizeof(float), stream);
-    gated_residual_backward_no_dx_db_kernel<<<grid, block, 0, stream>>>(
+    gated_residual_backward_no_dx_db_kernel<COLS, TOK_THREADS><<<grid, block, 0, stream>>>(
         reinterpret_cast<bf16*>(dh.data_ptr()),
         reinterpret_cast<float*>(dgate.data_ptr()),
         reinterpret_cast<float*>(dbias.data_ptr()),
@@ -2906,6 +3017,11 @@ PYBIND11_MODULE(_C, m) {
     m.def("gemm_linear_native_m2n2s8", &gemm_linear_native_variant_entrypoint<2,2,8>);
     m.def("gemm_linear_native_m1n4s8", &gemm_linear_native_variant_entrypoint<1,4,8>);
     m.def("gemm_linear_gated_residual", &gemm_linear_gated_residual_entrypoint);
+    m.def("gemm_linear_gated_residual_m2n4s4", &gemm_linear_gated_residual_variant_entrypoint<2,4,4>);
+    m.def("gemm_linear_gated_residual_m2n4s8", &gemm_linear_gated_residual_variant_entrypoint<2,4,8>);
+    m.def("gemm_linear_gated_residual_m2n4s16", &gemm_linear_gated_residual_variant_entrypoint<2,4,16>);
+    m.def("gemm_linear_gated_residual_m2n2s8", &gemm_linear_gated_residual_variant_entrypoint<2,2,8>);
+    m.def("gemm_linear_gated_residual_m1n4s8", &gemm_linear_gated_residual_variant_entrypoint<1,4,8>);
     m.def("gemm_linear_gated_residual_out", &gemm_linear_gated_residual_out_entrypoint);
     m.def("adaln_modulate", &adaln_modulate_entrypoint);
     m.def("adaln_modulate_backward", &adaln_modulate_backward_entrypoint);
@@ -2913,6 +3029,9 @@ PYBIND11_MODULE(_C, m) {
     m.def("gated_residual_backward", &gated_residual_backward_entrypoint);
     m.def("gated_residual_backward_no_dx", &gated_residual_backward_no_dx_entrypoint);
     m.def("gated_residual_backward_no_dx_db", &gated_residual_backward_no_dx_db_entrypoint);
+    m.def("gated_residual_backward_no_dx_db_c32t16", &gated_residual_backward_no_dx_db_variant_entrypoint<32,16>);
+    m.def("gated_residual_backward_no_dx_db_c16t32", &gated_residual_backward_no_dx_db_variant_entrypoint<16,32>);
+    m.def("gated_residual_backward_no_dx_db_c32t8", &gated_residual_backward_no_dx_db_variant_entrypoint<32,8>);
     m.def("layernorm_adaln", &layernorm_adaln_entrypoint);
     m.def("layernorm_adaln_persistent", &layernorm_adaln_persistent_entrypoint);
     m.def("layernorm_adaln_warp4", &layernorm_adaln_warp4_entrypoint);
