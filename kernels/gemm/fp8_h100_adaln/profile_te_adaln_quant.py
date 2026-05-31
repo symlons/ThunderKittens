@@ -11,8 +11,12 @@ from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
 
 from _C import (
+    delayed_scaling_update,
     fp8_gemm_k1024_bf16_out_wide_scaled,
+    ln_adaln_quantize_precomputed_vec_k1024,
     ln_adaln_quantize_stats_k1024,
+    ln_adaln_quantize_stats_delayed_k1024,
+    ln_adaln_quantize_stats_vec_delayed_k1024,
 )
 
 
@@ -122,7 +126,23 @@ def main() -> None:
     compiled_full = compile_bench(bf16_ln_adaln_linear)
     compiled_producer = compile_bench(bf16_ln_adaln_2d)
 
+    quant_scale = torch.full((1,), args.quant_scale, device=x2.device, dtype=torch.float32)
+    scale_inv = torch.full((1,), 1.0 / args.quant_scale, device=x2.device, dtype=torch.float32)
+    amax_history = torch.zeros((16,), device=x2.device, dtype=torch.float32)
+    hist_idx = torch.zeros((1,), device=x2.device, dtype=torch.int32)
     q_tk, tk_amax, _, _ = ln_adaln_quantize_stats_k1024(x2, shift, scale, tokens, args.quant_scale, args.eps)
+    q_delayed, row_amax_delayed, _, _ = ln_adaln_quantize_stats_delayed_k1024(
+        x2, shift, scale, quant_scale, tokens, args.eps
+    )
+    q_vec_delayed, row_amax_vec_delayed = ln_adaln_quantize_stats_vec_delayed_k1024(
+        x2, shift, scale, quant_scale, tokens, args.eps
+    )
+    delayed_scaling_update(row_amax_delayed, quant_scale, scale_inv, amax_history, hist_idx, args.eps)
+    mean = x2.float().mean(dim=1)
+    rstd = torch.rsqrt((x2.float() - mean[:, None]).square().mean(dim=1) + args.eps)
+    q_pre_vec, row_amax_pre_vec = ln_adaln_quantize_precomputed_vec_k1024(
+        x2, shift, scale, mean, rstd, quant_scale, tokens
+    )
     produced_adaln = compiled_producer(x3, shift, scale, args.eps)
     torch.cuda.synchronize()
 
@@ -136,6 +156,26 @@ def main() -> None:
         warmup=args.warmup,
         iters=args.iters,
     )
+    tk_delayed_quant_only = event_bench(
+        lambda: ln_adaln_quantize_stats_delayed_k1024(x2, shift, scale, quant_scale, tokens, args.eps),
+        warmup=args.warmup,
+        iters=args.iters,
+    )
+    tk_vec_delayed_quant_only = event_bench(
+        lambda: ln_adaln_quantize_stats_vec_delayed_k1024(x2, shift, scale, quant_scale, tokens, args.eps),
+        warmup=args.warmup,
+        iters=args.iters,
+    )
+    tk_precomputed_vec_quant_only = event_bench(
+        lambda: ln_adaln_quantize_precomputed_vec_k1024(x2, shift, scale, mean, rstd, quant_scale, tokens),
+        warmup=args.warmup,
+        iters=args.iters,
+    )
+    tk_delayed_update_only = event_bench(
+        lambda: delayed_scaling_update(row_amax_delayed, quant_scale, scale_inv, amax_history, hist_idx, args.eps),
+        warmup=args.warmup,
+        iters=args.iters,
+    )
     print(
         f"shape: B={batch} T={tokens} M={m} K={k}; "
         f"tk_fused_stats_amax={tk_amax[0].item():.6g}",
@@ -143,6 +183,10 @@ def main() -> None:
     )
     print_stats("bf16_compile_ln_adaln_producer_only", producer_only)
     print_stats("tk_fused_ln_stats_adaln_quant_only", tk_quant_only)
+    print_stats("tk_delayed_ln_stats_adaln_quant_row_amax_only", tk_delayed_quant_only)
+    print_stats("tk_vec_delayed_ln_stats_adaln_quant_row_amax_only", tk_vec_delayed_quant_only)
+    print_stats("tk_precomputed_stats_vec_adaln_quant_row_amax_only", tk_precomputed_vec_quant_only)
+    print_stats("tk_delayed_amax_history_scale_update_only", tk_delayed_update_only)
 
     for n in args.n:
         print(f"\nN={n}", flush=True)
@@ -222,6 +266,46 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
         )
+        tk_delayed_critical = event_bench(
+            lambda: fp8_gemm_k1024_bf16_out_wide_scaled(
+                ln_adaln_quantize_stats_delayed_k1024(x2, shift, scale, quant_scale, tokens, args.eps)[0],
+                w_raw_fp8,
+                1.0,
+                1.0,
+            ),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        tk_vec_delayed_critical = event_bench(
+            lambda: fp8_gemm_k1024_bf16_out_wide_scaled(
+                ln_adaln_quantize_stats_vec_delayed_k1024(x2, shift, scale, quant_scale, tokens, args.eps)[0],
+                w_raw_fp8,
+                1.0,
+                1.0,
+            ),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        tk_precomputed_vec_critical = event_bench(
+            lambda: fp8_gemm_k1024_bf16_out_wide_scaled(
+                ln_adaln_quantize_precomputed_vec_k1024(x2, shift, scale, mean, rstd, quant_scale, tokens)[0],
+                w_raw_fp8,
+                1.0,
+                1.0,
+            ),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+        tk_delayed_with_update = event_bench(
+            lambda: (
+                lambda delayed: (
+                    delayed_scaling_update(delayed[1], quant_scale, scale_inv, amax_history, hist_idx, args.eps),
+                    fp8_gemm_k1024_bf16_out_wide_scaled(delayed[0], w_raw_fp8, 1.0, 1.0),
+                )[1]
+            )(ln_adaln_quantize_stats_delayed_k1024(x2, shift, scale, quant_scale, tokens, args.eps)),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
         tk_on_te_raw = event_bench(
             lambda: fp8_gemm_k1024_bf16_out_wide_scaled(
                 raw_e4m3(te_x_fp8._data),
@@ -242,6 +326,10 @@ def main() -> None:
             ("te_compiled_adaln_act_weight_quant_plus_gemm", te_full_quant_weight),
             ("tk_wide_scaled_gemm_only_prequantized", tk_gemm_only),
             ("tk_fused_stats_adaln_quant_plus_wide_scaled_gemm", tk_full),
+            ("tk_delayed_stats_adaln_quant_plus_wide_scaled_gemm", tk_delayed_critical),
+            ("tk_vec_delayed_stats_adaln_quant_plus_wide_scaled_gemm", tk_vec_delayed_critical),
+            ("tk_precomputed_stats_vec_adaln_quant_plus_wide_scaled_gemm", tk_precomputed_vec_critical),
+            ("tk_delayed_stats_adaln_quant_update_plus_wide_scaled_gemm", tk_delayed_with_update),
             ("tk_wide_scaled_gemm_on_te_raw_fp8", tk_on_te_raw),
         ]
         print("| case | mean ms | TFLOP/s | vs bf16 compile |")
