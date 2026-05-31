@@ -821,7 +821,12 @@ class TkMlp(nn.Module):
         gate: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
-        if residual.shape[0] * residual.shape[1] >= 8192:
+        # The native TK MLP backward path is only a win for the large-D
+        # microbenchmarks it was tuned on. For DiT-S (D=384, hidden=1536),
+        # the custom weight-gradient GEMM is slower than the compiled
+        # cuBLAS/Inductor path, so keep GEMMs on torch and only use the
+        # faster standalone GELU backward.
+        if residual.shape[0] * residual.shape[1] >= 8192 and residual.shape[-1] < 1024:
             mlp_in = fused_adaln(residual, shift, scale, eps)
             h = TkGelu.apply(torch.nn.functional.linear(mlp_in, self.fc1.weight, self.fc1.bias))
             return gated_residual(
