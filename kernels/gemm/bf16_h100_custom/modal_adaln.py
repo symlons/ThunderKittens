@@ -27,7 +27,7 @@ ARTIFACT_DIR = "/data/adaln"
 image = (
     modal.Image.from_registry("pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel")
     .apt_install("git", "make", "ninja-build")
-    .pip_install("packaging", "psutil", "pybind11", "kernels", "timm")
+    .pip_install("packaging", "psutil", "pybind11", "kernels", "timm", "transformer-engine[pytorch]")
     .run_commands(
         "git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention && "
         "cd /tmp/flash-attention/hopper && "
