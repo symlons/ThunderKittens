@@ -2446,10 +2446,10 @@ void gated_residual_backward_no_dx_db_entrypoint(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     cudaMemsetAsync(dbias.data_ptr(), 0, K * sizeof(float), stream);
 
-    if (K == 1024 && tokens_per_sample >= 4096 && batch >= 20) {
-        dim3 block(16, 32);
+    if (K == 1024 && tokens_per_sample >= 4096) {
+        dim3 block(32, 32);
         dim3 grid((K + block.x - 1) / block.x, batch);
-        gated_residual_backward_no_dx_db_kernel<16, 32><<<grid, block, 0, stream>>>(
+        gated_residual_backward_no_dx_db_kernel<32, 32><<<grid, block, 0, stream>>>(
             reinterpret_cast<bf16*>(dh.data_ptr()),
             reinterpret_cast<float*>(dgate.data_ptr()),
             reinterpret_cast<float*>(dbias.data_ptr()),
@@ -2463,9 +2463,9 @@ void gated_residual_backward_no_dx_db_entrypoint(
     }
 
     if (K == 1024) {
-        dim3 block(32, 16);
+        dim3 block(64, 16);
         dim3 grid((K + block.x - 1) / block.x, batch);
-        gated_residual_backward_no_dx_db_kernel<32, 16><<<grid, block, 0, stream>>>(
+        gated_residual_backward_no_dx_db_kernel<64, 16><<<grid, block, 0, stream>>>(
             reinterpret_cast<bf16*>(dh.data_ptr()),
             reinterpret_cast<float*>(dgate.data_ptr()),
             reinterpret_cast<float*>(dbias.data_ptr()),
@@ -3032,6 +3032,8 @@ PYBIND11_MODULE(_C, m) {
     m.def("gated_residual_backward_no_dx_db_c32t16", &gated_residual_backward_no_dx_db_variant_entrypoint<32,16>);
     m.def("gated_residual_backward_no_dx_db_c16t32", &gated_residual_backward_no_dx_db_variant_entrypoint<16,32>);
     m.def("gated_residual_backward_no_dx_db_c32t8", &gated_residual_backward_no_dx_db_variant_entrypoint<32,8>);
+    m.def("gated_residual_backward_no_dx_db_c64t16", &gated_residual_backward_no_dx_db_variant_entrypoint<64,16>);
+    m.def("gated_residual_backward_no_dx_db_c32t32", &gated_residual_backward_no_dx_db_variant_entrypoint<32,32>);
     m.def("layernorm_adaln", &layernorm_adaln_entrypoint);
     m.def("layernorm_adaln_persistent", &layernorm_adaln_persistent_entrypoint);
     m.def("layernorm_adaln_warp4", &layernorm_adaln_warp4_entrypoint);
