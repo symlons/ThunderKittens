@@ -57,6 +57,12 @@ def torch_linear(group: tuple[torch.Tensor, ...]) -> torch.Tensor:
     return F.linear(a, w, b)
 
 
+def torch_linear_gelu_train(group: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+    a, w, b, *_ = group
+    preact = F.linear(a, w, b)
+    return F.gelu(preact, approximate="tanh"), preact
+
+
 def torch_linear_gated(group: tuple[torch.Tensor, ...], tokens: int) -> torch.Tensor:
     a, w, b, residual, gate, *_ = group
     projected = F.linear(a, w, b)
@@ -66,6 +72,18 @@ def torch_linear_gated(group: tuple[torch.Tensor, ...], tokens: int) -> torch.Te
 def tk_native_linear(group: tuple[torch.Tensor, ...]) -> torch.Tensor:
     a, w, b, _residual, _gate, native_out, *_ = group
     _C.gemm_linear_native(a, w, native_out, b)
+    return native_out
+
+
+def tk_native_linear_variant(group: tuple[torch.Tensor, ...], name: str) -> torch.Tensor:
+    a, w, b, _residual, _gate, native_out, *_ = group
+    getattr(_C, name)(a, w, native_out, b)
+    return native_out
+
+
+def tk_native_gelu_variant(group: tuple[torch.Tensor, ...], name: str) -> torch.Tensor:
+    a, w, b, _residual, _gate, native_out, _fused_out, preact, *_ = group
+    getattr(_C, name)(a, w, native_out, b, preact)
     return native_out
 
 
@@ -155,6 +173,37 @@ def tk_backward_db(group: tuple[torch.Tensor, ...]) -> torch.Tensor:
     return db
 
 
+def prepare_native_gelu(groups: list[tuple[torch.Tensor, ...]]) -> None:
+    for group in groups:
+        tk_native_gelu_variant(group, "gemm_custom_native")
+    torch.cuda.synchronize()
+
+
+def tk_gelu_bwd_bias_variant(group: tuple[torch.Tensor, ...], name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    preact = group[7]
+    grad_out = group[8]
+    dz = group[13]
+    db = group[11]
+    getattr(_linear_bwd_fused, name)(grad_out, preact, dz, db)
+    return dz, db
+
+
+def tk_gelu_bwd_dw_variant(group: tuple[torch.Tensor, ...], name: str) -> torch.Tensor:
+    x = group[0]
+    dz = group[13]
+    dw = group[10]
+    getattr(_linear_bwd_fused, name)(x, dz, dw)
+    return dw
+
+
+def tk_gelu_bwd_dx_variant(group: tuple[torch.Tensor, ...], name: str) -> torch.Tensor:
+    w = group[1]
+    dz = group[13]
+    dx = group[9]
+    getattr(_linear_bwd_fused, name)(dz, w.contiguous(), dx)
+    return dx
+
+
 def prepare_projected_and_dprojected(groups: list[tuple[torch.Tensor, ...]], tokens: int) -> None:
     for group in groups:
         tk_forward_projected(group, tokens)
@@ -214,6 +263,10 @@ def bench_one(
     flops = 2.0 * m * n * k
 
     compiled_linear: Callable[[tuple[torch.Tensor, ...]], torch.Tensor] = torch.compile(torch_linear, dynamic=False)
+    compiled_linear_gelu_train: Callable[[tuple[torch.Tensor, ...]], tuple[torch.Tensor, torch.Tensor]] = torch.compile(
+        torch_linear_gelu_train,
+        dynamic=False,
+    )
     compiled_linear_gated: Callable[[tuple[torch.Tensor, ...]], torch.Tensor] = torch.compile(
         lambda group: torch_linear_gated(group, tokens),
         dynamic=False,
@@ -222,9 +275,20 @@ def bench_one(
     for name, fn in (
         ("torch_linear", torch_linear),
         ("torch_compile_linear", compiled_linear),
+        ("torch_linear_gelu_train", torch_linear_gelu_train),
+        ("torch_compile_linear_gelu_train", compiled_linear_gelu_train),
         ("torch_linear_gated", lambda group: torch_linear_gated(group, tokens)),
         ("torch_compile_linear_gated", compiled_linear_gated),
         ("tk_native_linear", tk_native_linear),
+        ("tk_native_linear_m2n4s4", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n4s4")),
+        ("tk_native_linear_m2n4s16", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n4s16")),
+        ("tk_native_linear_m2n2s8", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n2s8")),
+        ("tk_native_linear_m1n4s8", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m1n4s8")),
+        ("tk_native_gelu", lambda group: tk_native_gelu_variant(group, "gemm_custom_native")),
+        ("tk_native_gelu_m2n4s4", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n4s4")),
+        ("tk_native_gelu_m2n4s16", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n4s16")),
+        ("tk_native_gelu_m2n2s8", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n2s8")),
+        ("tk_native_gelu_m1n4s8", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m1n4s8")),
         ("tk_fused_linear_gated", lambda group: tk_fused_linear_gated(group, tokens)),
         ("tk_fused_linear_gated_out", lambda group: tk_fused_linear_gated_out(group, tokens)),
     ):
@@ -245,17 +309,21 @@ def bench_one(
     out_ratio = results["torch_linear_gated"] / results["tk_fused_linear_gated_out"]
     compiled_fused_ratio = results["torch_compile_linear_gated"] / results["tk_fused_linear_gated"]
     compiled_out_ratio = results["torch_compile_linear_gated"] / results["tk_fused_linear_gated_out"]
+    gelu_ratio = results["torch_compile_linear_gelu_train"] / results["tk_native_gelu"]
     fused_vs_native = results["tk_native_linear"] / results["tk_fused_linear_gated"]
     out_vs_native = results["tk_native_linear"] / results["tk_fused_linear_gated_out"]
     print(
         f"RESULT {label}: torch={results['torch_linear']:.2f}us "
         f"torch_compile={results['torch_compile_linear']:.2f}us "
+        f"torch_compile_gelu_train={results['torch_compile_linear_gelu_train']:.2f}us "
         f"torch_gated={results['torch_linear_gated']:.2f}us "
         f"torch_compile_gated={results['torch_compile_linear_gated']:.2f}us "
         f"tk_native={results['tk_native_linear']:.2f}us "
+        f"tk_gelu={results['tk_native_gelu']:.2f}us "
         f"tk_fused={results['tk_fused_linear_gated']:.2f}us "
         f"tk_out_only={results['tk_fused_linear_gated_out']:.2f}us "
         f"native_vs_torch={native_ratio:.2f}x "
+        f"gelu_vs_compile_gelu_train={gelu_ratio:.2f}x "
         f"fused_vs_torch_gated={fused_ratio:.2f}x "
         f"out_vs_torch_gated={out_ratio:.2f}x "
         f"fused_vs_compile_gated={compiled_fused_ratio:.2f}x "
@@ -383,6 +451,68 @@ def bench_one_breakdown(
     return results
 
 
+def bench_one_gelu_bwd_breakdown(
+    label: str,
+    batch: int,
+    tokens: int,
+    k: int,
+    n: int,
+    warmup: int,
+    iters: int,
+) -> dict[str, float]:
+    m = batch * tokens
+    print(f"\n=== {label} gelu-bwd breakdown B={batch} T={tokens} M={m} N={n} K={k} ===", flush=True)
+    groups = make_groups(batch, tokens, k, n, 101000 + batch + tokens + k + n)
+    check_outputs(label, groups[0], tokens)
+    prepare_native_gelu(groups)
+
+    flops_gemm = 2.0 * m * n * k
+    results = {}
+    for name, fn, flops in (
+        ("gelu_bwd_bias", lambda group: tk_gelu_bwd_bias_variant(group, "gelu_bwd_bias"), 0.0),
+        ("gelu_bwd_bias_r512", lambda group: tk_gelu_bwd_bias_variant(group, "gelu_bwd_bias_r512"), 0.0),
+        ("gelu_bwd_bias_r2048", lambda group: tk_gelu_bwd_bias_variant(group, "gelu_bwd_bias_r2048"), 0.0),
+        ("gelu_bwd_bias_c32r1024", lambda group: tk_gelu_bwd_bias_variant(group, "gelu_bwd_bias_c32r1024"), 0.0),
+        ("dw_gemm", lambda group: tk_gelu_bwd_dw_variant(group, "dw_gemm"), flops_gemm),
+        ("dw_gemm_s4", lambda group: tk_gelu_bwd_dw_variant(group, "dw_gemm_s4"), flops_gemm),
+        ("dw_gemm_s16", lambda group: tk_gelu_bwd_dw_variant(group, "dw_gemm_s16"), flops_gemm),
+        ("dw_gemm_g120", lambda group: tk_gelu_bwd_dw_variant(group, "dw_gemm_g120"), flops_gemm),
+        ("dw_gemm_g132", lambda group: tk_gelu_bwd_dw_variant(group, "dw_gemm_g132"), flops_gemm),
+        ("dw_gemm_p3", lambda group: tk_gelu_bwd_dw_variant(group, "dw_gemm_p3"), flops_gemm),
+        ("dx_gemm_native", lambda group: tk_gelu_bwd_dx_variant(group, "dx_gemm_native"), flops_gemm),
+        ("dx_gemm_native_s4", lambda group: tk_gelu_bwd_dx_variant(group, "dx_gemm_native_s4"), flops_gemm),
+        ("dx_gemm_native_s16", lambda group: tk_gelu_bwd_dx_variant(group, "dx_gemm_native_s16"), flops_gemm),
+        ("dx_gemm_native_g120", lambda group: tk_gelu_bwd_dx_variant(group, "dx_gemm_native_g120"), flops_gemm),
+        ("dx_gemm_native_g132", lambda group: tk_gelu_bwd_dx_variant(group, "dx_gemm_native_g132"), flops_gemm),
+        ("dx_gemm_native_p3", lambda group: tk_gelu_bwd_dx_variant(group, "dx_gemm_native_p3"), flops_gemm),
+    ):
+        result = profile_groups(
+            f"{label} {name}",
+            groups,
+            fn,
+            warmup=warmup,
+            iters=iters,
+            cooldown_s=0.0,
+            flops=flops,
+        )
+        print_bench(result)
+        results[name] = result.us
+
+    best_gelu = min((v, k) for k, v in results.items() if k.startswith("gelu_bwd_bias"))
+    best_dw = min((v, k) for k, v in results.items() if k.startswith("dw_gemm"))
+    best_dx = min((v, k) for k, v in results.items() if k.startswith("dx_gemm_native"))
+    print(
+        f"RESULT {label} gelu_bwd_breakdown: "
+        f"best_gelu={best_gelu[1]}:{best_gelu[0]:.2f}us "
+        f"best_dw={best_dw[1]}:{best_dw[0]:.2f}us "
+        f"best_dx={best_dx[1]}:{best_dx[0]:.2f}us "
+        f"best_sum={best_gelu[0] + best_dw[0] + best_dx[0]:.2f}us "
+        f"default_sum={results['gelu_bwd_bias'] + results['dw_gemm'] + results['dx_gemm_native']:.2f}us",
+        flush=True,
+    )
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Profile TK GEMM against TK fused GEMM epilogue and torch linear.")
     parser.add_argument("--shapes", type=parse_shape_pair, nargs="+", default=[(64, 1024), (80, 1024), (16, 4096), (20, 4096)])
@@ -390,7 +520,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--cases", nargs="+", default=["fc2", "fc1", "qkv"], choices=["fc2", "fc1", "qkv"])
-    parser.add_argument("--bench", choices=["fwd", "fwd_bwd", "breakdown", "both"], default="fwd")
+    parser.add_argument("--bench", choices=["fwd", "fwd_bwd", "breakdown", "gelu_bwd_breakdown", "both"], default="fwd")
     args = parser.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -411,6 +541,8 @@ def main() -> None:
                 bench_one_fwd_bwd(case, batch, tokens, k, n, args.warmup, args.iters)
             if args.bench in ("breakdown", "both"):
                 bench_one_breakdown(case, batch, tokens, k, n, args.warmup, args.iters)
+            if args.bench in ("gelu_bwd_breakdown", "both"):
+                bench_one_gelu_bwd_breakdown(case, batch, tokens, k, n, args.warmup, args.iters)
 
 
 if __name__ == "__main__":

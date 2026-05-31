@@ -192,6 +192,75 @@ def _tk_dx_gemm_native_fake(grad_out, w, x_like):
     return torch.empty_like(x_like)
 
 
+@_register_custom_op("tk_dit::linear_native", mutates_args=())
+def tk_linear_native_op(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
+    _C.gemm_linear_native(flat.contiguous(), w.contiguous(), out, b.contiguous())
+    return out
+
+
+@tk_linear_native_op.register_fake
+def _tk_linear_native_fake(flat, w, b):
+    return torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
+
+
+def _tk_linear_native_setup(ctx, inputs, output) -> None:
+    flat, w, b = inputs
+    ctx.save_for_backward(flat, w, b)
+
+
+def _tk_linear_native_backward(ctx, grad_out):
+    flat, w, b = ctx.saved_tensors
+    grad = grad_out.contiguous()
+    dx = tk_dx_gemm_native_op(grad, w.contiguous(), flat)
+    dw = tk_dw_gemm_op(grad, flat, w)
+    db = tk_bias_reduce_op(grad)
+    return dx, dw, db.to(b.dtype)
+
+
+_register_autograd(
+    tk_linear_native_op,
+    _tk_linear_native_backward,
+    _tk_linear_native_setup,
+)
+
+
+@_register_custom_op("tk_dit::linear_gelu_native", mutates_args=())
+def tk_linear_gelu_native_op(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
+    preact = torch.empty_like(out)
+    _C.gemm_custom_native(flat.contiguous(), w.contiguous(), out, b.contiguous(), preact)
+    return out, preact
+
+
+@tk_linear_gelu_native_op.register_fake
+def _tk_linear_gelu_native_fake(flat, w, b):
+    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
+    return out, torch.empty_like(out)
+
+
+def _tk_linear_gelu_native_setup(ctx, inputs, output) -> None:
+    flat, w, b = inputs
+    _out, preact = output
+    ctx.save_for_backward(flat, w, b, preact)
+
+
+def _tk_linear_gelu_native_backward(ctx, grad_out, _grad_preact):
+    flat, w, b, preact = ctx.saved_tensors
+    grad = grad_out.contiguous()
+    dz, db = tk_gelu_bwd_bias_op(grad, preact)
+    dx = tk_dx_gemm_native_op(dz, w.contiguous(), flat)
+    dw = tk_dw_gemm_op(dz, flat, w)
+    return dx, dw, db.to(b.dtype)
+
+
+_register_autograd(
+    tk_linear_gelu_native_op,
+    _tk_linear_gelu_native_backward,
+    _tk_linear_gelu_native_setup,
+)
+
+
 @_register_custom_op("tk_dit::gated_residual_backward", mutates_args=())
 def tk_gated_residual_backward_op(
     grad: torch.Tensor,
@@ -422,6 +491,15 @@ def fused_adaln(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: 
     return FusedAdaLN.apply(x, shift, scale, eps)
 
 
+def tk_linear_native(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return tk_linear_native_op(flat.contiguous(), w.contiguous(), b.contiguous())
+
+
+def tk_linear_gelu_native(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out, _preact = tk_linear_gelu_native_op(flat.contiguous(), w.contiguous(), b.contiguous())
+    return out
+
+
 def can_use_ln_adaln_gemm(x: torch.Tensor, w: torch.Tensor) -> bool:
     rows = x.numel() // x.shape[-1]
     dim = x.shape[-1]
@@ -550,7 +628,7 @@ def fused_adaln_linear(
             eps,
         )
         return out.reshape(batch, tokens, linear.weight.shape[0])
-    return linear(fused_adaln(x, shift, scale, eps))
+    return torch.nn.functional.linear(fused_adaln(x, shift, scale, eps), linear.weight, linear.bias)
 
 
 def fused_adaln_linear_gelu(
@@ -560,7 +638,10 @@ def fused_adaln_linear_gelu(
     linear: nn.Linear,
     eps: float,
 ) -> torch.Tensor:
-    if can_use_ln_adaln_gemm(x, linear.weight):
+    out_features = linear.weight.shape[0]
+    in_features = x.shape[-1]
+    use_inline_gemm = can_use_ln_adaln_gemm(x, linear.weight) and out_features <= 2 * in_features
+    if use_inline_gemm:
         batch, tokens, dim = x.shape
         flat = x.reshape(batch * tokens, dim).contiguous()
         out, _, _, _ = tk_gemm_gelu_ln_adaln_op(
@@ -573,7 +654,12 @@ def fused_adaln_linear_gelu(
             eps,
         )
         return out.reshape(batch, tokens, linear.weight.shape[0])
-    return torch.nn.functional.gelu(linear(fused_adaln(x, shift, scale, eps)), approximate="tanh")
+    # For wide projections such as MLP fc1 (D -> 4D), applying AdaLN inside
+    # each GEMM output tile repeats the same input transform many times. We
+    # materialize AdaLN once, then keep GEMM+GELU on the custom TK path.
+    z = fused_adaln(x, shift, scale, eps).reshape(-1, in_features)
+    out = tk_linear_gelu_native(z, linear.weight, linear.bias)
+    return out.reshape(*x.shape[:-1], out_features)
 
 
 class FusedGatedResidual(torch.autograd.Function):
@@ -677,24 +763,17 @@ class TkGelu(torch.autograd.Function):
 class TkLinearGelu(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        x_c = x.contiguous()
-        out = torch.empty((x_c.shape[0], w.shape[0]), device=x.device, dtype=x.dtype)
-        preact = torch.empty_like(out)
-        _C.gemm_custom_native(x_c, w.contiguous(), out, b.contiguous(), preact)
-        ctx.save_for_backward(x_c, w, preact)
+        out, preact = tk_linear_gelu_native_op(x.contiguous(), w.contiguous(), b.contiguous())
+        ctx.save_for_backward(x.contiguous(), w, preact)
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         x, w, preact = ctx.saved_tensors
         grad_out = grad_out.contiguous()
-        dz = torch.empty_like(grad_out)
-        db = torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
-        _linear_bwd_fused.gelu_bwd_bias(grad_out, preact, dz, db)
-        dw = torch.empty_like(w)
-        dx = torch.empty_like(x)
-        _linear_bwd_fused.dw_gemm(dz, x, dw)
-        _linear_bwd_fused.dx_gemm_native(dz, w.contiguous(), dx)
+        dz, db = tk_gelu_bwd_bias_op(grad_out, preact)
+        dw = tk_dw_gemm_op(dz, x, w)
+        dx = tk_dx_gemm_native_op(dz, w.contiguous(), x)
         return dx, dw, db.to(grad_out.dtype)
 
 
@@ -703,20 +782,15 @@ class TkLinear(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         x_c = x.contiguous()
         ctx.save_for_backward(x_c, w)
-        out = torch.empty((x_c.shape[0], w.shape[0]), device=x.device, dtype=x.dtype)
-        _C.gemm_linear_native(x_c, w.contiguous(), out, b.contiguous())
-        return out
+        return tk_linear_native_op(x_c, w.contiguous(), b.contiguous())
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         x, w = ctx.saved_tensors
         grad_out = grad_out.contiguous()
-        dw = torch.empty_like(w)
-        dx = torch.empty_like(x)
-        _linear_bwd_fused.dw_gemm(grad_out, x, dw)
-        _linear_bwd_fused.dx_gemm_native(grad_out, w.contiguous(), dx)
-        db = torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
-        _linear_bwd_fused.bias_reduce(grad_out, db)
+        dw = tk_dw_gemm_op(grad_out, x, w)
+        dx = tk_dx_gemm_native_op(grad_out, w.contiguous(), x)
+        db = tk_bias_reduce_op(grad_out)
         return dx, dw, db.to(grad_out.dtype)
 
 
@@ -729,18 +803,14 @@ class TkMlp(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         flat = x.reshape(-1, shape[-1]).contiguous()
-        if flat.shape[0] >= 8192:
-            h = TkGelu.apply(torch.nn.functional.linear(flat, self.fc1.weight, self.fc1.bias))
-            out = torch.nn.functional.linear(h, self.fc2.weight, self.fc2.bias)
-            return out.reshape(shape)
-        h = TkLinearGelu.apply(flat, self.fc1.weight, self.fc1.bias)
-        out = TkLinear.apply(h, self.fc2.weight, self.fc2.bias)
+        h = tk_linear_gelu_native(flat, self.fc1.weight, self.fc1.bias)
+        out = tk_linear_native(h, self.fc2.weight, self.fc2.bias)
         return out.reshape(shape)
 
     def forward_from_adaln(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
         h = fused_adaln_linear_gelu(x, shift, scale, self.fc1, eps)
         shape = h.shape
-        out = TkLinear.apply(h.reshape(-1, shape[-1]).contiguous(), self.fc2.weight, self.fc2.bias)
+        out = tk_linear_native(h.reshape(-1, shape[-1]).contiguous(), self.fc2.weight, self.fc2.bias)
         return out.reshape(x.shape)
 
     def forward_from_adaln_residual(

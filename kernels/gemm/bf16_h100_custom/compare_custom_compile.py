@@ -92,6 +92,11 @@ def custom_ln_linear_gelu(x, shift, scale, w, b, eps):
     return out.reshape(batch, tokens, w.shape[0])
 
 
+def custom_materialized_ln_linear_gelu(x, shift, scale, w, b, eps):
+    h = fused_adaln_linear_gelu(x, shift, scale, _linear_from_tensors(w, b), eps)
+    return h
+
+
 def custom_linear_gated_residual(h, residual, gate, w, b):
     batch, tokens, _ = h.shape
     out, _ = tk_gemm_linear_gated_residual_op(
@@ -217,6 +222,14 @@ def detailed_correctness(batch: int, tokens: int, dim: int, eps: float) -> None:
             torch_ln_linear_gelu,
             custom_ln_linear_gelu,
             make_base(batch, tokens, dim, 4 * dim, 52000 + tokens + batch),
+            eps,
+            ("x", "shift", "scale", "w", "b"),
+        ),
+        (
+            "mlp_fc1_materialized_adaln_linear_gelu",
+            torch_ln_linear_gelu,
+            custom_materialized_ln_linear_gelu,
+            make_base(batch, tokens, dim, 4 * dim, 52500 + tokens + batch),
             eps,
             ("x", "shift", "scale", "w", "b"),
         ),
@@ -387,6 +400,16 @@ def run_shape_cases(batch: int, tokens: int, dim: int, warmup: int, iters: int, 
             warmup,
             iters,
         )
+    if "fc1_materialized_gelu" in cases:
+        compare_case(
+            "mlp_fc1_materialized_adaln_linear_gelu",
+            torch_ln_linear_gelu,
+            custom_materialized_ln_linear_gelu,
+            make_base(batch, tokens, dim, 4 * dim, 2500 + tokens),
+            eps,
+            warmup,
+            iters,
+        )
     if "post_residual" in cases:
         compare_case(
             "post_linear_gated_residual",
@@ -472,6 +495,7 @@ def main() -> None:
         choices=[
             "pre_qkv",
             "fc1_gelu",
+            "fc1_materialized_gelu",
             "post_residual",
             "post_residual_epilogue",
             "gated_residual",

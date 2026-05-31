@@ -72,8 +72,8 @@ template<kittens::ducks::sv::all SV> __device__ static inline void init_bias(rt_
     }
 }
 
-__device__ static inline void apply_gelu(rt_fl<16, 256> &acc) {
-    // rt_fl<16, 256>: height=1 (16/16), width=16 (256/16), 4 float2 per tile
+template<int WIDTH>
+__device__ static inline void apply_gelu(rt_fl<16, WIDTH> &acc) {
     #pragma unroll
     for(int i = 0; i < acc.width; i++) {
         #pragma unroll
@@ -788,7 +788,7 @@ __global__ __launch_bounds__(512, 2) void layernorm_adaln_param_backward_k1024_c
     int tokens_per_sample
 ) {
     constexpr int K = 1024;
-    constexpr int COLS = 16;
+    constexpr int COLS = 32;
     constexpr int TOK_THREADS = 16;
     __shared__ float shift_sums[TOK_THREADS][COLS];
     __shared__ float scale_sums[TOK_THREADS][COLS];
@@ -1955,14 +1955,15 @@ void gemm_custom_entrypoint(
     prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
 }
 
-void gemm_custom_native_entrypoint(
+template<int M_BLOCK, int N_BLOCK, int SUPER_M>
+void gemm_custom_native_variant_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
     const at::Tensor &C,
     const at::Tensor &bias,
     const at::Tensor &preact
 ) {
-    using mmt = native_matmul_template<2,4,8>;
+    using mmt = native_matmul_template<M_BLOCK, N_BLOCK, SUPER_M>;
     using globals = typename mmt::layout::globals;
     using global_layout = typename mmt::layout::global_layout;
     using bias_global = typename mmt::layout::bias_global;
@@ -1992,13 +1993,24 @@ void gemm_custom_native_entrypoint(
     prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
 }
 
-void gemm_linear_native_entrypoint(
+void gemm_custom_native_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias,
+    const at::Tensor &preact
+) {
+    gemm_custom_native_variant_entrypoint<2, 4, 8>(A, B, C, bias, preact);
+}
+
+template<int M_BLOCK, int N_BLOCK, int SUPER_M>
+void gemm_linear_native_variant_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
     const at::Tensor &C,
     const at::Tensor &bias
 ) {
-    using mmt = native_linear_template<2,4,8>;
+    using mmt = native_linear_template<M_BLOCK, N_BLOCK, SUPER_M>;
     using globals = typename mmt::layout::globals;
     using global_layout = typename mmt::layout::global_layout;
     using bias_global = typename mmt::layout::bias_global;
@@ -2026,6 +2038,15 @@ void gemm_linear_native_entrypoint(
     cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
     prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
+void gemm_linear_native_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias
+) {
+    gemm_linear_native_variant_entrypoint<2, 4, 8>(A, B, C, bias);
 }
 
 void gemm_linear_gated_residual_entrypoint(
@@ -2875,7 +2896,15 @@ void gemm_custom_adaln_entrypoint(
 PYBIND11_MODULE(_C, m) {
     m.def("gemm_custom", &gemm_custom_entrypoint);
     m.def("gemm_custom_native", &gemm_custom_native_entrypoint);
+    m.def("gemm_custom_native_m2n4s4", &gemm_custom_native_variant_entrypoint<2,4,4>);
+    m.def("gemm_custom_native_m2n4s16", &gemm_custom_native_variant_entrypoint<2,4,16>);
+    m.def("gemm_custom_native_m2n2s8", &gemm_custom_native_variant_entrypoint<2,2,8>);
+    m.def("gemm_custom_native_m1n4s8", &gemm_custom_native_variant_entrypoint<1,4,8>);
     m.def("gemm_linear_native", &gemm_linear_native_entrypoint);
+    m.def("gemm_linear_native_m2n4s4", &gemm_linear_native_variant_entrypoint<2,4,4>);
+    m.def("gemm_linear_native_m2n4s16", &gemm_linear_native_variant_entrypoint<2,4,16>);
+    m.def("gemm_linear_native_m2n2s8", &gemm_linear_native_variant_entrypoint<2,2,8>);
+    m.def("gemm_linear_native_m1n4s8", &gemm_linear_native_variant_entrypoint<1,4,8>);
     m.def("gemm_linear_gated_residual", &gemm_linear_gated_residual_entrypoint);
     m.def("gemm_linear_gated_residual_out", &gemm_linear_gated_residual_out_entrypoint);
     m.def("adaln_modulate", &adaln_modulate_entrypoint);

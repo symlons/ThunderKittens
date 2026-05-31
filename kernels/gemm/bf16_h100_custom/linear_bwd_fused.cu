@@ -66,10 +66,6 @@ void launch_gelu_bwd(
     gelu_bwd_kernel<<<blocks, 256, 0, stream>>>(dz, dy, preact, count);
 }
 
-constexpr int GELU_BWD_BIAS_COLS = 16;
-constexpr int GELU_BWD_BIAS_ROW_THREADS = 16;
-constexpr int GELU_BWD_BIAS_ROWS_PER_BLOCK = 256;
-
 __device__ static inline float gelu_tanh_grad(float x) {
     float x2 = x * x;
     float a = 0.79788456f * x * (1.f + 0.044715f * x2);
@@ -79,6 +75,7 @@ __device__ static inline float gelu_tanh_grad(float x) {
     return 0.5f * (1.f + t) + 0.5f * x * s2 * 0.79788456f * (1.f + 3.f * 0.044715f * x2);
 }
 
+template<int COLS, int ROW_THREADS, int ROWS_PER_BLOCK>
 __global__ void gelu_bwd_bias_fused_kernel(
     __nv_bfloat16 *__restrict__ dz,
     float *__restrict__ dbias,
@@ -87,15 +84,15 @@ __global__ void gelu_bwd_bias_fused_kernel(
     int M,
     int N
 ) {
-    __shared__ float sums[GELU_BWD_BIAS_ROW_THREADS][GELU_BWD_BIAS_COLS];
-    int col = blockIdx.x * GELU_BWD_BIAS_COLS + threadIdx.x;
-    int row_start = blockIdx.y * GELU_BWD_BIAS_ROWS_PER_BLOCK;
-    int row_end = min(row_start + GELU_BWD_BIAS_ROWS_PER_BLOCK, M);
+    __shared__ float sums[ROW_THREADS][COLS];
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int row_start = blockIdx.y * ROWS_PER_BLOCK;
+    int row_end = min(row_start + ROWS_PER_BLOCK, M);
     int ty = threadIdx.y;
 
     float acc = 0.f;
     if (col < N) {
-        for (int row = row_start + ty; row < row_end; row += GELU_BWD_BIAS_ROW_THREADS) {
+        for (int row = row_start + ty; row < row_end; row += ROW_THREADS) {
             size_t idx = size_t(row) * N + col;
             float x = __bfloat162float(preact[idx]);
             float g = __bfloat162float(dy[idx]);
@@ -110,7 +107,7 @@ __global__ void gelu_bwd_bias_fused_kernel(
     if (ty == 0 && col < N) {
         float total = 0.f;
         #pragma unroll
-        for (int i = 0; i < GELU_BWD_BIAS_ROW_THREADS; i++) {
+        for (int i = 0; i < ROW_THREADS; i++) {
             total += sums[i][threadIdx.x];
         }
         atomicAdd(&dbias[col], total);
@@ -133,7 +130,7 @@ struct dw_gemm_layout {
     struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> accum; };
 };
 
-template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _PIPE_STAGES=4>
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _PIPE_STAGES=4, int _GRID_BLOCKS=128>
 struct dw_gemm_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
     using layout    = dw_gemm_layout<M_BLOCK, N_BLOCK>;
@@ -141,7 +138,7 @@ struct dw_gemm_template {
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=_PIPE_STAGES, PRODUCER_BARRIER_ARRIVALS=1;
 
     template<bool PERSISTENT_GRID=true> __host__ static inline dim3 grid(int K, int N, int M) {
-        return dim3(PERSISTENT_GRID ? 128 : K*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        return dim3(PERSISTENT_GRID ? _GRID_BLOCKS : K*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
@@ -239,14 +236,14 @@ struct dx_gemm_layout {
     struct consumer_state { rt_fl<16, N_BLOCK*base_tile::cols> accum; };
 };
 
-template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _PIPE_STAGES=4>
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _PIPE_STAGES=4, int _GRID_BLOCKS=128>
 struct dx_gemm_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
     using layout    = dx_gemm_layout<M_BLOCK, N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=_PIPE_STAGES, PRODUCER_BARRIER_ARRIVALS=1;
 
     template<bool PERSISTENT_GRID=true> __host__ static inline dim3 grid(int M, int K, int N) {
-        return dim3(PERSISTENT_GRID ? 128 : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        return dim3(PERSISTENT_GRID ? _GRID_BLOCKS : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
@@ -327,7 +324,7 @@ struct dx_gemm_template {
 //   dz[M,N], W[N,K] -> dx[M,K], where W is [out_features, in_features]
 // ============================================================
 
-template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _PIPE_STAGES=4>
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12, int _PIPE_STAGES=4, int _GRID_BLOCKS=128>
 struct dx_native_gemm_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
     using layout    = dx_gemm_layout<M_BLOCK, N_BLOCK>;
@@ -335,7 +332,7 @@ struct dx_native_gemm_template {
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=_PIPE_STAGES, PRODUCER_BARRIER_ARRIVALS=1;
 
     template<bool PERSISTENT_GRID=true> __host__ static inline dim3 grid(int M, int K, int N) {
-        return dim3(PERSISTENT_GRID ? 128 : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        return dim3(PERSISTENT_GRID ? _GRID_BLOCKS : M*K/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
     }
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
@@ -449,10 +446,38 @@ void gelu_bwd_bias_entrypoint(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     cudaMemsetAsync(dbias.data_ptr(), 0, N * sizeof(float), stream);
-    dim3 block(GELU_BWD_BIAS_COLS, GELU_BWD_BIAS_ROW_THREADS);
-    dim3 grid((N + GELU_BWD_BIAS_COLS - 1) / GELU_BWD_BIAS_COLS,
-              (M + GELU_BWD_BIAS_ROWS_PER_BLOCK - 1) / GELU_BWD_BIAS_ROWS_PER_BLOCK);
-    gelu_bwd_bias_fused_kernel<<<grid, block, 0, stream>>>(
+    constexpr int COLS = 32;
+    constexpr int ROW_THREADS = 8;
+    constexpr int ROWS_PER_BLOCK = 1024;
+    dim3 block(COLS, ROW_THREADS);
+    dim3 grid((N + COLS - 1) / COLS,
+              (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    gelu_bwd_bias_fused_kernel<COLS, ROW_THREADS, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(dz.data_ptr()),
+        reinterpret_cast<float*>(dbias.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(preact.data_ptr()),
+        M,
+        N
+    );
+}
+
+template<int COLS, int ROW_THREADS, int ROWS_PER_BLOCK>
+void gelu_bwd_bias_variant_entrypoint(
+    const at::Tensor &dy,
+    const at::Tensor &preact,
+    const at::Tensor &dz,
+    const at::Tensor &dbias
+) {
+    TORCH_CHECK(dy.is_cuda() && preact.is_cuda() && dz.is_cuda() && dbias.is_cuda());
+    int M = dy.size(0), N = dy.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cudaMemsetAsync(dbias.data_ptr(), 0, N * sizeof(float), stream);
+    dim3 block(COLS, ROW_THREADS);
+    dim3 grid((N + COLS - 1) / COLS,
+              (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    gelu_bwd_bias_fused_kernel<COLS, ROW_THREADS, ROWS_PER_BLOCK><<<grid, block, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(dz.data_ptr()),
         reinterpret_cast<float*>(dbias.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(dy.data_ptr()),
@@ -488,7 +513,33 @@ void dw_gemm_entrypoint(
     const at::Tensor &dz,
     const at::Tensor &dW
 ) {
-    using mmt = dw_gemm_template<2, 4, 8>;
+    using mmt = dw_gemm_template<2, 4, 4, 4, 128>;
+    using global_layout = typename mmt::layout::global_layout;
+    using globals = typename mmt::layout::globals;
+
+    int M = x.size(0), K = x.size(1), N = dz.size(1);
+
+    global_layout Xg  = kittens::py::tensor_to_gl<global_layout>(x);
+    global_layout DZg = kittens::py::tensor_to_gl<global_layout>(dz);
+    global_layout DWg = kittens::py::tensor_to_gl<global_layout>(dW);
+    globals G{Xg, DZg, DWg};
+
+    dim3 grid = mmt::grid(K, N, M);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
+template<int M_BLOCK, int N_BLOCK, int SUPER_M, int PIPE_STAGES, int GRID_BLOCKS>
+void dw_gemm_variant_entrypoint(
+    const at::Tensor &x,
+    const at::Tensor &dz,
+    const at::Tensor &dW
+) {
+    using mmt = dw_gemm_template<M_BLOCK, N_BLOCK, SUPER_M, PIPE_STAGES, GRID_BLOCKS>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 
@@ -513,7 +564,7 @@ void dx_gemm_entrypoint(
     const at::Tensor &W,
     const at::Tensor &dx
 ) {
-    using mmt = dx_gemm_template<2, 4, 8>;
+    using mmt = dx_gemm_template<2, 4, 8, 4, 128>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 
@@ -538,7 +589,33 @@ void dx_gemm_native_entrypoint(
     const at::Tensor &W,
     const at::Tensor &dx
 ) {
-    using mmt = dx_native_gemm_template<2, 4, 8>;
+    using mmt = dx_native_gemm_template<2, 4, 8, 4, 128>;
+    using global_layout = typename mmt::layout::global_layout;
+    using globals = typename mmt::layout::globals;
+
+    int M = dz.size(0), N = dz.size(1), K = W.size(1);
+
+    global_layout DZg = kittens::py::tensor_to_gl<global_layout>(dz);
+    global_layout Wg  = kittens::py::tensor_to_gl<global_layout>(W);
+    global_layout DXg = kittens::py::tensor_to_gl<global_layout>(dx);
+    globals G{DZg, Wg, DXg};
+
+    dim3 grid = mmt::grid(M, K, N);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
+template<int M_BLOCK, int N_BLOCK, int SUPER_M, int PIPE_STAGES, int GRID_BLOCKS>
+void dx_gemm_native_variant_entrypoint(
+    const at::Tensor &dz,
+    const at::Tensor &W,
+    const at::Tensor &dx
+) {
+    using mmt = dx_native_gemm_template<M_BLOCK, N_BLOCK, SUPER_M, PIPE_STAGES, GRID_BLOCKS>;
     using global_layout = typename mmt::layout::global_layout;
     using globals = typename mmt::layout::globals;
 
@@ -560,9 +637,22 @@ void dx_gemm_native_entrypoint(
 
 PYBIND11_MODULE(_linear_bwd_fused, m) {
     m.def("gelu_bwd_bias", &gelu_bwd_bias_entrypoint);
+    m.def("gelu_bwd_bias_r512", &gelu_bwd_bias_variant_entrypoint<16,16,512>);
+    m.def("gelu_bwd_bias_r2048", &gelu_bwd_bias_variant_entrypoint<16,16,2048>);
+    m.def("gelu_bwd_bias_c32r1024", &gelu_bwd_bias_variant_entrypoint<32,8,1024>);
     m.def("bias_reduce", &bias_reduce_entrypoint);
     m.def("dw_gemm", &dw_gemm_entrypoint);
+    m.def("dw_gemm_s4", &dw_gemm_variant_entrypoint<2,4,4,4,128>);
+    m.def("dw_gemm_s16", &dw_gemm_variant_entrypoint<2,4,16,4,128>);
+    m.def("dw_gemm_g120", &dw_gemm_variant_entrypoint<2,4,8,4,120>);
+    m.def("dw_gemm_g132", &dw_gemm_variant_entrypoint<2,4,8,4,132>);
+    m.def("dw_gemm_p3", &dw_gemm_variant_entrypoint<2,4,8,3,128>);
     m.def("dx_gemm", &dx_gemm_entrypoint);
     m.def("dx_gemm_native", &dx_gemm_native_entrypoint);
+    m.def("dx_gemm_native_s4", &dx_gemm_native_variant_entrypoint<2,4,4,4,128>);
+    m.def("dx_gemm_native_s16", &dx_gemm_native_variant_entrypoint<2,4,16,4,128>);
+    m.def("dx_gemm_native_g120", &dx_gemm_native_variant_entrypoint<2,4,8,4,120>);
+    m.def("dx_gemm_native_g132", &dx_gemm_native_variant_entrypoint<2,4,8,4,132>);
+    m.def("dx_gemm_native_p3", &dx_gemm_native_variant_entrypoint<2,4,8,3,128>);
 }
 #endif
