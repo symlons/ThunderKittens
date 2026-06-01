@@ -728,6 +728,87 @@ __global__ __launch_bounds__(128, 4) void layernorm_adaln_backward_k1024_warp4_k
     }
 }
 
+__global__ __launch_bounds__(256, 2) void layernorm_adaln_backward_k4096_vec2_kernel(
+    bf16 *__restrict__ dx,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ x,
+    const bf16 *__restrict__ scale,
+    const float *__restrict__ mean,
+    const float *__restrict__ rstd,
+    int tokens_per_sample
+) {
+    constexpr int K = 4096;
+    constexpr int K2 = K / 2;
+    using bf16_2 = __nv_bfloat162;
+    __shared__ float2 warp_sums[8];
+    __shared__ float2 total_sums;
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int batch = row / tokens_per_sample;
+    float m = mean[row];
+    float rs = rstd[row];
+    size_t pair_base = size_t(row) * K2;
+    size_t param_pair_base = size_t(batch) * K2;
+    const bf16_2 *__restrict__ x2 = reinterpret_cast<const bf16_2*>(x);
+    const bf16_2 *__restrict__ grad2 = reinterpret_cast<const bf16_2*>(grad);
+    const bf16_2 *__restrict__ scale2 = reinterpret_cast<const bf16_2*>(scale);
+    bf16_2 *__restrict__ dx2 = reinterpret_cast<bf16_2*>(dx);
+
+    float2 sums = make_float2(0.0f, 0.0f);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int pair_col = tid + j * 256;
+        size_t pair_idx = pair_base + pair_col;
+        float2 xv = __bfloat1622float2(x2[pair_idx]);
+        float2 gv = __bfloat1622float2(grad2[pair_idx]);
+        float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
+        float xhat_x = (xv.x - m) * rs;
+        float xhat_y = (xv.y - m) * rs;
+        float dnorm_x = gv.x * (1.0f + sc.x);
+        float dnorm_y = gv.y * (1.0f + sc.y);
+        sums.x += dnorm_x + dnorm_y;
+        sums.y += dnorm_x * xhat_x + dnorm_y * xhat_y;
+    }
+    sums.x = warp_sum_float(sums.x);
+    sums.y = warp_sum_float(sums.y);
+    if (lane == 0) {
+        warp_sums[warp] = sums;
+    }
+    __syncthreads();
+
+    sums = tid < 8 ? warp_sums[lane] : make_float2(0.0f, 0.0f);
+    if (warp == 0) {
+        sums.x = warp_sum_float(sums.x);
+        sums.y = warp_sum_float(sums.y);
+    }
+    if (tid == 0) {
+        total_sums = sums;
+    }
+    __syncthreads();
+    float s1 = total_sums.x;
+    float s2 = total_sums.y;
+
+    constexpr float inv_k = 1.0f / K;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int pair_col = tid + j * 256;
+        size_t pair_idx = pair_base + pair_col;
+        float2 xv = __bfloat1622float2(x2[pair_idx]);
+        float2 gv = __bfloat1622float2(grad2[pair_idx]);
+        float2 sc = __bfloat1622float2(scale2[param_pair_base + pair_col]);
+        float xhat_x = (xv.x - m) * rs;
+        float xhat_y = (xv.y - m) * rs;
+        float dnorm_x = gv.x * (1.0f + sc.x);
+        float dnorm_y = gv.y * (1.0f + sc.y);
+        float dx_x = (dnorm_x - s1 * inv_k - xhat_x * s2 * inv_k) * rs;
+        float dx_y = (dnorm_y - s1 * inv_k - xhat_y * s2 * inv_k) * rs;
+        dx2[pair_idx] = __floats2bfloat162_rn(dx_x, dx_y);
+    }
+}
+
 __global__ void layernorm_adaln_param_backward_kernel(
     float *__restrict__ dshift,
     float *__restrict__ dscale,
@@ -872,6 +953,39 @@ __global__ __launch_bounds__(512, 2) void layernorm_adaln_param_backward_k1024_c
         dshift[batch * K + col] = ds;
         dscale[batch * K + col] = dc;
     }
+}
+
+__global__ __launch_bounds__(128, 4) void layernorm_adaln_param_backward_tok16_cols128_kernel(
+    float *__restrict__ dshift,
+    float *__restrict__ dscale,
+    const bf16 *__restrict__ grad,
+    const bf16 *__restrict__ x,
+    const float *__restrict__ mean,
+    const float *__restrict__ rstd,
+    int K
+) {
+    constexpr int TOKENS = 16;
+    constexpr int COLS = 128;
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int batch = blockIdx.y;
+    if (col >= K) {
+        return;
+    }
+
+    int row_base = batch * TOKENS;
+    float shift_acc = 0.0f;
+    float scale_acc = 0.0f;
+    #pragma unroll
+    for (int tok = 0; tok < TOKENS; tok++) {
+        int row = row_base + tok;
+        size_t idx = size_t(row) * K + col;
+        float xhat = (__bfloat162float(x[idx]) - mean[row]) * rstd[row];
+        float g = __bfloat162float(grad[idx]);
+        shift_acc += g;
+        scale_acc += g * xhat;
+    }
+    dshift[batch * K + col] = shift_acc;
+    dscale[batch * K + col] = scale_acc;
 }
 
 __global__ void adaln_modulate_backward_kernel(
@@ -2969,20 +3083,55 @@ void layernorm_adaln_backward_entrypoint(
     TORCH_CHECK(M == batch * tokens_per_sample);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    int threads = 256;
-    int smem = threads * 2 * sizeof(float);
-    layernorm_adaln_backward_kernel<<<M, threads, smem, stream>>>(
-        reinterpret_cast<bf16*>(dA.data_ptr()),
-        reinterpret_cast<const bf16*>(grad.data_ptr()),
-        reinterpret_cast<const bf16*>(A.data_ptr()),
-        reinterpret_cast<const bf16*>(scale.data_ptr()),
-        reinterpret_cast<const float*>(mean.data_ptr()),
-        reinterpret_cast<const float*>(rstd.data_ptr()),
-        M,
-        K,
-        static_cast<int>(tokens_per_sample)
-    );
     if (K == 1024) {
+        layernorm_adaln_backward_k1024_warp4_kernel<<<(M + 3) / 4, 128, 0, stream>>>(
+            reinterpret_cast<bf16*>(dA.data_ptr()),
+            reinterpret_cast<const bf16*>(grad.data_ptr()),
+            reinterpret_cast<const bf16*>(A.data_ptr()),
+            reinterpret_cast<const bf16*>(scale.data_ptr()),
+            reinterpret_cast<const float*>(mean.data_ptr()),
+            reinterpret_cast<const float*>(rstd.data_ptr()),
+            M,
+            static_cast<int>(tokens_per_sample)
+        );
+    } else if (K == 4096) {
+        layernorm_adaln_backward_k4096_vec2_kernel<<<M, 256, 0, stream>>>(
+            reinterpret_cast<bf16*>(dA.data_ptr()),
+            reinterpret_cast<const bf16*>(grad.data_ptr()),
+            reinterpret_cast<const bf16*>(A.data_ptr()),
+            reinterpret_cast<const bf16*>(scale.data_ptr()),
+            reinterpret_cast<const float*>(mean.data_ptr()),
+            reinterpret_cast<const float*>(rstd.data_ptr()),
+            static_cast<int>(tokens_per_sample)
+        );
+    } else {
+        int threads = 256;
+        int smem = threads * 2 * sizeof(float);
+        layernorm_adaln_backward_kernel<<<M, threads, smem, stream>>>(
+            reinterpret_cast<bf16*>(dA.data_ptr()),
+            reinterpret_cast<const bf16*>(grad.data_ptr()),
+            reinterpret_cast<const bf16*>(A.data_ptr()),
+            reinterpret_cast<const bf16*>(scale.data_ptr()),
+            reinterpret_cast<const float*>(mean.data_ptr()),
+            reinterpret_cast<const float*>(rstd.data_ptr()),
+            M,
+            K,
+            static_cast<int>(tokens_per_sample)
+        );
+    }
+    if (tokens_per_sample == 16) {
+        dim3 param_block(128);
+        dim3 param_grid((K + param_block.x - 1) / param_block.x, batch);
+        layernorm_adaln_param_backward_tok16_cols128_kernel<<<param_grid, param_block, 0, stream>>>(
+            reinterpret_cast<float*>(dshift.data_ptr()),
+            reinterpret_cast<float*>(dscale.data_ptr()),
+            reinterpret_cast<const bf16*>(grad.data_ptr()),
+            reinterpret_cast<const bf16*>(A.data_ptr()),
+            reinterpret_cast<const float*>(mean.data_ptr()),
+            reinterpret_cast<const float*>(rstd.data_ptr()),
+            K
+        );
+    } else if (K == 1024) {
         if (tokens_per_sample >= 2048) {
             dim3 param_block(16, 32);
             dim3 param_grid(1024 / param_block.x, batch);

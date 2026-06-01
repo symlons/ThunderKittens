@@ -517,22 +517,24 @@ def benchmark_big_adaln_case(batch: int, tokens: int, dim: int, eps: float, labe
     return results
 
 
+BIG_ADALN_CASES = [
+    (2048, 16, 1024, "D1024-B2048T16"),
+    (4096, 16, 1024, "D1024-B4096T16"),
+    (8192, 16, 1024, "D1024-B8192T16"),
+    (1024, 16, 4096, "D4096-B1024T16"),
+    (2048, 16, 4096, "D4096-B2048T16"),
+    (4096, 16, 4096, "D4096-B4096T16"),
+    (8192, 16, 4096, "D4096-B8192T16"),
+]
+
+
 def benchmark_big_adaln_suite() -> list[BenchResult]:
     print(
         "\nBig AdaLN bandwidth recipe: uniform BF16 inputs, one naturally cold large input group, "
         "500 warmups, 100 measured back-to-back launches, two CUDA events, cooldown between kernels."
     )
-    cases = [
-        (2048, 16, 1024, "D1024-B2048T16"),
-        (4096, 16, 1024, "D1024-B4096T16"),
-        (8192, 16, 1024, "D1024-B8192T16"),
-        (1024, 16, 4096, "D4096-B1024T16"),
-        (2048, 16, 4096, "D4096-B2048T16"),
-        (4096, 16, 4096, "D4096-B4096T16"),
-        (8192, 16, 4096, "D4096-B8192T16"),
-    ]
     results: list[BenchResult] = []
-    for batch, tokens, dim, label in cases:
+    for batch, tokens, dim, label in BIG_ADALN_CASES:
         results.extend(benchmark_big_adaln_case(batch, tokens, dim, 1e-6, label))
     fwd = [r for r in results if "forward" in r.name]
     bwd = [r for r in results if "backward" in r.name]
@@ -551,6 +553,30 @@ def compile_fn(fn):
     except Exception as exc:
         print(f"torch.compile unavailable for {getattr(fn, '__name__', repr(fn))}: {exc!r}")
         return None
+
+
+def _find_result(results: list[BenchResult], name: str) -> BenchResult | None:
+    for result in results:
+        if result.name == name:
+            return result
+    return None
+
+
+def print_tk_compile_speedups(results: list[BenchResult], label: str, prefix: str = "adaln") -> None:
+    pairs = [
+        ("forward", f"{label} {prefix} compile forward", f"{label} {prefix} tk forward"),
+        ("backward", f"{label} {prefix} compile backward", f"{label} {prefix} tk backward"),
+    ]
+    for kind, compile_name, tk_name in pairs:
+        compile_result = _find_result(results, compile_name)
+        tk_result = _find_result(results, tk_name)
+        if compile_result is None or tk_result is None:
+            continue
+        print(
+            f"{label} {prefix} TK vs torch.compile {kind}: "
+            f"{compile_result.us / tk_result.us:.2f}x "
+            f"(compile {compile_result.us:.2f} us, TK {tk_result.us:.2f} us)"
+        )
 
 
 def benchmark_adaln_compile_case(batch: int, tokens: int, dim: int, eps: float, label: str) -> list[BenchResult]:
@@ -627,6 +653,75 @@ def benchmark_adaln_compile_case(batch: int, tokens: int, dim: int, eps: float, 
     ))
     for result in results:
         print_bench(result)
+    print_tk_compile_speedups(results, label)
+    return results
+
+
+def benchmark_big_adaln_compile_case(batch: int, tokens: int, dim: int, eps: float, label: str) -> list[BenchResult]:
+    m = batch * tokens
+    x = uniform_bf16((m, dim), 41000, -2.0, 2.0)
+    shift = uniform_bf16((batch, dim), 41001, -0.5, 0.5)
+    scale = uniform_bf16((batch, dim), 41002, -0.25, 0.25)
+    grad = uniform_bf16((m, dim), 41003, -1.0, 1.0)
+    _, mean, rstd = run_fused_forward(x, shift, scale, tokens, eps)
+    group = [(x, shift, scale, grad, mean, rstd)]
+
+    compiled_forward = compile_fn(lambda x, shift, scale: pytorch_forward(x, shift, scale, tokens, eps))
+    compiled_backward = compile_fn(lambda grad, x, scale, mean, rstd: reference_backward(grad, x, scale, mean, rstd, tokens))
+
+    bytes_forward = m * dim * 2 * 2 + batch * dim * 2 * 2 + m * 4 * 2
+    bytes_backward = m * dim * 2 * 4 + batch * dim * 2 + m * 4 * 2 + batch * dim * 4 * 2
+
+    print(f"\nBig AdaLN compile comparison ({label}): batch={batch} tokens={tokens} dim={dim}; elements={m * dim:,}")
+    results: list[BenchResult] = []
+    if compiled_forward is not None:
+        results.append(profile_groups(
+            f"{label} big_adaln compile forward",
+            group,
+            lambda g: compiled_forward(g[0], g[1], g[2]),
+            warmup=5,
+            iters=20,
+            bytes_moved=bytes_forward,
+        ))
+    results.append(profile_groups(
+        f"{label} big_adaln tk forward",
+        group,
+        lambda g: run_fused_forward(g[0], g[1], g[2], tokens, eps),
+        warmup=100,
+        iters=20,
+        bytes_moved=bytes_forward,
+    ))
+    if compiled_backward is not None:
+        results.append(profile_groups(
+            f"{label} big_adaln compile backward",
+            group,
+            lambda g: compiled_backward(g[3], g[0], g[2], g[4], g[5]),
+            warmup=5,
+            iters=20,
+            bytes_moved=bytes_backward,
+        ))
+    results.append(profile_groups(
+        f"{label} big_adaln tk backward",
+        group,
+        lambda g: run_fused_backward(g[3], g[0], g[2], g[4], g[5], tokens),
+        warmup=100,
+        iters=20,
+        bytes_moved=bytes_backward,
+    ))
+    for result in results:
+        print_bench(result)
+    print_tk_compile_speedups(results, label, "big_adaln")
+    return results
+
+
+def benchmark_big_adaln_compile_suite() -> list[BenchResult]:
+    print(
+        "\nBig AdaLN torch.compile / TK comparison: same large shapes as big_adaln, "
+        "compile first-use excluded by warmup, CUDA event timing."
+    )
+    results: list[BenchResult] = []
+    for batch, tokens, dim, label in BIG_ADALN_CASES:
+        results.extend(benchmark_big_adaln_compile_case(batch, tokens, dim, 1e-6, label))
     return results
 
 
@@ -1337,6 +1432,35 @@ def benchmark_mlp_suite(tokens_filter: int | None = None) -> list[BenchResult]:
     return results
 
 
+def benchmark_adaln_long_compile_suite() -> list[BenchResult]:
+    print(
+        "\nLong-token AdaLN eager / torch.compile / TK comparison: D=1024, "
+        "tokens up to 4096, batches up to 256."
+    )
+    cases = [
+        (16, 256), (64, 256), (256, 256),
+        (16, 512), (64, 512), (256, 512),
+        (16, 1024), (64, 1024), (256, 1024),
+        (16, 2048), (64, 2048), (256, 2048),
+        (16, 4096), (64, 4096), (256, 4096),
+    ]
+    results: list[BenchResult] = []
+    for batch, tokens in cases:
+        label = f"L-D1024-B{batch}-T{tokens}"
+        try:
+            results.extend(benchmark_adaln_compile_case(batch, tokens, 1024, 1e-6, label))
+        except torch.cuda.OutOfMemoryError as exc:
+            print(f"\n{label}: SKIP OOM ({exc})")
+            torch.cuda.empty_cache()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(f"\n{label}: SKIP OOM ({exc})")
+                torch.cuda.empty_cache()
+            else:
+                raise
+    return results
+
+
 def benchmark_compile_suite() -> list[BenchResult]:
     print(
         "\nTorch eager / torch.compile / TK comparison: uniform BF16 inputs, natural L2 eviction via input groups, "
@@ -1365,6 +1489,7 @@ def main() -> None:
     parser.add_argument("mode", choices=[
         "test", "bench", "all", "block", "mlp", "mlp_t256", "mlp_t512", "mlp_t1024",
         "mlp_t2048", "mlp_t4096", "mlp_t8192", "mlp_t16384", "big_adaln",
+        "big_adaln_compile", "adaln_long_compile",
         "compile", "residual_sweep", "long_batch", "b1024_tokens"
     ], nargs="?", default="all")
     parser.add_argument("--report", type=Path, default=None)
@@ -1382,6 +1507,10 @@ def main() -> None:
         results = benchmark_mlp_suite(token_filter)
     elif args.mode == "big_adaln":
         results = benchmark_big_adaln_suite()
+    elif args.mode == "big_adaln_compile":
+        results = benchmark_big_adaln_compile_suite()
+    elif args.mode == "adaln_long_compile":
+        results = benchmark_adaln_long_compile_suite()
     elif args.mode == "compile":
         ok = run_block_tests()
         results = benchmark_compile_suite()
