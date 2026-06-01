@@ -33,7 +33,7 @@ void global_kernel(const __grid_constant__ Globals G) {
 
 template <typename Layout, bool TypeCheck = true>
 __host__ static inline void tensor_check(const at::Tensor &t) {
-    TORCH_CHECK(t.is_cuda(), "Tensor must be on CUDA device")
+    TORCH_CHECK(t.is_cuda() || t.is_pinned(), "Tensor must be on CUDA device or pinned memory")
     TORCH_CHECK(t.is_contiguous(), "Tensor must be contiguous")
     TORCH_CHECK(t.dim() <= 4, "Expected Tensor.dim() <= 4");
 

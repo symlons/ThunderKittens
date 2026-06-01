@@ -21,6 +21,8 @@ ThunderKittens is built for NVIDIA GPUs. For AMD GPUs, check out [HipKittens](ht
 
 ## Recent Updates
 
+**May 21, 2026** [Hamza Elshafie](https://hamzaelshafie.bearblog.dev/) has written a [completely delightful deep-dive on ThunderKittens](https://hamzaelshafie.bearblog.dev/dissecting-thunderkittens-anatomy-of-a-compact-dsl-for-high-performance-ai-kernels/) which is a fantastic starting point for anyone interested in a thorough understanding. Go read it!
+
 **Jan 11, 2026:** **ThunderKittens 2.0** is out!
 
 * This release brings full support for Blackwell GPUs along with MXFP8 and NVFP4 precision, and merges major contributions from across the industry.

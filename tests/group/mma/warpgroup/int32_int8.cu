@@ -167,6 +167,12 @@ void group::mma::warpgroup::int32_int8::tests(test_data &results) {
     mma_sweep_width_warpgroup<reg_test_mma_ABt_int32_int8, SIZE, I2_t>::run(results);
     mma_sweep_width_warpgroup<reg_test_mma_ABt_int32_int8, SIZE, I4_t>::run(results);
     mma_sweep_width_warpgroup<reg_test_mma_ABt_int32_int8, SIZE, I6_t>::run(results);
+
+    // explicit n256 (W=16) tests
+    mma_wrapper_2d<test_mma_ABt_int32_int8, 4, 16, 4, I2_t>::run(results);
+    mma_wrapper_2d<test_mma_ABt_int32_int8, 4, 16, 4, I4_t>::run(results);
+    mma_wrapper_2d<reg_test_mma_ABt_int32_int8, 4, 16, 4, I2_t>::run(results);
+    mma_wrapper_2d<reg_test_mma_ABt_int32_int8, 4, 16, 4, I4_t>::run(results);
     std::cout << std::endl;
 }
 
