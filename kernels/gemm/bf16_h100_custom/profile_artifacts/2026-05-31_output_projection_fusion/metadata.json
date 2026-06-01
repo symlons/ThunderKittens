@@ -1,0 +1,42 @@
+{
+  "created_at": "2026-05-31T21:08:55.216780+00:00",
+  "artifact_purpose": "Explain and preserve the output-projection fusion comparison between TK custom fused GEMM and torch.compile-visible epilogue path.",
+  "repo": "/cluster/home/kostfab1/ThunderKittens",
+  "variants": {
+    "compile_fused_output_proj": {
+      "meaning": "Uses TK custom tk_dit::gemm_linear_gated_residual for output projection plus gated residual. The projected tensor is written for backward inside the custom kernel.",
+      "observed_profile": "tk_dit::gemm_linear_gated_residual hot entry: about 1.514 ms self CUDA over 72 calls in the short profiler run.",
+      "known_issue": "gated_linear_template ptxas spills: 24-28 B spill stores/loads."
+    },
+    "compile_fused_output_proj_epilogue": {
+      "meaning": "Keeps output projection as torch linear/cuBLAS/NVJET and applies gated residual through compiler-visible pointwise/small kernels.",
+      "observed_profile": "No tk_dit::gemm_linear_gated_residual hot entry; GEMMs remain NVJET/cuBLAS and gate/add pieces are small fused pointwise/TK kernels."
+    }
+  },
+  "commands_to_regenerate_profiles": [
+    "env PYTHONPATH=/cluster/home/kostfab1/ThunderKittens/kernels/gemm/bf16_h100_custom:$PYTHONPATH LD_LIBRARY_PATH=/cluster/home/kostfab1/dev2/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH python3 dit3d_e2e_bench.py --model L --batches 4 --tokens 256 --profile-variant compile_fused_output_proj --warmup 1 --iters 3 --profile-rows 40",
+    "env PYTHONPATH=/cluster/home/kostfab1/ThunderKittens/kernels/gemm/bf16_h100_custom:$PYTHONPATH LD_LIBRARY_PATH=/cluster/home/kostfab1/dev2/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH python3 dit3d_e2e_bench.py --model L --batches 4 --tokens 256 --profile-variant compile_fused_output_proj_epilogue --warmup 1 --iters 3 --profile-rows 40",
+    "dot -Tsvg output_projection_fusion.dot -o output_projection_fusion.svg"
+  ],
+  "profile_notes": [
+    "Short profiler run: warmup=1, iters=3, profile_rows=40.",
+    "Profiler table self-CUDA totals are for profiler rows and can double-count compiled graph wrapper rows; use named kernel entries for boundary diagnosis.",
+    "Microbenchmark profile_gemm_fusion.py remains the direct isolated CUDA-event comparison for single-kernel timing."
+  ],
+  "rendered_artifacts": {
+    "svg": "output_projection_fusion.svg",
+    "png": "output_projection_fusion.png",
+    "pdf": "output_projection_fusion.pdf",
+    "renderer": "Graphviz dot from local conda-forge install",
+    "graphviz_version": "14.1.2",
+    "rendered_at": "2026-05-31T21:24:48.676396+00:00"
+  },
+  "graphviz_install": {
+    "method": "micromamba local env from conda-forge",
+    "micromamba": "tools/micromamba-bin/bin/micromamba",
+    "environment": "tools/graphviz-conda",
+    "dot_binary": "tools/graphviz-conda/bin/dot",
+    "version": "graphviz 14.1.2",
+    "status": "rendered successfully"
+  }
+}

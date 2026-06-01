@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <pybind11/pybind11.h>
+#include <limits>
 
 namespace {
 
@@ -404,6 +405,204 @@ __global__ void bias_gelu_quantize_k4096_kernel(
     }
 }
 
+
+template<bool WriteRowwise, bool WriteTranspose>
+__global__ void bf16_quantize_transpose_delayed_kernel(
+    fp8e4m3 *__restrict__ out,
+    fp8e4m3 *__restrict__ out_t,
+    float *__restrict__ row_amax,
+    const __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ quant_scale,
+    int rows,
+    int cols
+) {
+    constexpr int TILE = 16;
+    __shared__ fp8e4m3 tile[TILE][TILE + 1];
+    __shared__ float abs_tile[TILE][TILE];
+
+    int local_col = threadIdx.x;
+    int local_row = threadIdx.y;
+    int row = blockIdx.y * TILE + local_row;
+    int col = blockIdx.x * TILE + local_col;
+
+    fp8e4m3 qval(0.0f);
+    float abs_v = 0.0f;
+    if (row < rows && col < cols) {
+        float v = __bfloat162float(x[static_cast<size_t>(row) * cols + col]);
+        abs_v = fabsf(v);
+        float q = fminf(fmaxf(v * quant_scale[0], -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        qval = fp8e4m3(q);
+        if constexpr (WriteRowwise) {
+            out[static_cast<size_t>(row) * cols + col] = qval;
+        }
+    }
+    tile[local_row][local_col] = qval;
+    abs_tile[local_row][local_col] = abs_v;
+    __syncthreads();
+
+    if (local_col == 0 && row < rows) {
+        float local_amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            local_amax = fmaxf(local_amax, abs_tile[local_row][i]);
+        }
+        atomic_max_positive_float(row_amax + row, local_amax);
+    }
+
+    if constexpr (WriteTranspose) {
+        int trans_row = blockIdx.x * TILE + local_row;
+        int trans_col = blockIdx.y * TILE + local_col;
+        if (trans_row < cols && trans_col < rows) {
+            out_t[static_cast<size_t>(trans_row) * rows + trans_col] = tile[local_col][local_row];
+        }
+    }
+}
+
+
+
+template<bool WriteRowwise, bool WriteTranspose>
+__global__ void bf16_quantize_transpose_db_delayed_kernel(
+    fp8e4m3 *__restrict__ out,
+    fp8e4m3 *__restrict__ out_t,
+    float *__restrict__ row_amax,
+    float *__restrict__ db,
+    const __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ quant_scale,
+    int rows,
+    int cols
+) {
+    constexpr int TILE = 16;
+    __shared__ fp8e4m3 tile[TILE][TILE + 1];
+    __shared__ float abs_tile[TILE][TILE];
+    __shared__ float val_tile[TILE][TILE];
+
+    int local_col = threadIdx.x;
+    int local_row = threadIdx.y;
+    int row = blockIdx.y * TILE + local_row;
+    int col = blockIdx.x * TILE + local_col;
+
+    fp8e4m3 qval(0.0f);
+    float abs_v = 0.0f;
+    float v = 0.0f;
+    if (row < rows && col < cols) {
+        v = __bfloat162float(x[static_cast<size_t>(row) * cols + col]);
+        abs_v = fabsf(v);
+        float q = fminf(fmaxf(v * quant_scale[0], -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        qval = fp8e4m3(q);
+        if constexpr (WriteRowwise) {
+            out[static_cast<size_t>(row) * cols + col] = qval;
+        }
+    }
+    tile[local_row][local_col] = qval;
+    abs_tile[local_row][local_col] = abs_v;
+    val_tile[local_row][local_col] = v;
+    __syncthreads();
+
+    if (local_col == 0 && row < rows) {
+        float local_amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            local_amax = fmaxf(local_amax, abs_tile[local_row][i]);
+        }
+        atomic_max_positive_float(row_amax + row, local_amax);
+    }
+
+    if (local_row == 0 && col < cols) {
+        float local_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            local_sum += val_tile[i][local_col];
+        }
+        atomicAdd(db + col, local_sum);
+    }
+
+    if constexpr (WriteTranspose) {
+        int trans_row = blockIdx.x * TILE + local_row;
+        int trans_col = blockIdx.y * TILE + local_col;
+        if (trans_row < cols && trans_col < rows) {
+            out_t[static_cast<size_t>(trans_row) * rows + trans_col] = tile[local_col][local_row];
+        }
+    }
+}
+
+template<bool WriteRowwise, bool WriteTranspose>
+__global__ void gate_bwd_quantize_transpose_delayed_kernel(
+    fp8e4m3 *__restrict__ out,
+    fp8e4m3 *__restrict__ out_t,
+    float *__restrict__ row_amax,
+    float *__restrict__ dgate,
+    const __nv_bfloat16 *__restrict__ grad_out,
+    const __nv_bfloat16 *__restrict__ branch_out,
+    const __nv_bfloat16 *__restrict__ gate,
+    const float *__restrict__ quant_scale,
+    int rows,
+    int cols,
+    int tokens_per_sample
+) {
+    constexpr int TILE = 16;
+    __shared__ fp8e4m3 tile[TILE][TILE + 1];
+    __shared__ float abs_tile[TILE][TILE];
+    __shared__ float gate_grad_tile[TILE][TILE];
+
+    int local_col = threadIdx.x;
+    int local_row = threadIdx.y;
+    int row = blockIdx.y * TILE + local_row;
+    int col = blockIdx.x * TILE + local_col;
+
+    fp8e4m3 qval(0.0f);
+    float abs_v = 0.0f;
+    float gate_grad = 0.0f;
+    if (row < rows && col < cols) {
+        int batch = row / tokens_per_sample;
+        size_t idx = static_cast<size_t>(row) * cols + col;
+        float go = __bfloat162float(grad_out[idx]);
+        float bo = __bfloat162float(branch_out[idx]);
+        float gv = __bfloat162float(gate[static_cast<size_t>(batch) * cols + col]);
+        float branch_grad = go * gv;
+        gate_grad = go * bo;
+        abs_v = fabsf(branch_grad);
+        float q = fminf(fmaxf(branch_grad * quant_scale[0], -FP8_E4M3_MAX_F), FP8_E4M3_MAX_F);
+        qval = fp8e4m3(q);
+        if constexpr (WriteRowwise) {
+            out[idx] = qval;
+        }
+    }
+    tile[local_row][local_col] = qval;
+    abs_tile[local_row][local_col] = abs_v;
+    gate_grad_tile[local_row][local_col] = gate_grad;
+    __syncthreads();
+
+    if (local_col == 0 && row < rows) {
+        float local_amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            local_amax = fmaxf(local_amax, abs_tile[local_row][i]);
+        }
+        atomic_max_positive_float(row_amax + row, local_amax);
+    }
+
+    if (local_row == 0) {
+        int base_row = blockIdx.y * TILE;
+        int batch = base_row / tokens_per_sample;
+        if (col < cols) {
+            float local_sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < TILE; ++i) {
+                local_sum += gate_grad_tile[i][local_col];
+            }
+            atomicAdd(dgate + static_cast<size_t>(batch) * cols + col, local_sum);
+        }
+    }
+
+    if constexpr (WriteTranspose) {
+        int trans_row = blockIdx.x * TILE + local_row;
+        int trans_col = blockIdx.y * TILE + local_col;
+        if (trans_row < cols && trans_col < rows) {
+            out_t[static_cast<size_t>(trans_row) * rows + trans_col] = tile[local_col][local_row];
+        }
+    }
+}
+
 __global__ void delayed_scaling_update_kernel(
     float *__restrict__ scale,
     float *__restrict__ scale_inv,
@@ -674,10 +873,10 @@ struct matmul_template {
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         int Rblocks = args.globals.C.rows() / (2*layout::c_tile::rows), Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
         int super_rows = (Rblocks/SUPER_M)*SUPER_M,
             final_rows = Rblocks - super_rows,
             super_repeat = SUPER_M*Cblocks;
-        int task_id = args.task_iter*gridDim.x + blockIdx.x;
         if (task_id < super_rows * Cblocks) {
             args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
         } else if (task_id < Rblocks*Cblocks) {
@@ -783,10 +982,10 @@ struct matmul_template {
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         int Rblocks = args.globals.C.rows() / (2*layout::c_tile::rows), Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
         int super_rows = (Rblocks/SUPER_M)*SUPER_M,
             final_rows = Rblocks - super_rows,
             super_repeat = SUPER_M*Cblocks;
-        int task_id = args.task_iter*gridDim.x + blockIdx.x;
         if (task_id < super_rows * Cblocks) {
             args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
         } else if (task_id < Rblocks*Cblocks) {
@@ -1146,7 +1345,7 @@ struct matmul_template {
             zero_accum(args.state.fp32_accum);
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
-            kittens::st_descriptor<layout::a_tile, 0> a_desc(args.input.a[warpgroup::groupid()]);
+            kittens::st_descriptor<typename layout::a_tile, 0> a_desc(args.input.a[warpgroup::groupid()]);
             kittens::st_descriptor<layout::b_tile, 0> b_desc(args.input.b);
 
             float tc_accum[64];
@@ -1260,7 +1459,7 @@ struct matmul_template {
             zero_accum(args.state.fp32_accum);
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
-            kittens::st_descriptor<layout::a_tile, 0> a_desc(args.input.a[warpgroup::groupid()]);
+            kittens::st_descriptor<typename layout::a_tile, 0> a_desc(args.input.a[warpgroup::groupid()]);
             kittens::st_descriptor<layout::b_tile, 0> b_desc(args.input.b);
 
             float tc_accum[32];
@@ -1544,6 +1743,7 @@ void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, bf16 *d_C, size_t M, size_t N, size_t
     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
 
+
 } // namespace fp8_bf16out_pipe64
 
 namespace fp8_bf16out_bias {
@@ -1563,12 +1763,11 @@ struct matmul_layout {
     struct finish_block   { c_tile c[2]; };
     struct common_state   { int2 coord; };
     struct consumer_state {
-        rt_fl<16, c_tile::cols> tc_accum;
         rt_fl<16, c_tile::cols> fp32_accum;
     };
 };
 
-template<int _SUPER_M=12>
+template<int _SUPER_M=12, cache_policy A_LOAD_POLICY=cache_policy::NORMAL, cache_policy B_LOAD_POLICY=cache_policy::NORMAL, cache_policy STORE_POLICY=cache_policy::NORMAL>
 struct matmul_template {
     static constexpr int SUPER_M = _SUPER_M;
     using layout = matmul_layout;
@@ -1580,10 +1779,10 @@ struct matmul_template {
 
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         int Rblocks = args.globals.C.rows() / (2*layout::c_tile::rows), Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
         int super_rows = (Rblocks/SUPER_M)*SUPER_M,
             final_rows = Rblocks - super_rows,
             super_repeat = SUPER_M*Cblocks;
-        int task_id = args.task_iter*gridDim.x + blockIdx.x;
         if (task_id < super_rows * Cblocks) {
             args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
         } else if (task_id < Rblocks*Cblocks) {
@@ -1606,9 +1805,9 @@ struct matmul_template {
             if (warpgroup::laneid() == 0) {
                 tma::expect(args.inputs_arrived, args.input);
                 for (int i = 0; i < 2; i++) {
-                    tma::load_async(args.input.a[i], args.globals.A, {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                    tma::load_async<dim::ROW, A_LOAD_POLICY>(args.input.a[i], args.globals.A, {args.common.coord.x+i, args.iter}, args.inputs_arrived);
                 }
-                tma::load_async(args.input.b, args.globals.B, {args.common.coord.y, args.iter}, args.inputs_arrived);
+                tma::load_async<dim::ROW, B_LOAD_POLICY>(args.input.b, args.globals.B, {args.common.coord.y, args.iter}, args.inputs_arrived);
             }
         }
     };
@@ -1616,34 +1815,91 @@ struct matmul_template {
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
             warpgroup::increase_registers<232>();
-            warp::zero(args.state.tc_accum);
             group<NUM_CONSUMER_WARPS>::load(args.scratch.bias, args.globals.bias, {args.common.coord.y});
             group<NUM_CONSUMER_WARPS>::sync(0);
             init_bias(args.state.fp32_accum, args.scratch.bias);
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
             warpgroup::mma_ABt(
-                args.state.tc_accum,
+                args.state.fp32_accum,
                 args.input.a[warpgroup::groupid()],
                 args.input.b
             );
             warpgroup::mma_async_wait();
-            warp::add(args.state.fp32_accum, args.state.fp32_accum, args.state.tc_accum);
-            warp::zero(args.state.tc_accum);
             if (warp::laneid() == 0) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
             warpgroup::store(args.finish.c[warpgroup::groupid()], args.state.fp32_accum);
             warpgroup::sync(warpgroup::groupid()+4);
             if (warpgroup::laneid() == 0) {
-                tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()], {args.common.coord.x, args.common.coord.y});
+                tma::store_async<dim::ROW, STORE_POLICY>(args.globals.C, args.finish.c[warpgroup::groupid()], {args.common.coord.x, args.common.coord.y});
                 tma::store_async_read_wait();
             }
-            warp::zero(args.state.tc_accum);
             warp::zero(args.state.fp32_accum);
             if (warpgroup::laneid() == 0) arrive(args.finish_finished);
         }
     };
+};
+
+
+template<int _SUPER_M=12, cache_policy A_LOAD_POLICY=cache_policy::NORMAL, cache_policy B_LOAD_POLICY=cache_policy::NORMAL, cache_policy STORE_POLICY=cache_policy::NORMAL>
+struct matmul_cluster2_template : matmul_template<_SUPER_M, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY> {
+    using base = matmul_template<_SUPER_M, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>;
+    using layout = typename base::layout;
+    static constexpr int SUPER_M = _SUPER_M;
+    static constexpr int CLUSTER_BLOCKS = 2;
+    static constexpr int NUM_CONSUMER_WARPS = base::NUM_CONSUMER_WARPS;
+    static constexpr int INPUT_PIPE_STAGES = base::INPUT_PIPE_STAGES;
+    static constexpr int PRODUCER_BARRIER_ARRIVALS = base::PRODUCER_BARRIER_ARRIVALS;
+
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        int blocks = PERISISTENT_GRID ? 128 : M*N/(2*layout::c_tile::num_elements);
+        return dim3((blocks + CLUSTER_BLOCKS - 1) / CLUSTER_BLOCKS * CLUSTER_BLOCKS);
+    }
+
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        int cta_rank = cluster_ctarank();
+        int cluster_blocks = gridDim.x / CLUSTER_BLOCKS;
+        int Rblocks = args.globals.C.rows() / (2*layout::c_tile::rows);
+        int Cblocks = args.globals.C.cols() / layout::c_tile::cols;
+        int Rclusters = Rblocks / CLUSTER_BLOCKS;
+        int super_rows = (Rclusters/SUPER_M)*SUPER_M,
+            final_rows = Rclusters - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*cluster_blocks + blockIdx.x / CLUSTER_BLOCKS;
+        int2 cluster_coord;
+        if (task_id < super_rows * Cblocks) {
+            cluster_coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
+        } else if (task_id < Rclusters*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            cluster_coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        } else {
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/layout::a_tile::cols;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid();
+        args.common.coord = { (cluster_coord.x*CLUSTER_BLOCKS + cta_rank)*2 + id, cluster_coord.y };
+    }
+
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::elect_leader()) {
+                tma::expect(args.inputs_arrived, args.input);
+                int cta_rank = cluster_ctarank();
+                for (int i = 0; i < 2; i++) {
+                    tma::load_async<dim::ROW, A_LOAD_POLICY>(args.input.a[i], args.globals.A, {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                }
+                if (cta_rank == 0) {
+                    tma::cluster::load_async<dim::ROW, B_LOAD_POLICY>(args.input.b, args.globals.B, {args.common.coord.y, args.iter}, args.inputs_arrived, static_cast<uint16_t>(0x3));
+                }
+            }
+        }
+    };
+    using consumer = typename base::consumer;
 };
 
 template<typename mmt>
@@ -1659,6 +1915,22 @@ void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, bf16 *d_C, bf16 *d_bias, size_t M, si
     bias_layout Biasg{d_bias, nullptr, nullptr, nullptr, N};
     globals G{Ag, Bg, Cg, Biasg};
     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
+}
+
+template<typename mmt>
+void inner_run_cluster(fp8e4m3 *d_A, fp8e4m3 *d_B, bf16 *d_C, bf16 *d_bias, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
+    using a_layout = typename mmt::layout::a_layout;
+    using b_layout = typename mmt::layout::b_layout;
+    using c_layout = typename mmt::layout::c_layout;
+    using bias_layout = typename mmt::layout::bias_layout;
+    using globals  = typename mmt::layout::globals;
+    a_layout Ag{d_A, nullptr, nullptr, M, K};
+    b_layout Bg{d_B, nullptr, nullptr, N, K};
+    c_layout Cg{d_C, nullptr, nullptr, M, N};
+    bias_layout Biasg{d_bias, nullptr, nullptr, nullptr, N};
+    globals G{Ag, Bg, Cg, Biasg};
+    LaunchConfig<true> launch_config(grid, block, MAX_SHARED_MEMORY-1024, 0, dim3(mmt::CLUSTER_BLOCKS, 1, 1));
+    cudaLaunchKernelEx(launch_config, prototype::lcf::kernel<mmt>, G);
 }
 
 } // namespace fp8_bf16out_bias
@@ -1924,6 +2196,200 @@ std::vector<at::Tensor> bias_gelu_quantize_k4096(
     );
     CHECK_CUDA_ERROR(cudaGetLastError());
     return {out, row_amax};
+}
+
+
+std::vector<at::Tensor> bf16_quantize_delayed(
+    const at::Tensor &x,
+    const at::Tensor &quant_scale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(quant_scale);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, "x must be bf16");
+    TORCH_CHECK(quant_scale.scalar_type() == at::ScalarType::Float, "quant_scale must be fp32");
+    TORCH_CHECK(quant_scale.numel() == 1, "quant_scale must contain one scalar");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max() && x.size(1) <= std::numeric_limits<int>::max(),
+                "x dimensions must fit int32");
+
+    auto out = at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto row_amax = at::empty({x.size(0)}, x.options().dtype(at::ScalarType::Float));
+    dim3 block(16, 16);
+    dim3 grid((x.size(1) + 15) / 16, (x.size(0) + 15) / 16);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA_ERROR(cudaMemsetAsync(row_amax.data_ptr<float>(), 0, row_amax.numel() * sizeof(float), stream));
+    bf16_quantize_transpose_delayed_kernel<true, false><<<grid, block, 0, stream>>>(
+        reinterpret_cast<fp8e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
+        nullptr,
+        row_amax.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr<at::BFloat16>()),
+        quant_scale.data_ptr<float>(),
+        static_cast<int>(x.size(0)),
+        static_cast<int>(x.size(1))
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {out, row_amax};
+}
+
+std::vector<at::Tensor> bf16_quantize_transpose_delayed(
+    const at::Tensor &x,
+    const at::Tensor &quant_scale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(quant_scale);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, "x must be bf16");
+    TORCH_CHECK(quant_scale.scalar_type() == at::ScalarType::Float, "quant_scale must be fp32");
+    TORCH_CHECK(quant_scale.numel() == 1, "quant_scale must contain one scalar");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max() && x.size(1) <= std::numeric_limits<int>::max(),
+                "x dimensions must fit int32");
+
+    auto out_t = at::empty({x.size(1), x.size(0)}, x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto row_amax = at::empty({x.size(0)}, x.options().dtype(at::ScalarType::Float));
+    dim3 block(16, 16);
+    dim3 grid((x.size(1) + 15) / 16, (x.size(0) + 15) / 16);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA_ERROR(cudaMemsetAsync(row_amax.data_ptr<float>(), 0, row_amax.numel() * sizeof(float), stream));
+    bf16_quantize_transpose_delayed_kernel<false, true><<<grid, block, 0, stream>>>(
+        nullptr,
+        reinterpret_cast<fp8e4m3 *>(out_t.data_ptr<c10::Float8_e4m3fn>()),
+        row_amax.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr<at::BFloat16>()),
+        quant_scale.data_ptr<float>(),
+        static_cast<int>(x.size(0)),
+        static_cast<int>(x.size(1))
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {out_t, row_amax};
+}
+
+std::vector<at::Tensor> bf16_quantize_rowwise_transpose_delayed(
+    const at::Tensor &x,
+    const at::Tensor &quant_scale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(quant_scale);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, "x must be bf16");
+    TORCH_CHECK(quant_scale.scalar_type() == at::ScalarType::Float, "quant_scale must be fp32");
+    TORCH_CHECK(quant_scale.numel() == 1, "quant_scale must contain one scalar");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max() && x.size(1) <= std::numeric_limits<int>::max(),
+                "x dimensions must fit int32");
+
+    auto out = at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto out_t = at::empty({x.size(1), x.size(0)}, x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto row_amax = at::empty({x.size(0)}, x.options().dtype(at::ScalarType::Float));
+    dim3 block(16, 16);
+    dim3 grid((x.size(1) + 15) / 16, (x.size(0) + 15) / 16);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA_ERROR(cudaMemsetAsync(row_amax.data_ptr<float>(), 0, row_amax.numel() * sizeof(float), stream));
+    bf16_quantize_transpose_delayed_kernel<true, true><<<grid, block, 0, stream>>>(
+        reinterpret_cast<fp8e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
+        reinterpret_cast<fp8e4m3 *>(out_t.data_ptr<c10::Float8_e4m3fn>()),
+        row_amax.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr<at::BFloat16>()),
+        quant_scale.data_ptr<float>(),
+        static_cast<int>(x.size(0)),
+        static_cast<int>(x.size(1))
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {out, out_t, row_amax};
+}
+
+
+
+std::vector<at::Tensor> bf16_quantize_rowwise_transpose_db_delayed(
+    const at::Tensor &x,
+    const at::Tensor &quant_scale
+) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(quant_scale);
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, "x must be bf16");
+    TORCH_CHECK(quant_scale.scalar_type() == at::ScalarType::Float, "quant_scale must be fp32");
+    TORCH_CHECK(quant_scale.numel() == 1, "quant_scale must contain one scalar");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max() && x.size(1) <= std::numeric_limits<int>::max(),
+                "x dimensions must fit int32");
+
+    auto out = at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto out_t = at::empty({x.size(1), x.size(0)}, x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto row_amax = at::empty({x.size(0)}, x.options().dtype(at::ScalarType::Float));
+    auto db = at::empty({x.size(1)}, x.options().dtype(at::ScalarType::Float));
+    dim3 block(16, 16);
+    dim3 grid((x.size(1) + 15) / 16, (x.size(0) + 15) / 16);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA_ERROR(cudaMemsetAsync(row_amax.data_ptr<float>(), 0, row_amax.numel() * sizeof(float), stream));
+    CHECK_CUDA_ERROR(cudaMemsetAsync(db.data_ptr<float>(), 0, db.numel() * sizeof(float), stream));
+    bf16_quantize_transpose_db_delayed_kernel<true, true><<<grid, block, 0, stream>>>(
+        reinterpret_cast<fp8e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
+        reinterpret_cast<fp8e4m3 *>(out_t.data_ptr<c10::Float8_e4m3fn>()),
+        row_amax.data_ptr<float>(),
+        db.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr<at::BFloat16>()),
+        quant_scale.data_ptr<float>(),
+        static_cast<int>(x.size(0)),
+        static_cast<int>(x.size(1))
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {out, out_t, row_amax, db};
+}
+
+std::vector<at::Tensor> gate_bwd_quantize_rowwise_transpose_delayed(
+    const at::Tensor &grad_out,
+    const at::Tensor &branch_out,
+    const at::Tensor &gate,
+    const at::Tensor &quant_scale,
+    int64_t tokens_per_sample
+) {
+    CHECK_INPUT(grad_out);
+    CHECK_INPUT(branch_out);
+    CHECK_INPUT(gate);
+    CHECK_INPUT(quant_scale);
+    TORCH_CHECK(grad_out.scalar_type() == at::ScalarType::BFloat16, "grad_out must be bf16");
+    TORCH_CHECK(branch_out.scalar_type() == at::ScalarType::BFloat16, "branch_out must be bf16");
+    TORCH_CHECK(gate.scalar_type() == at::ScalarType::BFloat16, "gate must be bf16");
+    TORCH_CHECK(quant_scale.scalar_type() == at::ScalarType::Float, "quant_scale must be fp32");
+    TORCH_CHECK(quant_scale.numel() == 1, "quant_scale must contain one scalar");
+    TORCH_CHECK(grad_out.dim() == 2 && branch_out.dim() == 2, "grad_out and branch_out must be 2D");
+    TORCH_CHECK(grad_out.sizes() == branch_out.sizes(), "grad_out and branch_out shapes must match");
+    TORCH_CHECK(gate.dim() == 2 && gate.size(1) == grad_out.size(1), "gate must have shape [B, H]");
+    TORCH_CHECK(tokens_per_sample > 0, "tokens_per_sample must be positive");
+    TORCH_CHECK((tokens_per_sample % 16) == 0, "tokens_per_sample must be a multiple of 16");
+    TORCH_CHECK(grad_out.size(0) == gate.size(0) * tokens_per_sample, "rows must equal B * tokens_per_sample");
+    TORCH_CHECK(grad_out.is_contiguous() && branch_out.is_contiguous() && gate.is_contiguous(),
+                "grad_out, branch_out, and gate must be contiguous");
+    TORCH_CHECK(grad_out.size(0) <= std::numeric_limits<int>::max() && grad_out.size(1) <= std::numeric_limits<int>::max(),
+                "grad_out dimensions must fit int32");
+
+    auto out = at::empty(grad_out.sizes(), grad_out.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto out_t = at::empty({grad_out.size(1), grad_out.size(0)}, grad_out.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto row_amax = at::empty({grad_out.size(0)}, grad_out.options().dtype(at::ScalarType::Float));
+    auto dgate = at::empty(gate.sizes(), grad_out.options().dtype(at::ScalarType::Float));
+
+    dim3 block(16, 16);
+    dim3 grid((grad_out.size(1) + 15) / 16, (grad_out.size(0) + 15) / 16);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA_ERROR(cudaMemsetAsync(row_amax.data_ptr<float>(), 0, row_amax.numel() * sizeof(float), stream));
+    CHECK_CUDA_ERROR(cudaMemsetAsync(dgate.data_ptr<float>(), 0, dgate.numel() * sizeof(float), stream));
+    gate_bwd_quantize_transpose_delayed_kernel<true, true><<<grid, block, 0, stream>>>(
+        reinterpret_cast<fp8e4m3 *>(out.data_ptr<c10::Float8_e4m3fn>()),
+        reinterpret_cast<fp8e4m3 *>(out_t.data_ptr<c10::Float8_e4m3fn>()),
+        row_amax.data_ptr<float>(),
+        dgate.data_ptr<float>(),
+        reinterpret_cast<const __nv_bfloat16 *>(grad_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(branch_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16 *>(gate.data_ptr<at::BFloat16>()),
+        quant_scale.data_ptr<float>(),
+        static_cast<int>(grad_out.size(0)),
+        static_cast<int>(grad_out.size(1)),
+        static_cast<int>(tokens_per_sample)
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return {out, out_t, row_amax, dgate};
 }
 
 std::vector<at::Tensor> delayed_scaling_update(
@@ -2257,6 +2723,145 @@ at::Tensor fp8_gemm_k1024_bf16_out_pipe64(const at::Tensor &A, const at::Tensor 
     return C;
 }
 
+template<int SUPER_M, cache_policy A_LOAD_POLICY=cache_policy::NORMAL, cache_policy B_LOAD_POLICY=cache_policy::NORMAL, cache_policy STORE_POLICY=cache_policy::NORMAL>
+at::Tensor fp8_gemm_k1024_bf16_out_bias_super(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+    CHECK_INPUT(bias);
+    TORCH_CHECK(A.scalar_type() == at::ScalarType::Float8_e4m3fn, "A must be fp8 e4m3");
+    TORCH_CHECK(B.scalar_type() == at::ScalarType::Float8_e4m3fn, "B must be fp8 e4m3");
+    TORCH_CHECK(bias.scalar_type() == at::ScalarType::BFloat16, "bias must be bf16");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+    TORCH_CHECK(A.size(1) == K1024 && B.size(1) == K1024, "A and B must have K=1024");
+    TORCH_CHECK(bias.size(0) == B.size(0), "bias must have shape (N,)");
+    TORCH_CHECK((A.size(0) % 128) == 0 && (B.size(0) % 128) == 0, "M must be multiple of 128 and N multiple of 128");
+
+    auto M = A.size(0);
+    auto N = B.size(0);
+    auto K = A.size(1);
+    at::Tensor C = at::empty({M, N}, A.options().dtype(at::ScalarType::BFloat16));
+
+    fp8e4m3 *d_A = reinterpret_cast<fp8e4m3 *>(A.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_B = reinterpret_cast<fp8e4m3 *>(B.data_ptr<c10::Float8_e4m3fn>());
+    bf16 *d_C = reinterpret_cast<bf16 *>(C.data_ptr<at::BFloat16>());
+    bf16 *d_bias = reinterpret_cast<bf16 *>(bias.data_ptr<at::BFloat16>());
+
+    using mmt = fp8_bf16out_bias::matmul_template<SUPER_M, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>;
+    dim3 grid(mmt::template grid<false>(M, N, K));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fp8_bf16out_bias::inner_run<mmt>(d_A, d_B, d_C, d_bias, M, N, K, grid, block);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return C;
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_sm4(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_super<4>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_sm8(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_super<8>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    const auto M = A.size(0);
+    const auto N = B.size(0);
+
+    if (N == 4096) {
+        return M <= 24576 ? fp8_gemm_k1024_bf16_out_bias_super<4>(A, B, bias)
+                          : fp8_gemm_k1024_bf16_out_bias_super<12, cache_policy::NORMAL, cache_policy::NORMAL, cache_policy::EVICT_FIRST>(A, B, bias);
+    }
+    if (N == 3072) {
+        return fp8_gemm_k1024_bf16_out_bias_super<12, cache_policy::NORMAL, cache_policy::NORMAL, cache_policy::EVICT_FIRST>(A, B, bias);
+    }
+    if (N == 1024) {
+        return (M <= 24576 || M >= 262144) ? fp8_gemm_k1024_bf16_out_bias_super<16, cache_policy::NORMAL, cache_policy::NORMAL, cache_policy::EVICT_FIRST>(A, B, bias)
+                                           : fp8_gemm_k1024_bf16_out_bias_super<8, cache_policy::NORMAL, cache_policy::NORMAL, cache_policy::EVICT_FIRST>(A, B, bias);
+    }
+    return fp8_gemm_k1024_bf16_out_bias_super<8>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_sm12(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_super<12>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_sm16(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_super<16>(A, B, bias);
+}
+
+
+template<cache_policy A_LOAD_POLICY, cache_policy B_LOAD_POLICY, cache_policy STORE_POLICY>
+at::Tensor fp8_gemm_k1024_bf16_out_bias_policy(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    const auto M = A.size(0);
+    const auto N = B.size(0);
+
+    if (N == 4096) {
+        return M <= 24576 ? fp8_gemm_k1024_bf16_out_bias_super<4, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>(A, B, bias)
+                          : fp8_gemm_k1024_bf16_out_bias_super<12, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>(A, B, bias);
+    }
+    if (N == 3072) {
+        return fp8_gemm_k1024_bf16_out_bias_super<12, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>(A, B, bias);
+    }
+    if (N == 1024) {
+        return (M <= 24576 || M >= 262144) ? fp8_gemm_k1024_bf16_out_bias_super<16, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>(A, B, bias)
+                                           : fp8_gemm_k1024_bf16_out_bias_super<8, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>(A, B, bias);
+    }
+    return fp8_gemm_k1024_bf16_out_bias_super<8, A_LOAD_POLICY, B_LOAD_POLICY, STORE_POLICY>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_b_evict_last(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_policy<cache_policy::NORMAL, cache_policy::EVICT_LAST, cache_policy::NORMAL>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_a_first_b_last(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_policy<cache_policy::EVICT_FIRST, cache_policy::EVICT_LAST, cache_policy::NORMAL>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_store_evict_first(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_policy<cache_policy::NORMAL, cache_policy::NORMAL, cache_policy::EVICT_FIRST>(A, B, bias);
+}
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_all_cache_hints(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    return fp8_gemm_k1024_bf16_out_bias_policy<cache_policy::EVICT_FIRST, cache_policy::EVICT_LAST, cache_policy::EVICT_FIRST>(A, B, bias);
+}
+
+
+
+at::Tensor fp8_gemm_k1024_bf16_out_bias_cluster2(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+    CHECK_INPUT(bias);
+    TORCH_CHECK(A.scalar_type() == at::ScalarType::Float8_e4m3fn, "A must be fp8 e4m3");
+    TORCH_CHECK(B.scalar_type() == at::ScalarType::Float8_e4m3fn, "B must be fp8 e4m3");
+    TORCH_CHECK(bias.scalar_type() == at::ScalarType::BFloat16, "bias must be bf16");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+    TORCH_CHECK(A.size(1) == K1024 && B.size(1) == K1024, "A and B must have K=1024");
+    TORCH_CHECK(bias.size(0) == B.size(0), "bias must have shape (N,)");
+    TORCH_CHECK((A.size(0) % 256) == 0 && (B.size(0) % 128) == 0, "cluster2 requires M multiple of 256 and N multiple of 128");
+
+    auto M = A.size(0);
+    auto N = B.size(0);
+    auto K = A.size(1);
+    at::Tensor C = at::empty({M, N}, A.options().dtype(at::ScalarType::BFloat16));
+
+    fp8e4m3 *d_A = reinterpret_cast<fp8e4m3 *>(A.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_B = reinterpret_cast<fp8e4m3 *>(B.data_ptr<c10::Float8_e4m3fn>());
+    bf16 *d_C = reinterpret_cast<bf16 *>(C.data_ptr<at::BFloat16>());
+    bf16 *d_bias = reinterpret_cast<bf16 *>(bias.data_ptr<at::BFloat16>());
+
+    using mmt = fp8_bf16out_bias::matmul_cluster2_template<12, cache_policy::NORMAL, cache_policy::NORMAL, cache_policy::EVICT_FIRST>;
+    dim3 grid(mmt::template grid<false>(M, N, K));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fp8_bf16out_bias::inner_run_cluster<mmt>(d_A, d_B, d_C, d_bias, M, N, K, grid, block);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return C;
+}
+
 at::Tensor fp8_gemm_k4096_bf16_out_bias(const at::Tensor &A, const at::Tensor &B, const at::Tensor &bias) {
     CHECK_INPUT(A);
     CHECK_INPUT(B);
@@ -2290,6 +2895,77 @@ at::Tensor fp8_gemm_k4096_bf16_out_bias(const at::Tensor &A, const at::Tensor &B
     return C;
 }
 
+
+at::Tensor fp8_wgrad_2xacc_scaled(const at::Tensor &X_T, const at::Tensor &DY_T, double x_dequant_scale, double dy_dequant_scale) {
+    CHECK_INPUT(X_T);
+    CHECK_INPUT(DY_T);
+    TORCH_CHECK(X_T.scalar_type() == at::ScalarType::Float8_e4m3fn, "X_T must be fp8 e4m3");
+    TORCH_CHECK(DY_T.scalar_type() == at::ScalarType::Float8_e4m3fn, "DY_T must be fp8 e4m3");
+    TORCH_CHECK(X_T.dim() == 2 && DY_T.dim() == 2, "X_T and DY_T must be 2D");
+    TORCH_CHECK(X_T.size(1) == DY_T.size(1), "X_T and DY_T must have matching reduction dimension");
+    TORCH_CHECK((X_T.size(0) % 128) == 0 && (DY_T.size(0) % 128) == 0 && (X_T.size(1) % 128) == 0,
+                "K, N, and reduction M must be multiples of 128");
+
+    auto K = X_T.size(0);
+    auto M = X_T.size(1);
+    auto N = DY_T.size(0);
+    at::Tensor DW = at::empty({K, N}, X_T.options().dtype(at::ScalarType::BFloat16));
+
+    fp8e4m3 *d_X = reinterpret_cast<fp8e4m3 *>(X_T.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_DY = reinterpret_cast<fp8e4m3 *>(DY_T.data_ptr<c10::Float8_e4m3fn>());
+    bf16 *d_DW = reinterpret_cast<bf16 *>(DW.data_ptr<at::BFloat16>());
+
+    using mmt = fp8_bf16out_deepaccum::matmul_template<8>;
+    dim3 grid(mmt::grid(K, N, M));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fp8_bf16out_deepaccum::inner_run<mmt>(
+        d_X, d_DY, d_DW, K, N, M, static_cast<float>(x_dequant_scale * dy_dequant_scale), grid, block
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return DW;
+}
+
+at::Tensor fp8_wgrad_2xacc(const at::Tensor &X_T, const at::Tensor &DY_T) {
+    return fp8_wgrad_2xacc_scaled(X_T, DY_T, 1.0, 1.0);
+}
+
+at::Tensor fp8_dgrad_2xacc_scaled(const at::Tensor &DY, const at::Tensor &W_T, double dy_dequant_scale, double w_dequant_scale) {
+    CHECK_INPUT(DY);
+    CHECK_INPUT(W_T);
+    TORCH_CHECK(DY.scalar_type() == at::ScalarType::Float8_e4m3fn, "DY must be fp8 e4m3");
+    TORCH_CHECK(W_T.scalar_type() == at::ScalarType::Float8_e4m3fn, "W_T must be fp8 e4m3");
+    TORCH_CHECK(DY.dim() == 2 && W_T.dim() == 2, "DY and W_T must be 2D");
+    TORCH_CHECK(DY.size(1) == W_T.size(1), "DY columns must match W_T columns");
+    TORCH_CHECK((DY.size(0) % 128) == 0 && (W_T.size(0) % 128) == 0 && (DY.size(1) % 128) == 0,
+                "M, K, and reduction N must be multiples of 128");
+
+    auto M = DY.size(0);
+    auto N = DY.size(1);
+    auto K = W_T.size(0);
+    at::Tensor DX = at::empty({M, K}, DY.options().dtype(at::ScalarType::BFloat16));
+
+    fp8e4m3 *d_DY = reinterpret_cast<fp8e4m3 *>(DY.data_ptr<c10::Float8_e4m3fn>());
+    fp8e4m3 *d_W = reinterpret_cast<fp8e4m3 *>(W_T.data_ptr<c10::Float8_e4m3fn>());
+    bf16 *d_DX = reinterpret_cast<bf16 *>(DX.data_ptr<at::BFloat16>());
+
+    using mmt = fp8_bf16out_deepaccum::matmul_template<8>;
+    dim3 grid(mmt::grid(M, K, N));
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fp8_bf16out_deepaccum::inner_run<mmt>(
+        d_DY, d_W, d_DX, M, K, N, static_cast<float>(dy_dequant_scale * w_dequant_scale), grid, block
+    );
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return DX;
+}
+
+at::Tensor fp8_dgrad_2xacc(const at::Tensor &DY, const at::Tensor &W_T) {
+    return fp8_dgrad_2xacc_scaled(DY, W_T, 1.0, 1.0);
+}
+
 PYBIND11_MODULE(_C, m) {
     m.def("ln_adaln_quantize_k1024", &ln_adaln_quantize_k1024);
     m.def("ln_adaln_quantize_stats_k1024", &ln_adaln_quantize_stats_k1024);
@@ -2297,6 +2973,11 @@ PYBIND11_MODULE(_C, m) {
     m.def("ln_adaln_quantize_stats_vec_delayed_k1024", &ln_adaln_quantize_stats_vec_delayed_k1024);
     m.def("ln_adaln_quantize_precomputed_vec_k1024", &ln_adaln_quantize_precomputed_vec_k1024);
     m.def("bias_gelu_quantize_k4096", &bias_gelu_quantize_k4096);
+    m.def("bf16_quantize_delayed", &bf16_quantize_delayed);
+    m.def("bf16_quantize_transpose_delayed", &bf16_quantize_transpose_delayed);
+    m.def("bf16_quantize_rowwise_transpose_delayed", &bf16_quantize_rowwise_transpose_delayed);
+    m.def("bf16_quantize_rowwise_transpose_db_delayed", &bf16_quantize_rowwise_transpose_db_delayed);
+    m.def("gate_bwd_quantize_rowwise_transpose_delayed", &gate_bwd_quantize_rowwise_transpose_delayed);
     m.def("delayed_scaling_update", &delayed_scaling_update);
     m.def("reduce_amax", &reduce_amax);
     m.def("fp8_gemm_k1024", &fp8_gemm_k1024);
@@ -2310,5 +2991,18 @@ PYBIND11_MODULE(_C, m) {
     m.def("fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled", &fp8_gemm_k1024_bf16_out_deepaccum_n64_scaled);
     m.def("fp8_gemm_k1024_bf16_out_pipe", &fp8_gemm_k1024_bf16_out_pipe);
     m.def("fp8_gemm_k1024_bf16_out_pipe64", &fp8_gemm_k1024_bf16_out_pipe64);
+    m.def("fp8_gemm_k1024_bf16_out_bias_sm4", &fp8_gemm_k1024_bf16_out_bias_sm4);
+    m.def("fp8_gemm_k1024_bf16_out_bias_sm8", &fp8_gemm_k1024_bf16_out_bias_sm8);
+    m.def("fp8_gemm_k1024_bf16_out_bias", &fp8_gemm_k1024_bf16_out_bias);
+    m.def("fp8_gemm_k1024_bf16_out_bias_sm12", &fp8_gemm_k1024_bf16_out_bias_sm12);
+    m.def("fp8_gemm_k1024_bf16_out_bias_sm16", &fp8_gemm_k1024_bf16_out_bias_sm16);
+    m.def("fp8_gemm_k1024_bf16_out_bias_b_evict_last", &fp8_gemm_k1024_bf16_out_bias_b_evict_last);
+    m.def("fp8_gemm_k1024_bf16_out_bias_a_first_b_last", &fp8_gemm_k1024_bf16_out_bias_a_first_b_last);
+    m.def("fp8_gemm_k1024_bf16_out_bias_store_evict_first", &fp8_gemm_k1024_bf16_out_bias_store_evict_first);
+    m.def("fp8_gemm_k1024_bf16_out_bias_all_cache_hints", &fp8_gemm_k1024_bf16_out_bias_all_cache_hints);
     m.def("fp8_gemm_k4096_bf16_out_bias", &fp8_gemm_k4096_bf16_out_bias);
+    m.def("fp8_wgrad_2xacc", &fp8_wgrad_2xacc);
+    m.def("fp8_wgrad_2xacc_scaled", &fp8_wgrad_2xacc_scaled);
+    m.def("fp8_dgrad_2xacc", &fp8_dgrad_2xacc);
+    m.def("fp8_dgrad_2xacc_scaled", &fp8_dgrad_2xacc_scaled);
 }

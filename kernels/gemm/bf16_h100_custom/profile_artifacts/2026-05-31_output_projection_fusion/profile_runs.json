@@ -1,0 +1,21 @@
+{
+  "started_at": "2026-05-31T21:09:31.336801+00:00",
+  "workdir": "/cluster/home/kostfab1/ThunderKittens/kernels/gemm/bf16_h100_custom",
+  "runs": {
+    "compile_fused_output_proj": {
+      "command": "python3 dit3d_e2e_bench.py --model L --batches 4 --tokens 256 --profile-variant compile_fused_output_proj --warmup 1 --iters 3 --profile-rows 40",
+      "started_at": "2026-05-31T21:09:31.336819+00:00",
+      "finished_at": "2026-05-31T21:10:02.824560+00:00",
+      "returncode": 0,
+      "log": "compile_fused_output_proj.profile.txt"
+    },
+    "compile_fused_output_proj_epilogue": {
+      "command": "python3 dit3d_e2e_bench.py --model L --batches 4 --tokens 256 --profile-variant compile_fused_output_proj_epilogue --warmup 1 --iters 3 --profile-rows 40",
+      "started_at": "2026-05-31T21:10:02.824606+00:00",
+      "finished_at": "2026-05-31T21:10:35.786075+00:00",
+      "returncode": 0,
+      "log": "compile_fused_output_proj_epilogue.profile.txt"
+    }
+  },
+  "finished_at": "2026-05-31T21:10:35.786104+00:00"
+}

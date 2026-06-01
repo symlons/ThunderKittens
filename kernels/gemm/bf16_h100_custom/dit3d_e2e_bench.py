@@ -1314,6 +1314,7 @@ def make_model(
     tk_mlp: bool = False,
     fused_input_projection: bool = False,
     fused_output_projection: bool = False,
+    fused_epilogue_only: bool = False,
     attention_backend: str = "timm",
 ) -> DiT:
     torch.manual_seed(123)
@@ -1324,6 +1325,7 @@ def make_model(
         tk_mlp_enabled=tk_mlp,
         fused_input_projection_enabled=fused_input_projection,
         fused_output_projection_enabled=fused_output_projection,
+        fused_epilogue_only_enabled=fused_epilogue_only,
         attention_backend=attention_backend,
     ).cuda().to(torch.bfloat16).train()
     model.randomize_zero_init_layers()
@@ -1332,21 +1334,29 @@ def make_model(
 
 def variant_config(variant_name: str):
     variants = {
-        "eager": (False, False, False, False, False, "timm", False),
-        "compile": (False, False, False, False, False, "timm", True),
-        "compile_fused_adaln": (True, False, False, False, False, "timm", True),
-        "compile_tk_adaln_only": (True, False, False, False, False, "timm", True),
-        "fused_adaln_residual": (True, True, False, False, False, "timm", False),
-        "compile_fused_adaln_residual": (True, True, False, False, False, "timm", True),
-        "compile_tk_adaln_residual_only": (True, True, False, False, False, "timm", True),
-        "fused_adaln_residual_tk_mlp": (True, True, True, False, False, "timm", False),
-        "compile_fused_adaln_residual_tk_mlp": (True, True, True, False, False, "timm", True),
-        "fa3_attn": (False, False, False, False, False, "fa3", False),
-        "compile_fa3_attn": (False, False, False, False, False, "fa3", True),
-        "fused_adaln_residual_fa3": (True, True, False, False, False, "fa3", False),
-        "compile_fused_adaln_residual_fa3": (True, True, False, False, False, "fa3", True),
-        "fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, "fa3", False),
-        "compile_fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, "fa3", True),
+        "eager": (False, False, False, False, False, False, "timm", False),
+        "compile": (False, False, False, False, False, False, "timm", True),
+        "compile_fused_adaln": (True, False, False, False, False, False, "timm", True),
+        "compile_tk_adaln_only": (True, False, False, False, False, False, "timm", True),
+        "fused_adaln_residual": (True, True, False, False, False, False, "timm", False),
+        "compile_fused_adaln_residual": (True, True, False, False, False, False, "timm", True),
+        "fused_adaln_residual_epilogue": (True, True, False, False, False, True, "timm", False),
+        "compile_fused_adaln_residual_epilogue": (True, True, False, False, False, True, "timm", True),
+        "compile_fused_output_proj": (True, True, False, False, True, False, "timm", True),
+        "compile_fused_output_proj_epilogue": (True, True, False, False, True, True, "timm", True),
+        "compile_tk_adaln_residual_only": (True, True, False, False, False, False, "timm", True),
+        "fused_adaln_residual_tk_mlp": (True, True, True, False, False, False, "timm", False),
+        "compile_fused_adaln_residual_tk_mlp": (True, True, True, False, False, False, "timm", True),
+        "fa3_attn": (False, False, False, False, False, False, "fa3", False),
+        "compile_fa3_attn": (False, False, False, False, False, False, "fa3", True),
+        "fused_adaln_residual_fa3": (True, True, False, False, False, False, "fa3", False),
+        "compile_fused_adaln_residual_fa3": (True, True, False, False, False, False, "fa3", True),
+        "fused_adaln_residual_epilogue_fa3": (True, True, False, False, False, True, "fa3", False),
+        "compile_fused_adaln_residual_epilogue_fa3": (True, True, False, False, False, True, "fa3", True),
+        "compile_fused_output_proj_fa3": (True, True, False, False, True, False, "fa3", True),
+        "compile_fused_output_proj_epilogue_fa3": (True, True, False, False, True, True, "fa3", True),
+        "fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, False, "fa3", False),
+        "compile_fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, False, "fa3", True),
     }
     if variant_name not in variants:
         raise ValueError(f"unknown profile variant: {variant_name}")
@@ -1404,7 +1414,7 @@ def profile_variant_case(
     iters: int,
     rows: int,
 ) -> None:
-    fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, attention_backend, compiled = variant_config(variant_name)
+    fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, fused_epilogue_only, attention_backend, compiled = variant_config(variant_name)
     model = make_model(
         model_name,
         fused=fused,
@@ -1412,6 +1422,7 @@ def profile_variant_case(
         tk_mlp=tk_mlp,
         fused_input_projection=fused_input_projection,
         fused_output_projection=fused_output_projection,
+        fused_epilogue_only=fused_epilogue_only,
         attention_backend=attention_backend,
     )
     model.pos_embed(spatial, torch.bfloat16, torch.device("cuda"))
@@ -1618,45 +1629,47 @@ def bench_case(
     groups = [make_group(batch, cfg["in_channels"], spatial, 50000 + i * 10) for i in range(groups_n)]
 
     print(f"\n3D DiT-{model_name}/1 E2E train: batch={batch} tokens={tokens} spatial={spatial} groups={groups_n}")
-    variants = [("eager", False, False, False, False, False, "timm", False)]
+    variants = [("eager", False, False, False, False, False, False, "timm", False)]
     if include_compile:
-        variants.append(("compile", False, False, False, False, False, "timm", True))
+        variants.append(("compile", False, False, False, False, False, False, "timm", True))
     variants.extend([
-        ("tk_mlp", False, False, True, False, False, "timm", False),
-        ("fused_adaln", True, False, False, False, False, "timm", False),
-        ("fused_adaln_residual", True, True, False, False, False, "timm", False),
-        ("fused_adaln_residual_tk_mlp", True, True, True, False, False, "timm", False),
-        ("fused_output_proj", True, True, False, False, True, "timm", False),
-        ("fused_input_proj", True, True, False, True, False, "timm", False),
-        ("fused_input_output_proj", True, True, False, True, True, "timm", False),
-        ("fused_input_proj_tk_mlp", True, True, True, True, False, "timm", False),
-        ("fused_input_output_proj_tk_mlp", True, True, True, True, True, "timm", False),
+        ("tk_mlp", False, False, True, False, False, False, "timm", False),
+        ("fused_adaln", True, False, False, False, False, False, "timm", False),
+        ("fused_adaln_residual", True, True, False, False, False, False, "timm", False),
+        ("fused_adaln_residual_tk_mlp", True, True, True, False, False, False, "timm", False),
+        ("fused_output_proj", True, True, False, False, True, False, "timm", False),
+        ("fused_input_proj", True, True, False, True, False, False, "timm", False),
+        ("fused_input_output_proj", True, True, False, True, True, False, "timm", False),
+        ("fused_input_proj_tk_mlp", True, True, True, True, False, False, "timm", False),
+        ("fused_input_output_proj_tk_mlp", True, True, True, True, True, False, "timm", False),
     ])
     if include_compile:
         variants.extend([
-            ("compile_fused_adaln", True, False, False, False, False, "timm", True),
-            ("compile_tk_adaln_only", True, False, False, False, False, "timm", True),
-            ("compile_fused_adaln_residual", True, True, False, False, False, "timm", True),
-            ("compile_tk_adaln_residual_only", True, True, False, False, False, "timm", True),
-            ("compile_fused_adaln_tk_mlp", True, False, True, False, False, "timm", True),
-            ("compile_fused_adaln_residual_tk_mlp", True, True, True, False, False, "timm", True),
+            ("compile_fused_adaln", True, False, False, False, False, False, "timm", True),
+            ("compile_tk_adaln_only", True, False, False, False, False, False, "timm", True),
+            ("compile_fused_adaln_residual", True, True, False, False, False, False, "timm", True),
+            ("compile_fused_output_proj", True, True, False, False, True, False, "timm", True),
+            ("compile_fused_output_proj_epilogue", True, True, False, False, True, True, "timm", True),
+            ("compile_tk_adaln_residual_only", True, True, False, False, False, False, "timm", True),
+            ("compile_fused_adaln_tk_mlp", True, False, True, False, False, False, "timm", True),
+            ("compile_fused_adaln_residual_tk_mlp", True, True, True, False, False, False, "timm", True),
         ])
     if include_fa3:
         variants.extend([
-            ("fa3_attn", False, False, False, False, False, "fa3", False),
-            ("fused_adaln_residual_fa3", True, True, False, False, False, "fa3", False),
-            ("fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, "fa3", False),
-            ("fused_output_proj_fa3", True, True, False, False, True, "fa3", False),
-            ("fused_input_proj_fa3", True, True, False, True, False, "fa3", False),
-            ("fused_input_output_proj_fa3", True, True, False, True, True, "fa3", False),
-            ("fused_input_proj_fa3_tk_mlp", True, True, True, True, False, "fa3", False),
-            ("fused_input_output_proj_fa3_tk_mlp", True, True, True, True, True, "fa3", False),
+            ("fa3_attn", False, False, False, False, False, False, "fa3", False),
+            ("fused_adaln_residual_fa3", True, True, False, False, False, False, "fa3", False),
+            ("fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, False, "fa3", False),
+            ("fused_output_proj_fa3", True, True, False, False, True, False, "fa3", False),
+            ("fused_input_proj_fa3", True, True, False, True, False, False, "fa3", False),
+            ("fused_input_output_proj_fa3", True, True, False, True, True, False, "fa3", False),
+            ("fused_input_proj_fa3_tk_mlp", True, True, True, True, False, False, "fa3", False),
+            ("fused_input_output_proj_fa3_tk_mlp", True, True, True, True, True, False, "fa3", False),
         ])
         if include_compile:
             variants.extend([
-                ("compile_fa3_attn", False, False, False, False, False, "fa3", True),
-                ("compile_fused_adaln_residual_fa3", True, True, False, False, False, "fa3", True),
-                ("compile_fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, "fa3", True),
+                ("compile_fa3_attn", False, False, False, False, False, False, "fa3", True),
+                ("compile_fused_adaln_residual_fa3", True, True, False, False, False, False, "fa3", True),
+                ("compile_fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, False, "fa3", True),
             ])
     if only_variants:
         missing = only_variants.difference(name for name, *_ in variants)
@@ -1664,7 +1677,7 @@ def bench_case(
             raise ValueError(f"unknown variants: {sorted(missing)}")
         variants = [variant for variant in variants if variant[0] in only_variants]
     results = []
-    for variant_name, fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, attention_backend, compiled in variants:
+    for variant_name, fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, fused_epilogue_only, attention_backend, compiled in variants:
         print(f"  running {variant_name}...", flush=True)
         model = make_model(
             model_name,
@@ -1673,6 +1686,7 @@ def bench_case(
             tk_mlp=tk_mlp,
             fused_input_projection=fused_input_projection,
             fused_output_projection=fused_output_projection,
+            fused_epilogue_only=fused_epilogue_only,
             attention_backend=attention_backend,
         )
         model.pos_embed(spatial, torch.bfloat16, torch.device("cuda"))

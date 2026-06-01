@@ -107,3 +107,35 @@ def _(
     q = torch.empty_strided(x.shape, x.stride(), device=x.device, dtype=torch.float8_e4m3fn)
     row_amax = torch.empty((x.shape[0],), device=x.device, dtype=torch.float32)
     return q, row_amax
+
+
+@torch.library.custom_op(
+    "tk_fp8_adaln::gate_bwd_quantize_rowwise_transpose_delayed",
+    mutates_args=(),
+)
+def gate_bwd_quantize_rowwise_transpose_delayed(
+    grad_out: torch.Tensor,
+    branch_out: torch.Tensor,
+    gate: torch.Tensor,
+    quant_scale: torch.Tensor,
+    tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _C.gate_bwd_quantize_rowwise_transpose_delayed(
+        grad_out, branch_out, gate, quant_scale, tokens
+    )
+
+
+@gate_bwd_quantize_rowwise_transpose_delayed.register_fake
+def _(
+    grad_out: torch.Tensor,
+    branch_out: torch.Tensor,
+    gate: torch.Tensor,
+    quant_scale: torch.Tensor,
+    tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del branch_out, quant_scale, tokens
+    q = torch.empty_strided(grad_out.shape, grad_out.stride(), device=grad_out.device, dtype=torch.float8_e4m3fn)
+    q_t = torch.empty((grad_out.shape[1], grad_out.shape[0]), device=grad_out.device, dtype=torch.float8_e4m3fn)
+    row_amax = torch.empty((grad_out.shape[0],), device=grad_out.device, dtype=torch.float32)
+    dgate = torch.empty(gate.shape, device=gate.device, dtype=torch.float32)
+    return q, q_t, row_amax, dgate

@@ -1343,7 +1343,6 @@ struct native_linear_template {
         if (threadIdx.x == 0) {
             args.globals.A.template prefetch_tma<typename layout::base_tile>();
             args.globals.B.template prefetch_tma<typename layout::base_tile>();
-            args.globals.C.template prefetch_tma<typename layout::base_tile>();
         }
         int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
         int super_rows = (Rblocks/SUPER_M)*SUPER_M,
@@ -1405,6 +1404,84 @@ struct native_linear_template {
             if (warp::elect_leader()) arrive(args.finish_finished);
         }
     };
+};
+
+
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=16>
+struct native_linear_grid132_template : native_linear_template<_M_BLOCK, _N_BLOCK, _SUPER_M> {
+    using base_template = native_linear_template<_M_BLOCK, _N_BLOCK, _SUPER_M>;
+    using layout = typename base_template::layout;
+    static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
+
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        return dim3(PERISISTENT_GRID ? 132 : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+    }
+};
+
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=16>
+struct native_linear_cluster2_template : native_linear_template<_M_BLOCK, _N_BLOCK, _SUPER_M> {
+    using base_template = native_linear_template<_M_BLOCK, _N_BLOCK, _SUPER_M>;
+    static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
+    static constexpr int CLUSTER_BLOCKS = 2;
+    using layout    = typename base_template::layout;
+    using wide_tile = typename base_template::wide_tile;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        int blocks = PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((blocks + CLUSTER_BLOCKS - 1) / CLUSTER_BLOCKS * CLUSTER_BLOCKS);
+    }
+
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        if (threadIdx.x == 0) {
+            args.globals.A.template prefetch_tma<typename layout::base_tile>();
+            args.globals.B.template prefetch_tma<typename layout::base_tile>();
+        }
+        int cta_rank = cluster_ctarank();
+        int cluster_blocks = gridDim.x / CLUSTER_BLOCKS;
+        int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
+        int Rclusters = Rblocks / CLUSTER_BLOCKS;
+        int super_rows = (Rclusters/SUPER_M)*SUPER_M,
+            final_rows = Rclusters - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*cluster_blocks + blockIdx.x / CLUSTER_BLOCKS;
+        int2 cluster_coord;
+        if (task_id < super_rows * Cblocks)
+            cluster_coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
+        else if (task_id < Rclusters*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            cluster_coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        }
+        else {
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/64;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid();
+        args.common.coord = {(cluster_coord.x*CLUSTER_BLOCKS + cta_rank)*M_BLOCK + id, cluster_coord.y*N_BLOCK};
+    }
+
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::elect_leader()) {
+                tma::expect(args.inputs_arrived, args.input);
+                int cta_rank = cluster_ctarank();
+                for(int i = 0; i < M_BLOCK; i++)
+                    tma::load_async(args.input.a[i], args.globals.A,
+                                    {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                if (cta_rank == 0) {
+                    for(int i = 0; i < N_BLOCK; i++)
+                        tma::cluster::load_async(args.input.b[i], args.globals.B,
+                                                 {args.common.coord.y+i, args.iter}, args.inputs_arrived,
+                                                 static_cast<uint16_t>(0x3));
+                }
+            }
+        }
+    };
+    using consumer = typename base_template::consumer;
 };
 
 template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
@@ -2009,6 +2086,82 @@ void gemm_custom_native_entrypoint(
 }
 
 template<int M_BLOCK, int N_BLOCK, int SUPER_M>
+void gemm_linear_native_grid132_variant_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias
+) {
+    using mmt = native_linear_grid132_template<M_BLOCK, N_BLOCK, SUPER_M>;
+    using globals = typename mmt::layout::globals;
+    using global_layout = typename mmt::layout::global_layout;
+    using bias_global = typename mmt::layout::bias_global;
+
+    kittens::py::device_check(A, B, C, bias);
+
+    globals G{
+        kittens::py::tensor_to_gl<global_layout>(A),
+        kittens::py::tensor_to_gl<global_layout>(B),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<bias_global>(bias)
+    };
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(0);
+
+    dim3 grid = mmt::grid(M, N, K);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+
+    prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
+template<int M_BLOCK, int N_BLOCK, int SUPER_M>
+void gemm_linear_native_cluster2_variant_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias
+) {
+    using mmt = native_linear_cluster2_template<M_BLOCK, N_BLOCK, SUPER_M>;
+    using globals = typename mmt::layout::globals;
+    using global_layout = typename mmt::layout::global_layout;
+    using bias_global = typename mmt::layout::bias_global;
+
+    kittens::py::device_check(A, B, C, bias);
+
+    globals G{
+        kittens::py::tensor_to_gl<global_layout>(A),
+        kittens::py::tensor_to_gl<global_layout>(B),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<bias_global>(bias)
+    };
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(0);
+
+    dim3 grid = mmt::grid(M, N, K);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+
+    LaunchConfig<true, false> launch_config(grid, block, smem, stream, dim3(2, 1, 1));
+    cudaLaunchKernelEx(launch_config, prototype::lcf::kernel<mmt>, G);
+}
+
+template<int M_BLOCK, int N_BLOCK, int SUPER_M>
 void gemm_linear_native_variant_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
@@ -2051,7 +2204,43 @@ void gemm_linear_native_entrypoint(
     const at::Tensor &C,
     const at::Tensor &bias
 ) {
-    gemm_linear_native_variant_entrypoint<2, 4, 8>(A, B, C, bias);
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(0);
+
+    if (K == 1024 && N == 3072) {
+        if (M == 65536 || M == 262144 || M == 393216) {
+            gemm_linear_native_variant_entrypoint<2, 4, 8>(A, B, C, bias);
+            return;
+        }
+        if (M == 131072) {
+            gemm_linear_native_variant_entrypoint<2, 4, 12>(A, B, C, bias);
+            return;
+        }
+        if (M >= 524288) {
+            gemm_linear_native_grid132_variant_entrypoint<2, 4, 16>(A, B, C, bias);
+            return;
+        }
+        if (M == 98304) {
+            gemm_linear_native_variant_entrypoint<2, 4, 4>(A, B, C, bias);
+            return;
+        }
+    }
+    if (K == 1024 && N == 1024) {
+        if (M == 65536) {
+            gemm_linear_native_variant_entrypoint<2, 4, 12>(A, B, C, bias);
+            return;
+        }
+        if (M == 32768) {
+            gemm_linear_native_grid132_variant_entrypoint<2, 4, 16>(A, B, C, bias);
+            return;
+        }
+        if (M == 98304 || M == 131072 || M == 262144 || M >= 524288) {
+            gemm_linear_native_variant_entrypoint<2, 4, 4>(A, B, C, bias);
+            return;
+        }
+    }
+    gemm_linear_native_variant_entrypoint<2, 4, 16>(A, B, C, bias);
 }
 
 template<int M_BLOCK, int N_BLOCK, int SUPER_M>
@@ -2128,17 +2317,46 @@ void gemm_linear_gated_residual_entrypoint(
     int M = A.size(0);
     int K = A.size(1);
     int N = B.size(0);
-    if (K >= 4 * N && tokens_per_sample >= 4096) {
-        if (M >= 81920) {
-            gemm_linear_gated_residual_variant_entrypoint<2, 4, 16>(
-                A, B, residual, gate, C, projected, bias, tokens_per_sample);
-            return;
+    if (K == 4096 && N == 1024) {
+        if (tokens_per_sample >= 4096) {
+            if (M == 65536) {
+                gemm_linear_gated_residual_variant_entrypoint<2, 4, 8>(
+                    A, B, residual, gate, C, projected, bias, tokens_per_sample);
+                return;
+            }
+            if (M == 98304) {
+                gemm_linear_gated_residual_variant_entrypoint<2, 4, 4>(
+                    A, B, residual, gate, C, projected, bias, tokens_per_sample);
+                return;
+            }
+            if (M == 131072) {
+                gemm_linear_gated_residual_variant_entrypoint<2, 4, 16>(
+                    A, B, residual, gate, C, projected, bias, tokens_per_sample);
+                return;
+            }
         }
-        gemm_linear_gated_residual_variant_entrypoint<2, 4, 4>(
+        else {
+            if (M == 16384) {
+                gemm_linear_gated_residual_variant_entrypoint<2, 4, 8>(
+                    A, B, residual, gate, C, projected, bias, tokens_per_sample);
+                return;
+            }
+            if (M == 98304) {
+                gemm_linear_gated_residual_variant_entrypoint<2, 4, 16>(
+                    A, B, residual, gate, C, projected, bias, tokens_per_sample);
+                return;
+            }
+            if (M == 131072) {
+                gemm_linear_gated_residual_variant_entrypoint<2, 4, 12>(
+                    A, B, residual, gate, C, projected, bias, tokens_per_sample);
+                return;
+            }
+        }
+        gemm_linear_gated_residual_variant_entrypoint<2, 4, 2>(
             A, B, residual, gate, C, projected, bias, tokens_per_sample);
         return;
     }
-    gemm_linear_gated_residual_variant_entrypoint<2, 4, 8>(
+    gemm_linear_gated_residual_variant_entrypoint<2, 4, 16>(
         A, B, residual, gate, C, projected, bias, tokens_per_sample);
 }
 
@@ -3008,17 +3226,29 @@ PYBIND11_MODULE(_C, m) {
     m.def("gemm_custom", &gemm_custom_entrypoint);
     m.def("gemm_custom_native", &gemm_custom_native_entrypoint);
     m.def("gemm_custom_native_m2n4s4", &gemm_custom_native_variant_entrypoint<2,4,4>);
+    m.def("gemm_custom_native_m2n4s6", &gemm_custom_native_variant_entrypoint<2,4,6>);
+    m.def("gemm_custom_native_m2n4s8", &gemm_custom_native_variant_entrypoint<2,4,8>);
+    m.def("gemm_custom_native_m2n4s12", &gemm_custom_native_variant_entrypoint<2,4,12>);
     m.def("gemm_custom_native_m2n4s16", &gemm_custom_native_variant_entrypoint<2,4,16>);
     m.def("gemm_custom_native_m2n2s8", &gemm_custom_native_variant_entrypoint<2,2,8>);
     m.def("gemm_custom_native_m1n4s8", &gemm_custom_native_variant_entrypoint<1,4,8>);
     m.def("gemm_linear_native", &gemm_linear_native_entrypoint);
     m.def("gemm_linear_native_m2n4s4", &gemm_linear_native_variant_entrypoint<2,4,4>);
+    m.def("gemm_linear_native_m2n4s6", &gemm_linear_native_variant_entrypoint<2,4,6>);
+    m.def("gemm_linear_native_m2n4s8", &gemm_linear_native_variant_entrypoint<2,4,8>);
+    m.def("gemm_linear_native_m2n4s12", &gemm_linear_native_variant_entrypoint<2,4,12>);
     m.def("gemm_linear_native_m2n4s16", &gemm_linear_native_variant_entrypoint<2,4,16>);
+    m.def("gemm_linear_native_cluster2_m2n4s16", &gemm_linear_native_cluster2_variant_entrypoint<2,4,16>);
+    m.def("gemm_linear_native_grid132_m2n4s4", &gemm_linear_native_grid132_variant_entrypoint<2,4,4>);
+    m.def("gemm_linear_native_grid132_m2n4s16", &gemm_linear_native_grid132_variant_entrypoint<2,4,16>);
     m.def("gemm_linear_native_m2n2s8", &gemm_linear_native_variant_entrypoint<2,2,8>);
     m.def("gemm_linear_native_m1n4s8", &gemm_linear_native_variant_entrypoint<1,4,8>);
     m.def("gemm_linear_gated_residual", &gemm_linear_gated_residual_entrypoint);
+    m.def("gemm_linear_gated_residual_m2n4s2", &gemm_linear_gated_residual_variant_entrypoint<2,4,2>);
     m.def("gemm_linear_gated_residual_m2n4s4", &gemm_linear_gated_residual_variant_entrypoint<2,4,4>);
+    m.def("gemm_linear_gated_residual_m2n4s6", &gemm_linear_gated_residual_variant_entrypoint<2,4,6>);
     m.def("gemm_linear_gated_residual_m2n4s8", &gemm_linear_gated_residual_variant_entrypoint<2,4,8>);
+    m.def("gemm_linear_gated_residual_m2n4s12", &gemm_linear_gated_residual_variant_entrypoint<2,4,12>);
     m.def("gemm_linear_gated_residual_m2n4s16", &gemm_linear_gated_residual_variant_entrypoint<2,4,16>);
     m.def("gemm_linear_gated_residual_m2n2s8", &gemm_linear_gated_residual_variant_entrypoint<2,2,8>);
     m.def("gemm_linear_gated_residual_m1n4s8", &gemm_linear_gated_residual_variant_entrypoint<1,4,8>);

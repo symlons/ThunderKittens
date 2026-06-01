@@ -99,6 +99,13 @@ def tk_fused_linear_gated_out(group: tuple[torch.Tensor, ...], tokens: int) -> t
     return fused_out
 
 
+def tk_native_then_gated(group: tuple[torch.Tensor, ...], tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    a, w, b, residual, gate, _native_out, fused_out, projected, *_ = group
+    _C.gemm_linear_native(a, w, projected, b)
+    _C.gated_residual(residual, projected, gate, fused_out, tokens)
+    return fused_out, projected
+
+
 def torch_linear_gated_fwd_bwd(group: tuple[torch.Tensor, ...], tokens: int) -> tuple[torch.Tensor, ...]:
     a, w, b, residual, gate, *_rest = group
     grad_out = group[8]
@@ -116,6 +123,16 @@ def torch_linear_gated_fwd_bwd(group: tuple[torch.Tensor, ...], tokens: int) -> 
 def tk_projected_fwd_bwd(group: tuple[torch.Tensor, ...], tokens: int) -> tuple[torch.Tensor, ...]:
     a, w, b, residual, gate, _native_out, fused_out, projected, grad_out, dx, dw, db, dresidual, dprojected, dgate = group
     _C.gemm_linear_gated_residual(a, w, residual, gate, fused_out, projected, b, tokens)
+    _C.gated_residual_backward_no_dx_db(grad_out, projected, gate, dprojected, dgate, db, tokens)
+    _linear_bwd_fused.dw_gemm(dprojected, a, dw)
+    _linear_bwd_fused.dx_gemm_native(dprojected, w.contiguous(), dx)
+    return fused_out, dx, dw, db, grad_out, dgate
+
+
+def tk_native_then_gated_fwd_bwd(group: tuple[torch.Tensor, ...], tokens: int) -> tuple[torch.Tensor, ...]:
+    a, w, b, residual, gate, _native_out, fused_out, projected, grad_out, dx, dw, db, dresidual, dprojected, dgate = group
+    _C.gemm_linear_native(a, w, projected, b)
+    _C.gated_residual(residual, projected, gate, fused_out, tokens)
     _C.gated_residual_backward_no_dx_db(grad_out, projected, gate, dprojected, dgate, db, tokens)
     _linear_bwd_fused.dw_gemm(dprojected, a, dw)
     _linear_bwd_fused.dx_gemm_native(dprojected, w.contiguous(), dx)
@@ -281,16 +298,31 @@ def bench_one(
         ("torch_compile_linear_gated", compiled_linear_gated),
         ("tk_native_linear", tk_native_linear),
         ("tk_native_linear_m2n4s4", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n4s4")),
+        ("tk_native_linear_m2n4s6", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n4s6")),
+        ("tk_native_linear_m2n4s8", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n4s8")),
+        ("tk_native_linear_m2n4s12", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n4s12")),
         ("tk_native_linear_m2n4s16", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n4s16")),
         ("tk_native_linear_m2n2s8", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m2n2s8")),
         ("tk_native_linear_m1n4s8", lambda group: tk_native_linear_variant(group, "gemm_linear_native_m1n4s8")),
         ("tk_native_gelu", lambda group: tk_native_gelu_variant(group, "gemm_custom_native")),
         ("tk_native_gelu_m2n4s4", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n4s4")),
+        ("tk_native_gelu_m2n4s6", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n4s6")),
+        ("tk_native_gelu_m2n4s8", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n4s8")),
+        ("tk_native_gelu_m2n4s12", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n4s12")),
         ("tk_native_gelu_m2n4s16", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n4s16")),
         ("tk_native_gelu_m2n2s8", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m2n2s8")),
         ("tk_native_gelu_m1n4s8", lambda group: tk_native_gelu_variant(group, "gemm_custom_native_m1n4s8")),
         ("tk_fused_linear_gated", lambda group: tk_fused_linear_gated(group, tokens)),
+        ("tk_fused_linear_gated_m2n4s2", lambda group: (_C.gemm_linear_gated_residual_m2n4s2(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
+        ("tk_fused_linear_gated_m2n4s4", lambda group: (_C.gemm_linear_gated_residual_m2n4s4(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
+        ("tk_fused_linear_gated_m2n4s6", lambda group: (_C.gemm_linear_gated_residual_m2n4s6(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
+        ("tk_fused_linear_gated_m2n4s8", lambda group: (_C.gemm_linear_gated_residual_m2n4s8(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
+        ("tk_fused_linear_gated_m2n4s12", lambda group: (_C.gemm_linear_gated_residual_m2n4s12(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
+        ("tk_fused_linear_gated_m2n4s16", lambda group: (_C.gemm_linear_gated_residual_m2n4s16(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
+        ("tk_fused_linear_gated_m2n2s8", lambda group: (_C.gemm_linear_gated_residual_m2n2s8(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
+        ("tk_fused_linear_gated_m1n4s8", lambda group: (_C.gemm_linear_gated_residual_m1n4s8(group[0], group[1], group[3], group[4], group[6], group[7], group[2], tokens), group[6])),
         ("tk_fused_linear_gated_out", lambda group: tk_fused_linear_gated_out(group, tokens)),
+        ("tk_native_then_gated", lambda group: tk_native_then_gated(group, tokens)),
     ):
         result = profile_groups(
             f"{label} {name}",
@@ -359,6 +391,7 @@ def bench_one_fwd_bwd(
         ("torch_linear_gated_fwd_bwd", lambda group: torch_linear_gated_fwd_bwd(group, tokens)),
         ("torch_compile_linear_gated_fwd_bwd", compiled_fwd_bwd),
         ("tk_projected_fwd_bwd", lambda group: tk_projected_fwd_bwd(group, tokens)),
+        ("tk_native_then_gated_fwd_bwd", lambda group: tk_native_then_gated_fwd_bwd(group, tokens)),
         ("tk_out_recompute_fwd_bwd", lambda group: tk_out_recompute_fwd_bwd(group, tokens)),
     ):
         result = profile_groups(
@@ -379,8 +412,10 @@ def bench_one_fwd_bwd(
         f"torch={results['torch_linear_gated_fwd_bwd']:.2f}us "
         f"torch_compile={compile_us:.2f}us "
         f"tk_projected={results['tk_projected_fwd_bwd']:.2f}us "
+        f"tk_native_then_gated={results['tk_native_then_gated_fwd_bwd']:.2f}us "
         f"tk_out_recompute={results['tk_out_recompute_fwd_bwd']:.2f}us "
         f"tk_projected_vs_compile={compile_us / results['tk_projected_fwd_bwd']:.2f}x "
+        f"tk_native_then_gated_vs_compile={compile_us / results['tk_native_then_gated_fwd_bwd']:.2f}x "
         f"tk_out_recompute_vs_compile={compile_us / results['tk_out_recompute_fwd_bwd']:.2f}x",
         flush=True,
     )

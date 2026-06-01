@@ -544,6 +544,10 @@ void dw_gemm_entrypoint(
         launch_dw_gemm_variant<1, 2, 8, 4, 128>(x, dz, dW);
         return;
     }
+    if (K == 4096 && N == 1024) {
+        launch_dw_gemm_variant<2, 4, 4, 4, 128>(x, dz, dW);
+        return;
+    }
     launch_dw_gemm_variant<2, 4, 16, 4, 128>(x, dz, dW);
 }
 

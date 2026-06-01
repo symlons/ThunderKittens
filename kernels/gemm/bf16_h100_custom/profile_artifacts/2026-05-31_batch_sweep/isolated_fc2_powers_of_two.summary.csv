@@ -1,0 +1,9 @@
+batch,tokens,M,N,K,torch_compile_gated_us,tk_fused_us,tk_out_only_us,fused_vs_compile_gated,out_vs_compile_gated,tk_projected_faster_than_compile_gated,tk_out_only_faster_than_compile_gated
+1,256,256,1024,4096,117.01,51.38,50.52,2.28,2.32,True,True
+2,256,512,1024,4096,115.68,52.15,51.42,2.22,2.25,True,True
+4,256,1024,1024,4096,115.32,52.73,51.98,2.19,2.22,True,True
+8,256,2048,1024,4096,116.68,54.29,57.74,2.15,2.02,True,True
+16,256,4096,1024,4096,115.76,71.63,73.15,1.62,1.58,True,True
+32,256,8192,1024,4096,147.1,155.24,147.58,0.95,1.0,False,False
+64,256,16384,1024,4096,286.59,299.5,286.81,0.96,1.0,False,False
+128,256,32768,1024,4096,577.03,592.65,667.12,0.97,0.86,False,False

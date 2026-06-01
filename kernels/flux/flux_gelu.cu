@@ -21,6 +21,12 @@ __device__ static inline float fast_tanh(float x) {
   #endif
 }
 
+__device__ static inline float fast_gelu_tanh(float x) {
+    float x2 = x * x;
+    float arg = x * fmaf(0.035677408f, x2, 0.79788456f);
+    return (0.5f * x) * (1.0f + fast_tanh(arg));
+}
+
 using namespace kittens;
 template<kittens::ducks::sv::all SV> __device__ static inline void init_bias(rt_fl<16,SV::length> &acc, const SV &bias) {
     #pragma unroll
@@ -62,7 +68,8 @@ struct flux_matmul_gelu_layout {
 template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int transpose_lhs, int transpose_rhs>
 struct flux_matmul_gelu_template {
     using layout = flux_matmul_gelu_layout<BLOCK_M, BLOCK_N, BLOCK_K, transpose_lhs, transpose_rhs>;
-    static constexpr int NUM_CONSUMER_WARPS = BLOCK_M/16, NUM_CONSUMER_WARPGROUPS = NUM_CONSUMER_WARPS/4;
+    static constexpr int NUM_CONSUMER_WARPS = BLOCK_M/16, NUM_CONSUMER_WARPGROUPS = NUM_CONSUMER_WARPS/4,
+                         INPUT_PIPE_STAGES = 4;
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if(args.task_iter == 0) {
             args.num_iters = transpose_lhs ? args.globals.lhs.rows() / BLOCK_K : args.globals.lhs.cols() / BLOCK_K;
@@ -71,11 +78,11 @@ struct flux_matmul_gelu_template {
     }
     struct producer {
         __device__ static void setup(producer_setup_args<layout> args) { // setup and load the first iteration
-            warpgroup::producer_registers(); // decrease registers for the producer warpgroup
+            warpgroup::decrease_registers<32>(); // decrease registers for the producer warpgroup
         }
         __device__ static void load(producer_load_args<layout> args) { // semaphore for the producer to load into
             if(warpgroup::laneid() == 0) {
-                tma::expect_bytes(args.inputs_arrived, sizeof(layout::input_block));
+                tma::expect(args.inputs_arrived, args.input);
                 for(int i = 0; i < NUM_CONSUMER_WARPGROUPS; i++) {
                     if constexpr (transpose_lhs)
                         tma::load_async(args.input.lhs[i], args.globals.lhs, {args.iter, (int)blockIdx.x*NUM_CONSUMER_WARPGROUPS+i}, args.inputs_arrived);
@@ -92,7 +99,7 @@ struct flux_matmul_gelu_template {
     };
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) { // setup locals for before the first iteration
-            warpgroup::consumer_registers<NUM_CONSUMER_WARPGROUPS>();
+            warpgroup::increase_registers<NUM_CONSUMER_WARPGROUPS == 3 ? 152 : 232>();
             group<NUM_CONSUMER_WARPS>::load(args.scratch.bias, args.globals.bias, {(int)blockIdx.y});
             group<NUM_CONSUMER_WARPS>::sync(0);
             init_bias(args.state.acc, args.scratch.bias); // <std::remove_reference_t<decltype(args.scratch.bias)>>
@@ -116,8 +123,8 @@ struct flux_matmul_gelu_template {
                 #pragma unroll
                 for(int j = 0; j < 4; j++) {
                     float f = args.state.acc.tiles[0][i].data[j].x, g = args.state.acc.tiles[0][i].data[j].y;
-                    args.state.acc.tiles[0][i].data[j].x = f * 0.5f * (1.0f + fast_tanh(f * 0.79788456f * (1.f + f * f *0.044715f)));  
-                    args.state.acc.tiles[0][i].data[j].y = g * 0.5f * (1.0f + fast_tanh(g * 0.79788456f * (1.f + g * g *0.044715f)));  
+                    args.state.acc.tiles[0][i].data[j].x = fast_gelu_tanh(f);
+                    args.state.acc.tiles[0][i].data[j].y = fast_gelu_tanh(g);
                 } 
             }
             warpgroup::store(args.finish.acc[warpgroup::groupid()], args.state.acc);
