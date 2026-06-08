@@ -660,6 +660,8 @@ def run_ditblock_fusion_ui(
         compare_scroll_step: int,
         timeline_offset_us: float,
         timeline_window_us: float,
+        call_offset: int,
+        timeline_mode: str,
         active_lane: str,
         event_indices: dict[str, int],
         inspect_event: bool,
@@ -762,7 +764,7 @@ def run_ditblock_fusion_ui(
         if show_compare:
             put(y, x, "eager vs compile trace", curses.A_BOLD)
             y += 1
-            put(y, x + 2, "tab lane  [/] kernel  h/l pan  +/- zoom", curses.A_DIM)
+            put(y, x + 2, "m mode  tab lane  [/] kernel  h/l pan", curses.A_DIM)
             y += 1
             put(y, x + 2, "j/k scroll  up/down variants  a/f speed  t back  q", curses.A_DIM)
             y += 1
@@ -772,7 +774,14 @@ def run_ditblock_fusion_ui(
                 window_us = min(max(1.0, timeline_window_us), scale_us)
                 offset_us = min(max(0.0, timeline_offset_us), max(0.0, scale_us - window_us))
                 zoom = scale_us / max(window_us, 1.0)
-                put(y, x + 2, f"cursor lane={active_lane}  window={offset_us / 1000.0:.3f}-{(offset_us + window_us) / 1000.0:.3f} ms / {scale_us / 1000.0:.3f} ms  zoom={zoom:.1f}x  detail={'on' if inspect_event else 'off'}", curses.A_BOLD)
+                active_for_window = compare_data.eager if active_lane == "eager" else compare_data.compile
+                call_window = max(1, lane_width)
+                call_start = min(max(0, call_offset), max(0, len(active_for_window.events) - call_window))
+                call_end = min(len(active_for_window.events), call_start + call_window)
+                if timeline_mode == "calls":
+                    put(y, x + 2, f"mode=calls  lane={active_lane}  calls={call_start + 1}-{call_end}/{len(active_for_window.events)}  detail={'on' if inspect_event else 'off'}", curses.A_BOLD)
+                else:
+                    put(y, x + 2, f"mode=time  lane={active_lane}  window={offset_us / 1000.0:.3f}-{(offset_us + window_us) / 1000.0:.3f} ms / {scale_us / 1000.0:.3f} ms  zoom={zoom:.1f}x  detail={'on' if inspect_event else 'off'}", curses.A_BOLD)
                 y += 1
 
                 def event_char(category: str) -> str:
@@ -801,23 +810,36 @@ def run_ditblock_fusion_ui(
                     selected_col: int | None = None
                     selected_range: tuple[int, int, str] | None = None
                     selected_index = event_indices.get(lane.label, 0)
-                    for idx, event in enumerate(lane.events):
-                        if event.end_us < offset_us or event.start_us > offset_us + window_us:
-                            continue
-                        left = max(0, min(lane_width - 1, int((event.start_us - offset_us) / window_us * lane_width)))
-                        right = max(left + 1, min(lane_width, int((event.end_us - offset_us) / window_us * lane_width) + 1))
-                        ch = event_char(event.category)
-                        attr = category_color_attr(event.category)
-                        for col in range(left, right):
-                            cells[col] = (ch, attr)
-                        if is_active and idx == selected_index:
-                            selected_col = left
-                            selected_range = (left, right, event.category)
+                    if timeline_mode == "calls":
+                        start = min(max(0, call_offset), max(0, len(lane.events) - lane_width))
+                        for col, idx in enumerate(range(start, min(len(lane.events), start + lane_width))):
+                            event = lane.events[idx]
+                            cells[col] = (event_char(event.category), category_color_attr(event.category))
+                            if is_active and idx == selected_index:
+                                selected_col = col
+                                selected_range = (col, col + 1, event.category)
+                    else:
+                        for idx, event in enumerate(lane.events):
+                            if event.end_us < offset_us or event.start_us > offset_us + window_us:
+                                continue
+                            left = max(0, min(lane_width - 1, int((event.start_us - offset_us) / window_us * lane_width)))
+                            right = max(left + 1, min(lane_width, int((event.end_us - offset_us) / window_us * lane_width) + 1))
+                            ch = event_char(event.category)
+                            attr = category_color_attr(event.category)
+                            for col in range(left, right):
+                                cells[col] = (ch, attr)
+                            if is_active and idx == selected_index:
+                                selected_col = left
+                                selected_range = (left, right, event.category)
                     if selected_range is not None:
                         left, right, category = selected_range
                         center_col = max(0, min(lane_width - 1, (left + right - 1) // 2))
-                        left = max(0, min(left, center_col - 1))
-                        right = min(lane_width, max(right, center_col + 2))
+                        if timeline_mode == "calls":
+                            left = center_col
+                            right = center_col + 1
+                        else:
+                            left = max(0, min(left, center_col - 1))
+                            right = min(lane_width, max(right, center_col + 2))
                         for col in range(left, right):
                             cells[col] = ("@", category_color_attr(category, selected_event=True))
                     return cells, selected_col
@@ -993,6 +1015,8 @@ def run_ditblock_fusion_ui(
         compare_scroll_step = 1
         timeline_offset_us = 0.0
         timeline_window_us = max(compare_data.eager.span_us, compare_data.compile.span_us, 1.0) if compare_data is not None else 1.0
+        call_offset = 0
+        timeline_mode = "time"
         active_lane = "compile"
         event_indices = {"eager": 0, "compile": 0}
         inspect_event = False
@@ -1010,6 +1034,28 @@ def run_ditblock_fusion_ui(
         def clamp_timeline_offset(offset_us: float) -> float:
             scale_us = compare_span_us()
             return min(max(0.0, scale_us - timeline_window_us), max(0.0, offset_us))
+
+        def clamp_call_offset(offset: int) -> int:
+            lane = focused_lane()
+            if lane is None:
+                return 0
+            return min(max(0, len(lane.events) - 1), max(0, offset))
+
+        def ensure_selected_call_visible(*, center: bool = False) -> None:
+            nonlocal call_offset
+            lane = focused_lane()
+            if lane is None or not lane.events:
+                return
+            idx = min(max(0, event_indices.get(active_lane, 0)), len(lane.events) - 1)
+            event_indices[active_lane] = idx
+            window = 76
+            if center:
+                call_offset = max(0, idx - window // 2)
+            elif idx < call_offset + max(1, window // 5):
+                call_offset = max(0, idx - max(1, window // 5))
+            elif idx >= call_offset + window - max(1, window // 5):
+                call_offset = max(0, idx - window + max(1, window // 5) + 1)
+            call_offset = clamp_call_offset(call_offset)
 
         def selected_event() -> TraceEvent | None:
             lane = focused_lane()
@@ -1051,6 +1097,8 @@ def run_ditblock_fusion_ui(
                 compare_scroll_step,
                 timeline_offset_us,
                 timeline_window_us,
+                call_offset,
+                timeline_mode,
                 active_lane,
                 event_indices,
                 inspect_event,
@@ -1122,22 +1170,38 @@ def run_ditblock_fusion_ui(
                     status_lines = ("showing loaded comparison; press c to rerun for selected variant",)
                 else:
                     status_lines = ("no loaded comparison yet; press c to generate one",)
+            elif key == ord("m"):
+                if show_compare and compare_data is not None:
+                    timeline_mode = "calls" if timeline_mode == "time" else "time"
+                    if timeline_mode == "calls":
+                        ensure_selected_call_visible(center=True)
+                    else:
+                        ensure_selected_visible(zoom_if_full=True, center=True)
             elif key == ord("	"):
                 if show_compare and compare_data is not None:
                     active_lane = "eager" if active_lane == "compile" else "compile"
-                    ensure_selected_visible(zoom_if_full=True, center=True)
+                    if timeline_mode == "calls":
+                        ensure_selected_call_visible(center=True)
+                    else:
+                        ensure_selected_visible(zoom_if_full=True, center=True)
             elif key in (ord("h"), curses.KEY_LEFT):
                 if show_compare and compare_data is not None:
-                    scale_us = compare_span_us()
-                    if timeline_window_us >= scale_us * 0.99:
-                        timeline_window_us = max(1.0, scale_us / 4.0)
-                    timeline_offset_us = clamp_timeline_offset(timeline_offset_us - timeline_window_us * 0.25)
+                    if timeline_mode == "calls":
+                        call_offset = clamp_call_offset(call_offset - 16)
+                    else:
+                        scale_us = compare_span_us()
+                        if timeline_window_us >= scale_us * 0.99:
+                            timeline_window_us = max(1.0, scale_us / 4.0)
+                        timeline_offset_us = clamp_timeline_offset(timeline_offset_us - timeline_window_us * 0.25)
             elif key in (ord("l"), curses.KEY_RIGHT):
                 if show_compare and compare_data is not None:
-                    scale_us = compare_span_us()
-                    if timeline_window_us >= scale_us * 0.99:
-                        timeline_window_us = max(1.0, scale_us / 4.0)
-                    timeline_offset_us = clamp_timeline_offset(timeline_offset_us + timeline_window_us * 0.25)
+                    if timeline_mode == "calls":
+                        call_offset = clamp_call_offset(call_offset + 16)
+                    else:
+                        scale_us = compare_span_us()
+                        if timeline_window_us >= scale_us * 0.99:
+                            timeline_window_us = max(1.0, scale_us / 4.0)
+                        timeline_offset_us = clamp_timeline_offset(timeline_offset_us + timeline_window_us * 0.25)
             elif key in (ord("+"), ord("=")):
                 if show_compare and compare_data is not None:
                     center = timeline_offset_us + timeline_window_us / 2.0
@@ -1154,13 +1218,19 @@ def run_ditblock_fusion_ui(
                     lane = focused_lane()
                     if lane is not None and lane.events:
                         event_indices[active_lane] = max(0, event_indices.get(active_lane, 0) - 1)
-                        ensure_selected_visible(zoom_if_full=True)
+                        if timeline_mode == "calls":
+                            ensure_selected_call_visible()
+                        else:
+                            ensure_selected_visible(zoom_if_full=True)
             elif key == ord("]"):
                 if show_compare and compare_data is not None:
                     lane = focused_lane()
                     if lane is not None and lane.events:
                         event_indices[active_lane] = min(len(lane.events) - 1, event_indices.get(active_lane, 0) + 1)
-                        ensure_selected_visible(zoom_if_full=True)
+                        if timeline_mode == "calls":
+                            ensure_selected_call_visible()
+                        else:
+                            ensure_selected_visible(zoom_if_full=True)
             elif key == ord("r"):
                 if trace_runner is None:
                     status_lines = ("trace runner not configured",)
@@ -1189,6 +1259,8 @@ def run_ditblock_fusion_ui(
                 compare_scroll_step = 1
                 timeline_offset_us = 0.0
                 timeline_window_us = max(compare_data.eager.span_us, compare_data.compile.span_us, 1.0) if compare_data is not None else 1.0
+                call_offset = 0
+                timeline_mode = "time"
                 active_lane = "compile"
                 event_indices = {"eager": 0, "compile": 0}
                 inspect_event = False
