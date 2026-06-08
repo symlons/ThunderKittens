@@ -514,12 +514,25 @@ def make_block_group(batch: int, tokens: int, hidden_size: int, seed: int):
     return x, c, grad
 
 
+def block_forward_step(block: nn.Module, group):
+    x, c, _ = group
+    with torch.no_grad():
+        block(x, c)
+
+
 def block_train_step(block: nn.Module, group):
     x, c, grad = group
     out = block(x, c)
     out.backward(grad)
     block.zero_grad(set_to_none=True)
     x.grad = None
+
+
+def block_profile_step(block: nn.Module, group, include_backward: bool):
+    if include_backward:
+        block_train_step(block, group)
+    else:
+        block_forward_step(block, group)
 
 
 def profile_variant_block_case(
@@ -531,20 +544,22 @@ def profile_variant_block_case(
     iters: int,
     rows: int,
     trace_out: Path | None = None,
+    include_backward: bool = False,
 ) -> None:
     config = variant_config(variant_name)
     block = make_variant_block(model_name, config)
     hidden = dit_config(model_name)["hidden_size"]
     group = make_block_group(batch, tokens, hidden, 88000)
     for _ in range(warmup):
-        block_train_step(block, group)
+        block_profile_step(block, group, include_backward)
     torch.cuda.synchronize()
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
         for _ in range(iters):
-            block_train_step(block, group)
+            block_profile_step(block, group, include_backward)
     torch.cuda.synchronize()
-    print(f"\nTorch profiler DiTBlock-{model_name} {variant_name} B{batch} T{tokens} warmup={warmup} iters={iters}")
+    mode = "forward+backward" if include_backward else "forward"
+    print(f"\nTorch profiler DiTBlock-{model_name} {variant_name} {mode} B{batch} T{tokens} warmup={warmup} iters={iters}")
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=rows))
     if trace_out is not None:
         trace_out.parent.mkdir(parents=True, exist_ok=True)
@@ -630,8 +645,9 @@ def trace_file_name(model_name: str, variant_name: str, batch: int, spatial: tup
     return f"dit_{model_name}_{variant_name}_b{batch}_t{tokens}.json"
 
 
-def block_trace_file_name(model_name: str, variant_name: str, batch: int, tokens: int) -> str:
-    return f"ditblock_{model_name}_{variant_name}_b{batch}_t{tokens}.json"
+def block_trace_file_name(model_name: str, variant_name: str, batch: int, tokens: int, include_backward: bool = False) -> str:
+    mode = "fwd_bwd" if include_backward else "fwd"
+    return f"ditblock_{mode}_{model_name}_{variant_name}_b{batch}_t{tokens}.json"
 
 
 def profile_variant_block_trace(
@@ -643,9 +659,10 @@ def profile_variant_block_trace(
     iters: int,
     rows: int,
     trace_dir: Path,
+    include_backward: bool = False,
 ) -> Path:
-    trace_path = trace_dir / block_trace_file_name(model_name, variant_name, batch, tokens)
-    profile_variant_block_case(model_name, variant_name, batch, tokens, warmup, iters, rows, trace_path)
+    trace_path = trace_dir / block_trace_file_name(model_name, variant_name, batch, tokens, include_backward)
+    profile_variant_block_case(model_name, variant_name, batch, tokens, warmup, iters, rows, trace_path, include_backward)
     return trace_path
 
 
@@ -1089,6 +1106,7 @@ def main():
     parser.add_argument("--print-ditblock", action="store_true", help="Print colored DiTBlock fusion plan for selected variants and exit.")
     parser.add_argument("--ditblock-ui", action="store_true", help="Open an interactive DiTBlock variant browser. Use with --print-ditblock.")
     parser.add_argument("--ditblock-detail", action="store_true", help="Include kernel-boundary explanations in --print-ditblock output.")
+    parser.add_argument("--ditblock-bwd", action="store_true", help="Profile DiTBlock forward+backward traces in the UI. Default is forward-only.")
     parser.add_argument("--ditblock-compile-trace", type=Path, default=None, help="Chrome trace JSON from a compiled profile run; used to show actual TorchInductor Triton kernels in the DiTBlock UI/printout.")
     parser.add_argument("--ditblock-compile-rows", type=int, default=8, help="Number of trace-derived TorchInductor kernels to show in the DiTBlock UI/printout.")
     parser.add_argument("--ditblock-trace-dir", type=Path, default=Path("profile_artifacts/ditblock_ui_traces"), help="Directory where DiTBlock UI trace reruns are written.")
@@ -1108,25 +1126,25 @@ def main():
         batch = args.batches[0]
         tokens = spatial[0] * spatial[1] * spatial[2]
         trace_config = (
-            f"trace config: scope=DiTBlock model={args.model} batch={batch} tokens={tokens} warmup={args.warmup} iters={args.iters}",
+            f"trace config: scope=DiTBlock mode={'forward+backward' if args.ditblock_bwd else 'forward'} model={args.model} batch={batch} tokens={tokens} warmup={args.warmup} iters={args.iters}",
             f"trace dir: {args.ditblock_trace_dir}",
         )
 
         def ui_trace_runner(variant_name: str):
-            trace_path = profile_variant_block_trace(args.model, variant_name, batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            trace_path = profile_variant_block_trace(args.model, variant_name, batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir, include_backward=args.ditblock_bwd)
             evidence = load_compile_fusion_evidence(trace_path, rows=args.ditblock_compile_rows) if variant_config(variant_name).compiled else None
             return evidence, (f"wrote trace: {trace_path}",)
 
         def ui_compare_runner(variant_name: str):
             compile_variant = variant_name if variant_config(variant_name).compiled else "compile"
-            eager_trace = profile_variant_block_trace(args.model, "eager", batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
-            compile_trace = profile_variant_block_trace(args.model, compile_variant, batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            eager_trace = profile_variant_block_trace(args.model, "eager", batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir, include_backward=args.ditblock_bwd)
+            compile_trace = profile_variant_block_trace(args.model, compile_variant, batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir, include_backward=args.ditblock_bwd)
             evidence = load_compile_fusion_evidence(compile_trace, rows=args.ditblock_compile_rows)
             lines, data = compare_compile_trace(eager_trace, compile_trace, rows=args.ditblock_compile_rows)
             return evidence, lines, data
 
-        existing_eager_trace = args.ditblock_trace_dir / block_trace_file_name(args.model, "eager", batch, tokens)
-        existing_compile_trace = args.ditblock_trace_dir / block_trace_file_name(args.model, "compile", batch, tokens)
+        existing_eager_trace = args.ditblock_trace_dir / block_trace_file_name(args.model, "eager", batch, tokens, args.ditblock_bwd)
+        existing_compile_trace = args.ditblock_trace_dir / block_trace_file_name(args.model, "compile", batch, tokens, args.ditblock_bwd)
         initial_compare_lines: tuple[str, ...] = ()
         initial_compare_data = None
         initial_show_compare = False
