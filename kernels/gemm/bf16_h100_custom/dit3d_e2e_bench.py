@@ -28,6 +28,7 @@ from tk_dit_ops import (
     linear_then_gated_residual,
     modulate,
 )
+from dit_profile_utils import REGULAR_TIMM_BLOCK_KWARGS
 
 
 class ProjectedAttention(nn.Module):
@@ -474,6 +475,83 @@ def make_variant_model(model_name: str, config: VariantConfig) -> nn.Module:
     return model
 
 
+def make_variant_block(model_name: str, config: VariantConfig) -> nn.Module:
+    cfg = dit_config(model_name)
+    block = DiTBlock(
+        cfg["hidden_size"],
+        cfg["num_heads"],
+        fused_adaln_enabled=config.fused,
+        fused_residual_enabled=config.fused_residual,
+        tk_mlp_enabled=config.tk_mlp,
+        fused_input_projection_enabled=config.fused_input_projection,
+        fused_output_projection_enabled=config.fused_output_projection,
+        fused_epilogue_only_enabled=config.fused_epilogue_only,
+        attention_backend=config.attention_backend,
+        **({} if config.attention_backend != "timm" else {
+            key: value for key, value in REGULAR_TIMM_BLOCK_KWARGS.items()
+            if key not in {
+                "fused_adaln_enabled",
+                "fused_residual_enabled",
+                "tk_mlp_enabled",
+                "fused_input_projection_enabled",
+                "fused_output_projection_enabled",
+                "fused_epilogue_only_enabled",
+                "attention_backend",
+            }
+        }),
+    ).cuda().to(torch.bfloat16).train()
+    nn.init.xavier_uniform_(block.adaLN_modulation[-1].weight)
+    nn.init.normal_(block.adaLN_modulation[-1].bias, std=0.02)
+    if config.compiled:
+        block = torch.compile(block)
+    return block
+
+
+def make_block_group(batch: int, tokens: int, hidden_size: int, seed: int):
+    x = uniform_bf16((batch, tokens, hidden_size), seed, -1.0, 1.0).requires_grad_(True)
+    c = uniform_bf16((batch, hidden_size), seed + 1, -1.0, 1.0)
+    grad = uniform_bf16((batch, tokens, hidden_size), seed + 2, -1.0, 1.0)
+    return x, c, grad
+
+
+def block_train_step(block: nn.Module, group):
+    x, c, grad = group
+    out = block(x, c)
+    out.backward(grad)
+    block.zero_grad(set_to_none=True)
+    x.grad = None
+
+
+def profile_variant_block_case(
+    model_name: str,
+    variant_name: str,
+    batch: int,
+    tokens: int,
+    warmup: int,
+    iters: int,
+    rows: int,
+    trace_out: Path | None = None,
+) -> None:
+    config = variant_config(variant_name)
+    block = make_variant_block(model_name, config)
+    hidden = dit_config(model_name)["hidden_size"]
+    group = make_block_group(batch, tokens, hidden, 88000)
+    for _ in range(warmup):
+        block_train_step(block, group)
+    torch.cuda.synchronize()
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
+        for _ in range(iters):
+            block_train_step(block, group)
+    torch.cuda.synchronize()
+    print(f"\nTorch profiler DiTBlock-{model_name} {variant_name} B{batch} T{tokens} warmup={warmup} iters={iters}")
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=rows))
+    if trace_out is not None:
+        trace_out.parent.mkdir(parents=True, exist_ok=True)
+        prof.export_chrome_trace(str(trace_out))
+        print(f"wrote Chrome trace: {trace_out}")
+
+
 def clone_state(dst: nn.Module, src: nn.Module) -> None:
     dst.load_state_dict(src.state_dict(), strict=False)
 
@@ -550,6 +628,25 @@ def profile_variant_case(
 def trace_file_name(model_name: str, variant_name: str, batch: int, spatial: tuple[int, int, int]) -> str:
     tokens = spatial[0] * spatial[1] * spatial[2]
     return f"dit_{model_name}_{variant_name}_b{batch}_t{tokens}.json"
+
+
+def block_trace_file_name(model_name: str, variant_name: str, batch: int, tokens: int) -> str:
+    return f"ditblock_{model_name}_{variant_name}_b{batch}_t{tokens}.json"
+
+
+def profile_variant_block_trace(
+    model_name: str,
+    variant_name: str,
+    batch: int,
+    tokens: int,
+    warmup: int,
+    iters: int,
+    rows: int,
+    trace_dir: Path,
+) -> Path:
+    trace_path = trace_dir / block_trace_file_name(model_name, variant_name, batch, tokens)
+    profile_variant_block_case(model_name, variant_name, batch, tokens, warmup, iters, rows, trace_path)
+    return trace_path
 
 
 def profile_variant_trace(
@@ -1011,25 +1108,25 @@ def main():
         batch = args.batches[0]
         tokens = spatial[0] * spatial[1] * spatial[2]
         trace_config = (
-            f"trace config: model={args.model} batch={batch} tokens={tokens} warmup={args.warmup} iters={args.iters}",
+            f"trace config: scope=DiTBlock model={args.model} batch={batch} tokens={tokens} warmup={args.warmup} iters={args.iters}",
             f"trace dir: {args.ditblock_trace_dir}",
         )
 
         def ui_trace_runner(variant_name: str):
-            trace_path = profile_variant_trace(args.model, variant_name, batch, spatial, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            trace_path = profile_variant_block_trace(args.model, variant_name, batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
             evidence = load_compile_fusion_evidence(trace_path, rows=args.ditblock_compile_rows) if variant_config(variant_name).compiled else None
             return evidence, (f"wrote trace: {trace_path}",)
 
         def ui_compare_runner(variant_name: str):
             compile_variant = variant_name if variant_config(variant_name).compiled else "compile"
-            eager_trace = profile_variant_trace(args.model, "eager", batch, spatial, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
-            compile_trace = profile_variant_trace(args.model, compile_variant, batch, spatial, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            eager_trace = profile_variant_block_trace(args.model, "eager", batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            compile_trace = profile_variant_block_trace(args.model, compile_variant, batch, tokens, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
             evidence = load_compile_fusion_evidence(compile_trace, rows=args.ditblock_compile_rows)
             lines, data = compare_compile_trace(eager_trace, compile_trace, rows=args.ditblock_compile_rows)
             return evidence, lines, data
 
-        existing_eager_trace = args.ditblock_trace_dir / trace_file_name(args.model, "eager", batch, spatial)
-        existing_compile_trace = args.ditblock_trace_dir / trace_file_name(args.model, "compile", batch, spatial)
+        existing_eager_trace = args.ditblock_trace_dir / block_trace_file_name(args.model, "eager", batch, tokens)
+        existing_compile_trace = args.ditblock_trace_dir / block_trace_file_name(args.model, "compile", batch, tokens)
         initial_compare_lines: tuple[str, ...] = ()
         initial_compare_data = None
         initial_show_compare = False
