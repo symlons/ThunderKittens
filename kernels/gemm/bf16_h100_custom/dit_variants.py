@@ -6,7 +6,7 @@ import textwrap
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, cast
+from typing import Any, Callable, cast
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class TraceEvent:
     dur_us: float
     category: str
     name: str
+    args: dict[str, Any] | None = None
 
     @property
     def end_us(self) -> float:
@@ -69,6 +70,8 @@ def trace_event_glyph(category: str) -> str:
         return "U"
     if "conv" in category or "patch_embed" in category:
         return "P"
+    if "memcpy" in category:
+        return "M"
     if "memset" in category:
         return "0"
     return "."
@@ -98,6 +101,68 @@ def time_marker_timeline_cells(events: tuple[TraceEvent, ...], lane_width: int, 
         right = max(left + 1, min(len(cells), int((event.end_us - offset_us) / window * len(cells)) + 1))
         cells[(left + right - 1) // 2] = trace_event_glyph(event.category)
     return tuple(cells)
+
+
+def cuda_speedup_percent(eager_us: float, candidate_us: float) -> float | None:
+    if eager_us <= 0.0 or candidate_us <= 0.0:
+        return None
+    return (eager_us / candidate_us - 1.0) * 100.0
+
+
+def format_cuda_speedup(eager_us: float, candidate_us: float) -> str:
+    speedup = cuda_speedup_percent(eager_us, candidate_us)
+    if speedup is None:
+        return "speedup=n/a"
+    return f"speedup={speedup:+.1f}%"
+
+
+def trace_event_bytes(event: TraceEvent) -> int:
+    args = event.args or {}
+    value = args.get("bytes")
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def trace_lane_memory_bytes(lane: TraceLane) -> int:
+    return sum(trace_event_bytes(event) for event in lane.events)
+
+
+def format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024.0 or unit == "GiB":
+            return f"{value:.0f}{unit}" if unit == "B" else f"{value:.2f}{unit}"
+        value /= 1024.0
+    return f"{value:.2f}GiB"
+
+
+def trace_event_footprint_lines(event: TraceEvent) -> tuple[str, ...]:
+    args = event.args or {}
+    resource_keys = (
+        "registers per thread",
+        "shared memory",
+        "grid",
+        "block",
+        "blocks per SM",
+        "warps per SM",
+        "est. achieved occupancy %",
+    )
+    launch_keys = ("device", "context", "stream", "correlation", "External id")
+    memory_keys = ("bytes", "memory bandwidth (GB/s)")
+
+    def present(keys: tuple[str, ...]) -> list[str]:
+        return [f"{key}={args[key]}" for key in keys if key in args]
+
+    lines: list[str] = []
+    resources = present(resource_keys)
+    memory = present(memory_keys)
+    launch = present(launch_keys)
+    if resources:
+        lines.append("footprint: " + "  ".join(resources))
+    if memory:
+        lines.append("memory: " + "  ".join(memory))
+    if launch:
+        lines.append("launch: " + "  ".join(launch))
+    return tuple(lines)
 
 
 @dataclass(frozen=True)
@@ -865,6 +930,17 @@ def run_ditblock_fusion_ui(
                 else:
                     put(y, x + 2, f"mode=time  lane={active_lane}  window={offset_us / 1000.0:.3f}-{(offset_us + window_us) / 1000.0:.3f} ms / {scale_us / 1000.0:.3f} ms  zoom={zoom:.1f}x  detail={'on' if inspect_event else 'off'}", curses.A_BOLD)
                 y += 1
+                put(
+                    y,
+                    x + 2,
+                    f"CUDA: e={compare_data.eager.total_cuda_us / 1000.0:.3f}ms c={compare_data.compile.total_cuda_us / 1000.0:.3f}ms {format_cuda_speedup(compare_data.eager.total_cuda_us, compare_data.compile.total_cuda_us)}",
+                    curses.A_BOLD,
+                )
+                y += 1
+                eager_mem = trace_lane_memory_bytes(compare_data.eager)
+                compile_mem = trace_lane_memory_bytes(compare_data.compile)
+                put(y, x + 2, f"mem bytes: e={format_bytes(eager_mem)} c={format_bytes(compile_mem)}", curses.A_DIM)
+                y += 1
 
                 def event_char(category: str) -> str:
                     return trace_event_glyph(category)
@@ -910,7 +986,15 @@ def run_ditblock_fusion_ui(
                             return
                         put(row, cursor_col, ch, ch_attr)
                         cursor_col += 1
-                    put(row, cursor_col, f"| CUDA total={lane.total_cuda_us / 1000.0:.3f}ms", attr)
+                    suffix = f"| CUDA total={lane.total_cuda_us / 1000.0:.3f}ms"
+                    memory_bytes = trace_lane_memory_bytes(lane)
+                    if memory_bytes:
+                        suffix += f" mem={format_bytes(memory_bytes)}"
+                    if lane.label == "compile":
+                        suffix += f" {format_cuda_speedup(compare_data.eager.total_cuda_us, lane.total_cuda_us)}"
+                    elif lane.label == "eager":
+                        suffix += " baseline"
+                    put(row, cursor_col, suffix, attr)
 
                 for lane in (compare_data.eager, compare_data.compile):
                     is_active = lane.label == active_lane
@@ -925,7 +1009,7 @@ def run_ditblock_fusion_ui(
                         y += 1
                 put(y, x + 2, "legend: @ current  G GEMM  F fused  A attn  N AdaLN  L norm", curses.A_DIM)
                 y += 1
-                put(y, x + 2, "        R residual  U GELU  . other; right = total CUDA time", curses.A_DIM)
+                put(y, x + 2, "        R residual  U GELU  M memcpy  0 memset  . other; right = totals", curses.A_DIM)
                 y += 1
                 active = compare_data.eager if active_lane == "eager" else compare_data.compile
                 if active.events:
@@ -938,6 +1022,8 @@ def run_ditblock_fusion_ui(
                     y += 1
                     preview = event.name if len(event.name) <= 72 else event.name[:69] + "..."
                     y = put_wrapped(y, x + 4, "kernel: " + preview, curses.A_DIM)
+                    for footprint_line in trace_event_footprint_lines(event):
+                        y = put_wrapped(y, x + 4, footprint_line, curses.A_DIM)
                     if inspect_event and preview != event.name:
                         y = put_wrapped(y, x + 4, "full: " + event.name, curses.A_DIM)
                     elif not inspect_event and preview != event.name:

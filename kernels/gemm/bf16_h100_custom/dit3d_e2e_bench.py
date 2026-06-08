@@ -451,6 +451,9 @@ from dit_variants import (
     TraceCompareData,
     TraceEvent,
     TraceLane,
+    format_bytes,
+    format_cuda_speedup,
+    trace_lane_memory_bytes,
     VariantConfig,
     load_compile_fusion_evidence,
     print_ditblock_fusion_plan,
@@ -696,17 +699,20 @@ def compare_compile_trace(eager_trace: Path, compile_trace: Path, rows: int = 10
         external_linear_map = build_external_linear_map(events)
         out: list[TraceEvent] = []
         for event in events:
-            if event.get("ph") != "X" or event.get("cat") not in {"kernel", "gpu_memset"}:
+            if event.get("ph") != "X" or event.get("cat") not in {"kernel", "gpu_memcpy", "gpu_memset"}:
                 continue
             name = event.get("name", "")
             start_us = float(event.get("ts", 0.0))
             dur_us = float(event.get("dur", 0.0))
-            category, _desc = cuda_kernel_category(name, (event.get("args") or {}).get("External id"), external_linear_map)
-            out.append(TraceEvent(start_us, dur_us, category, name))
+            args = dict(event.get("args") or {})
+            category, _desc = cuda_kernel_category(name, args.get("External id"), external_linear_map)
+            if event.get("cat") == "gpu_memcpy":
+                category = "memcpy"
+            out.append(TraceEvent(start_us, dur_us, category, name, args))
         if not out:
             return []
         first_us = min(event.start_us for event in out)
-        return sorted((TraceEvent(event.start_us - first_us, event.dur_us, event.category, event.name) for event in out), key=lambda event: event.start_us)
+        return sorted((TraceEvent(event.start_us - first_us, event.dur_us, event.category, event.name, event.args) for event in out), key=lambda event: event.start_us)
 
     def kernel_rows(events: list[dict], limit: int) -> list[str]:
         grouped: dict[tuple[str, str], dict[str, float]] = defaultdict(lambda: {"count": 0, "dur_us": 0.0})
@@ -787,7 +793,8 @@ def compare_compile_trace(eager_trace: Path, compile_trace: Path, rows: int = 10
         "mode: eager vs compile trace browser",
         f"eager trace:   {eager_trace}",
         f"compile trace: {compile_trace}",
-        f"total CUDA: eager={eager_total_us / 1000.0:.3f} ms compile={compile_total_us / 1000.0:.3f} ms delta={(compile_total_us - eager_total_us) / 1000.0:+.3f} ms",
+        f"total CUDA: eager={eager_total_us / 1000.0:.3f} ms compile={compile_total_us / 1000.0:.3f} ms delta={(compile_total_us - eager_total_us) / 1000.0:+.3f} ms {format_cuda_speedup(eager_total_us, compile_total_us)}",
+        f"memory bytes in trace events: eager={format_bytes(trace_lane_memory_bytes(TraceLane('eager', tuple(categorized_kernel_events(eager_events)), eager_total_us)))} compile={format_bytes(trace_lane_memory_bytes(TraceLane('compile', tuple(categorized_kernel_events(compile_events)), compile_total_us)))}",
         "",
     ]
     lines.extend(timeline_rows(eager_events, compile_events))

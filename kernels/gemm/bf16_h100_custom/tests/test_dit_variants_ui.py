@@ -2,9 +2,13 @@ import unittest
 
 from dit_variants import (
     TraceEvent,
+    format_bytes,
+    format_cuda_speedup,
     packed_call_timeline_cells,
     time_marker_timeline_cells,
+    trace_event_footprint_lines,
     trace_event_glyph,
+    trace_event_bytes,
 )
 
 
@@ -19,6 +23,7 @@ class DiTTraceTimelineTests(unittest.TestCase):
             "gated_residual": "R",
             "mlp_gelu": "U",
             "patch_embed_conv": "P",
+            "memcpy": "M",
             "memset": "0",
             "other_cuda": ".",
         }
@@ -62,6 +67,38 @@ class DiTTraceTimelineTests(unittest.TestCase):
         self.assertEqual(rendered.count("G"), 1)
         self.assertEqual(rendered.count("A"), 1)
         self.assertGreater(rendered.count(" "), 10)
+
+    def test_speedup_and_memory_formatters(self):
+        self.assertEqual(format_cuda_speedup(63.0, 42.0), "speedup=+50.0%")
+        self.assertEqual(format_cuda_speedup(0.0, 42.0), "speedup=n/a")
+        self.assertEqual(format_bytes(4), "4B")
+        self.assertEqual(format_bytes(2048), "2.00KiB")
+
+    def test_trace_event_footprint_lines_include_profiler_args(self):
+        event = TraceEvent(
+            0.0,
+            1.0,
+            "linear_gemm",
+            "gemm",
+            {
+                "registers per thread": 168,
+                "shared memory": 164308,
+                "grid": [4, 24, 1],
+                "block": [384, 1, 1],
+                "bytes": 4096,
+                "memory bandwidth (GB/s)": 1.5,
+                "device": 0,
+                "stream": 7,
+            },
+        )
+
+        lines = trace_event_footprint_lines(event)
+
+        self.assertEqual(trace_event_bytes(event), 4096)
+        self.assertTrue(any("registers per thread=168" in line for line in lines))
+        self.assertTrue(any("shared memory=164308" in line for line in lines))
+        self.assertTrue(any("bytes=4096" in line for line in lines))
+        self.assertTrue(any("stream=7" in line for line in lines))
 
 
 if __name__ == "__main__":
