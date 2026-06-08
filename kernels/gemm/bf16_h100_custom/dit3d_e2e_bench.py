@@ -4,6 +4,7 @@ import argparse
 import math
 import time
 from functools import partial
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -13,868 +14,23 @@ from timm.layers.attention import Attention
 from timm.layers.mlp import Mlp
 
 import _C
-import _gelu_bwd
-import _linear_bwd_fused
 from tk_bench import input_group_count, profile_groups, print_bench, uniform_bf16
-
-
-def _is_compiling() -> bool:
-    try:
-        return bool(torch.compiler.is_compiling())
-    except Exception:
-        return False
-
-
-def _register_custom_op(name: str, mutates_args=()):
-    try:
-        return torch.library.custom_op(name, mutates_args=mutates_args)
-    except Exception:
-        def decorator(fn):
-            return fn
-        return decorator
-
-
-def _register_autograd(op, backward, setup_context) -> None:
-    try:
-        op.register_autograd(backward, setup_context=setup_context)
-    except Exception:
-        pass
-
-
-@_register_custom_op("tk_dit::layernorm_adaln", mutates_args=())
-def tk_layernorm_adaln_op(
-    flat: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    tokens: int,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    out = torch.empty_like(flat)
-    mean = torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32)
-    rstd = torch.empty_like(mean)
-    if flat.dtype == torch.bfloat16 and flat.shape[1] == 1024:
-        _C.layernorm_adaln_warp4(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
-    else:
-        _C.layernorm_adaln(flat, shift.contiguous(), scale.contiguous(), out, mean, rstd, tokens, eps)
-    return out, mean, rstd
-
-
-@tk_layernorm_adaln_op.register_fake
-def _tk_layernorm_adaln_fake(flat, shift, scale, tokens: int, eps: float):
-    return (
-        torch.empty_like(flat),
-        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
-        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
-    )
-
-
-@_register_custom_op("tk_dit::layernorm_adaln_backward", mutates_args=())
-def tk_layernorm_adaln_backward_op(
-    grad: torch.Tensor,
-    flat: torch.Tensor,
-    scale: torch.Tensor,
-    mean: torch.Tensor,
-    rstd: torch.Tensor,
-    tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dx = torch.empty_like(flat)
-    dshift = torch.empty_like(scale, dtype=torch.float32)
-    dscale = torch.empty_like(scale, dtype=torch.float32)
-    if flat.dtype == torch.bfloat16 and flat.shape[1] == 1024:
-        _C.layernorm_adaln_backward_warp4(grad, flat, scale, mean, rstd, dx, dshift, dscale, tokens)
-    else:
-        _C.layernorm_adaln_backward(grad, flat, scale, mean, rstd, dx, dshift, dscale, tokens)
-    return dx, dshift, dscale
-
-
-@tk_layernorm_adaln_backward_op.register_fake
-def _tk_layernorm_adaln_backward_fake(grad, flat, scale, mean, rstd, tokens: int):
-    return (
-        torch.empty_like(flat),
-        torch.empty_like(scale, dtype=torch.float32),
-        torch.empty_like(scale, dtype=torch.float32),
-    )
-
-
-@_register_custom_op("tk_dit::gated_residual", mutates_args=())
-def tk_gated_residual_op(
-    flat_x: torch.Tensor,
-    flat_h: torch.Tensor,
-    gate: torch.Tensor,
-    tokens: int,
-) -> torch.Tensor:
-    out = torch.empty_like(flat_x)
-    _C.gated_residual(flat_x, flat_h, gate.contiguous(), out, tokens)
-    return out
-
-
-@tk_gated_residual_op.register_fake
-def _tk_gated_residual_fake(flat_x, flat_h, gate, tokens: int):
-    return torch.empty_like(flat_x)
-
-
-@_register_custom_op("tk_dit::gated_residual_backward_no_dx", mutates_args=())
-def tk_gated_residual_backward_no_dx_op(
-    grad: torch.Tensor,
-    flat_h: torch.Tensor,
-    gate: torch.Tensor,
-    tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    dh = torch.empty_like(grad)
-    dgate = torch.empty_like(gate, dtype=torch.float32)
-    _C.gated_residual_backward_no_dx(grad, flat_h, gate, dh, dgate, tokens)
-    return dh, dgate
-
-
-@tk_gated_residual_backward_no_dx_op.register_fake
-def _tk_gated_residual_backward_no_dx_fake(grad, flat_h, gate, tokens: int):
-    return torch.empty_like(grad), torch.empty_like(gate, dtype=torch.float32)
-
-
-@_register_custom_op("tk_dit::gelu_backward", mutates_args=())
-def tk_gelu_backward_op(grad_out: torch.Tensor, preact: torch.Tensor) -> torch.Tensor:
-    grad_input = torch.empty_like(preact)
-    _gelu_bwd.gelu_backward(grad_out.contiguous(), preact.contiguous(), grad_input)
-    return grad_input
-
-
-@tk_gelu_backward_op.register_fake
-def _tk_gelu_backward_fake(grad_out, preact):
-    return torch.empty_like(preact)
-
-
-@_register_custom_op("tk_dit::gelu_bwd_bias", mutates_args=())
-def tk_gelu_bwd_bias_op(grad_out: torch.Tensor, preact: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    dz = torch.empty_like(grad_out)
-    db = torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
-    _linear_bwd_fused.gelu_bwd_bias(grad_out.contiguous(), preact.contiguous(), dz, db)
-    return dz, db
-
-
-@tk_gelu_bwd_bias_op.register_fake
-def _tk_gelu_bwd_bias_fake(grad_out, preact):
-    return torch.empty_like(grad_out), torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
-
-
-@_register_custom_op("tk_dit::bias_reduce", mutates_args=())
-def tk_bias_reduce_op(grad_out: torch.Tensor) -> torch.Tensor:
-    db = torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
-    _linear_bwd_fused.bias_reduce(grad_out.contiguous(), db)
-    return db
-
-
-@tk_bias_reduce_op.register_fake
-def _tk_bias_reduce_fake(grad_out):
-    return torch.empty((grad_out.shape[1],), device=grad_out.device, dtype=torch.float32)
-
-
-@_register_custom_op("tk_dit::dw_gemm", mutates_args=())
-def tk_dw_gemm_op(grad_out: torch.Tensor, x: torch.Tensor, w_like: torch.Tensor) -> torch.Tensor:
-    dw = torch.empty_like(w_like)
-    _linear_bwd_fused.dw_gemm(grad_out.contiguous(), x.contiguous(), dw)
-    return dw
-
-
-@tk_dw_gemm_op.register_fake
-def _tk_dw_gemm_fake(grad_out, x, w_like):
-    return torch.empty_like(w_like)
-
-
-@_register_custom_op("tk_dit::dx_gemm_native", mutates_args=())
-def tk_dx_gemm_native_op(grad_out: torch.Tensor, w: torch.Tensor, x_like: torch.Tensor) -> torch.Tensor:
-    dx = torch.empty_like(x_like)
-    _linear_bwd_fused.dx_gemm_native(grad_out.contiguous(), w.contiguous(), dx)
-    return dx
-
-
-@tk_dx_gemm_native_op.register_fake
-def _tk_dx_gemm_native_fake(grad_out, w, x_like):
-    return torch.empty_like(x_like)
-
-
-@_register_custom_op("tk_dit::linear_native", mutates_args=())
-def tk_linear_native_op(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-    _C.gemm_linear_native(flat.contiguous(), w.contiguous(), out, b.contiguous())
-    return out
-
-
-@tk_linear_native_op.register_fake
-def _tk_linear_native_fake(flat, w, b):
-    return torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-
-
-def _tk_linear_native_setup(ctx, inputs, output) -> None:
-    flat, w, b = inputs
-    ctx.save_for_backward(flat, w, b)
-
-
-def _tk_linear_native_backward(ctx, grad_out):
-    flat, w, b = ctx.saved_tensors
-    grad = grad_out.contiguous()
-    dx = tk_dx_gemm_native_op(grad, w.contiguous(), flat)
-    dw = tk_dw_gemm_op(grad, flat, w)
-    db = tk_bias_reduce_op(grad)
-    return dx, dw, db.to(b.dtype)
-
-
-_register_autograd(
-    tk_linear_native_op,
-    _tk_linear_native_backward,
-    _tk_linear_native_setup,
+from tk_dit_ops import (
+    FusedAdaLNLinear,
+    FusedAdaLNLinearGelu,
+    FusedInputMlp,
+    FusedLinearGatedResidual,
+    TkMlp,
+    fused_adaln,
+    fused_adaln_linear,
+    fused_linear_gated_residual,
+    gated_residual,
+    linear_then_gated_residual,
+    modulate,
 )
 
 
-@_register_custom_op("tk_dit::linear_gelu_native", mutates_args=())
-def tk_linear_gelu_native_op(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-    preact = torch.empty_like(out)
-    _C.gemm_custom_native(flat.contiguous(), w.contiguous(), out, b.contiguous(), preact)
-    return out, preact
-
-
-@tk_linear_gelu_native_op.register_fake
-def _tk_linear_gelu_native_fake(flat, w, b):
-    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-    return out, torch.empty_like(out)
-
-
-def _tk_linear_gelu_native_setup(ctx, inputs, output) -> None:
-    flat, w, b = inputs
-    _out, preact = output
-    ctx.save_for_backward(flat, w, b, preact)
-
-
-def _tk_linear_gelu_native_backward(ctx, grad_out, _grad_preact):
-    flat, w, b, preact = ctx.saved_tensors
-    grad = grad_out.contiguous()
-    dz, db = tk_gelu_bwd_bias_op(grad, preact)
-    dx = tk_dx_gemm_native_op(dz, w.contiguous(), flat)
-    dw = tk_dw_gemm_op(dz, flat, w)
-    return dx, dw, db.to(b.dtype)
-
-
-_register_autograd(
-    tk_linear_gelu_native_op,
-    _tk_linear_gelu_native_backward,
-    _tk_linear_gelu_native_setup,
-)
-
-
-@_register_custom_op("tk_dit::gated_residual_backward", mutates_args=())
-def tk_gated_residual_backward_op(
-    grad: torch.Tensor,
-    projected: torch.Tensor,
-    gate: torch.Tensor,
-    tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dresidual = torch.empty_like(grad)
-    dprojected = torch.empty_like(grad)
-    dgate = torch.empty_like(gate, dtype=torch.float32)
-    _C.gated_residual_backward(grad.contiguous(), projected.contiguous(), gate.contiguous(), dresidual, dprojected, dgate, tokens)
-    return dresidual, dprojected, dgate
-
-
-@tk_gated_residual_backward_op.register_fake
-def _tk_gated_residual_backward_fake(grad, projected, gate, tokens: int):
-    return torch.empty_like(grad), torch.empty_like(grad), torch.empty_like(gate, dtype=torch.float32)
-
-
-@_register_custom_op("tk_dit::gemm_linear_ln_adaln", mutates_args=())
-def tk_gemm_linear_ln_adaln_op(
-    flat: torch.Tensor,
-    w: torch.Tensor,
-    b: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    tokens: int,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-    preact = torch.empty_like(out)
-    mean = torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32)
-    rstd = torch.empty_like(mean)
-    _C.layernorm_stats(flat, mean, rstd, eps)
-    _C.gemm_linear_ln_adaln(flat, w, out, b, preact, shift, scale, mean, rstd, tokens)
-    return out, preact, mean, rstd
-
-
-@tk_gemm_linear_ln_adaln_op.register_fake
-def _tk_gemm_linear_ln_adaln_fake(flat, w, b, shift, scale, tokens: int, eps: float):
-    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-    return (
-        out,
-        torch.empty_like(out),
-        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
-        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
-    )
-
-
-def _tk_gemm_linear_ln_adaln_setup(ctx, inputs, output) -> None:
-    flat, w, b, shift, scale, tokens, eps = inputs
-    _out, _preact, mean, rstd = output
-    ctx.save_for_backward(flat, w, b, shift, scale, mean, rstd)
-    ctx.tokens = tokens
-    ctx.eps = eps
-
-
-def _tk_gemm_linear_ln_adaln_backward(ctx, grad_out, _grad_preact, _grad_mean, _grad_rstd):
-    flat, w, b, shift, scale, mean, rstd = ctx.saved_tensors
-    grad = grad_out.contiguous()
-    z, _, _ = tk_layernorm_adaln_op(flat.contiguous(), shift.contiguous(), scale.contiguous(), ctx.tokens, ctx.eps)
-    dw = tk_dw_gemm_op(grad, z, w)
-    dz = tk_dx_gemm_native_op(grad, w.contiguous(), flat)
-    db = tk_bias_reduce_op(grad)
-    dx, dshift, dscale = tk_layernorm_adaln_backward_op(dz, flat, scale, mean, rstd, ctx.tokens)
-    return dx, dw, db.to(b.dtype), dshift.to(shift.dtype), dscale.to(scale.dtype), None, None
-
-
-_register_autograd(
-    tk_gemm_linear_ln_adaln_op,
-    _tk_gemm_linear_ln_adaln_backward,
-    _tk_gemm_linear_ln_adaln_setup,
-)
-
-
-@_register_custom_op("tk_dit::gemm_gelu_ln_adaln", mutates_args=())
-def tk_gemm_gelu_ln_adaln_op(
-    flat: torch.Tensor,
-    w: torch.Tensor,
-    b: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    tokens: int,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-    preact = torch.empty_like(out)
-    mean = torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32)
-    rstd = torch.empty_like(mean)
-    _C.layernorm_stats(flat, mean, rstd, eps)
-    _C.gemm_gelu_ln_adaln(flat, w, out, b, preact, shift, scale, mean, rstd, tokens)
-    return out, preact, mean, rstd
-
-
-@tk_gemm_gelu_ln_adaln_op.register_fake
-def _tk_gemm_gelu_ln_adaln_fake(flat, w, b, shift, scale, tokens: int, eps: float):
-    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
-    return (
-        out,
-        torch.empty_like(out),
-        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
-        torch.empty((flat.shape[0],), device=flat.device, dtype=torch.float32),
-    )
-
-
-def _tk_gemm_gelu_ln_adaln_setup(ctx, inputs, output) -> None:
-    flat, w, b, shift, scale, tokens, eps = inputs
-    _out, preact, mean, rstd = output
-    ctx.save_for_backward(flat, w, b, shift, scale, preact, mean, rstd)
-    ctx.tokens = tokens
-    ctx.eps = eps
-
-
-def _tk_gemm_gelu_ln_adaln_backward(ctx, grad_out, _grad_preact, _grad_mean, _grad_rstd):
-    flat, w, b, shift, scale, preact, mean, rstd = ctx.saved_tensors
-    grad = grad_out.contiguous()
-    dz_gelu, db = tk_gelu_bwd_bias_op(grad, preact)
-    z, _, _ = tk_layernorm_adaln_op(flat.contiguous(), shift.contiguous(), scale.contiguous(), ctx.tokens, ctx.eps)
-    dw = tk_dw_gemm_op(dz_gelu, z, w)
-    dz = tk_dx_gemm_native_op(dz_gelu, w.contiguous(), flat)
-    dx, dshift, dscale = tk_layernorm_adaln_backward_op(dz, flat, scale, mean, rstd, ctx.tokens)
-    return dx, dw, db.to(b.dtype), dshift.to(shift.dtype), dscale.to(scale.dtype), None, None
-
-
-_register_autograd(
-    tk_gemm_gelu_ln_adaln_op,
-    _tk_gemm_gelu_ln_adaln_backward,
-    _tk_gemm_gelu_ln_adaln_setup,
-)
-
-
-@_register_custom_op("tk_dit::gemm_linear_gated_residual", mutates_args=())
-def tk_gemm_linear_gated_residual_op(
-    flat_x: torch.Tensor,
-    w: torch.Tensor,
-    flat_residual: torch.Tensor,
-    gate: torch.Tensor,
-    b: torch.Tensor,
-    tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    out = torch.empty_like(flat_residual)
-    projected = torch.empty_like(flat_residual)
-    _C.gemm_linear_gated_residual(flat_x, w, flat_residual, gate, out, projected, b, tokens)
-    return out, projected
-
-
-@tk_gemm_linear_gated_residual_op.register_fake
-def _tk_gemm_linear_gated_residual_fake(flat_x, w, flat_residual, gate, b, tokens: int):
-    return torch.empty_like(flat_residual), torch.empty_like(flat_residual)
-
-
-def _tk_gemm_linear_gated_residual_setup(ctx, inputs, output) -> None:
-    flat_x, w, flat_residual, gate, b, tokens = inputs
-    _out, projected = output
-    ctx.save_for_backward(flat_x, w, gate, b, projected)
-    ctx.tokens = tokens
-
-
-def _tk_gemm_linear_gated_residual_backward(ctx, grad_out, _grad_projected):
-    flat_x, w, gate, b, projected = ctx.saved_tensors
-    grad = grad_out.contiguous()
-    dresidual, dprojected, dgate = tk_gated_residual_backward_op(grad, projected, gate, ctx.tokens)
-    dx = dprojected.matmul(w)
-    dw = dprojected.transpose(0, 1).matmul(flat_x)
-    db = dprojected.sum(dim=0)
-    return dx, dw.to(w.dtype), dresidual, dgate.to(gate.dtype), db.to(b.dtype), None
-
-
-_register_autograd(
-    tk_gemm_linear_gated_residual_op,
-    _tk_gemm_linear_gated_residual_backward,
-    _tk_gemm_linear_gated_residual_setup,
-)
-
-
-_FLASH_ATTN3_FUNC = None
-
-
-def flash_attn3_func():
-    global _FLASH_ATTN3_FUNC
-    if _FLASH_ATTN3_FUNC is not None:
-        return _FLASH_ATTN3_FUNC
-    try:
-        import flash_attn_interface
-
-        _FLASH_ATTN3_FUNC = flash_attn_interface.flash_attn_func
-        return _FLASH_ATTN3_FUNC
-    except ImportError:
-        pass
-    try:
-        from kernels import get_kernel
-
-        fa3_module = get_kernel("kernels-community/flash-attn3", version=1)
-        _FLASH_ATTN3_FUNC = fa3_module.flash_attn_func
-        return _FLASH_ATTN3_FUNC
-    except Exception as exc:
-        raise RuntimeError(
-            "FlashAttention-3 is unavailable. Install Dao-AILab flash-attention hopper package "
-            "or the Hugging Face kernels package with kernels-community/flash-attn3."
-        ) from exc
-
-
-def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-class FusedAdaLN(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
-        batch, tokens, dim = x.shape
-        flat = x.reshape(batch * tokens, dim).contiguous()
-        scale_c = scale.contiguous()
-        out, mean, rstd = tk_layernorm_adaln_op(flat, shift.contiguous(), scale_c, tokens, eps)
-        ctx.save_for_backward(flat, scale_c, mean, rstd)
-        ctx.tokens = tokens
-        ctx.shape = x.shape
-        return out.reshape_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, scale, mean, rstd = ctx.saved_tensors
-        grad = grad_out.reshape_as(x).contiguous()
-        dx, dshift, dscale = tk_layernorm_adaln_backward_op(grad, x, scale, mean, rstd, ctx.tokens)
-        return dx.reshape(ctx.shape), dshift.to(scale.dtype), dscale.to(scale.dtype), None
-
-
-def fused_adaln(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    return FusedAdaLN.apply(x, shift, scale, eps)
-
-
-def tk_linear_native(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return tk_linear_native_op(flat.contiguous(), w.contiguous(), b.contiguous())
-
-
-def tk_linear_gelu_native(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    out, _preact = tk_linear_gelu_native_op(flat.contiguous(), w.contiguous(), b.contiguous())
-    return out
-
-
-def can_use_ln_adaln_gemm(x: torch.Tensor, w: torch.Tensor) -> bool:
-    rows = x.numel() // x.shape[-1]
-    dim = x.shape[-1]
-    out_features = w.shape[0]
-    return (
-        x.is_cuda
-        and x.dtype == torch.bfloat16
-        and w.dtype == torch.bfloat16
-        and rows % 128 == 0
-        and dim % 64 == 0
-        and out_features % 256 == 0
-    )
-
-
-def can_use_gated_linear(x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor, w: torch.Tensor) -> bool:
-    rows = x.numel() // x.shape[-1]
-    in_features = x.shape[-1]
-    out_features = w.shape[0]
-    return (
-        x.is_cuda
-        and x.dtype == torch.bfloat16
-        and residual.dtype == torch.bfloat16
-        and gate.dtype == torch.bfloat16
-        and w.dtype == torch.bfloat16
-        and residual.shape[:-1] == x.shape[:-1]
-        and residual.shape[-1] == out_features
-        and gate.shape == (x.shape[0], out_features)
-        and rows % 128 == 0
-        and in_features % 64 == 0
-        and out_features % 256 == 0
-    )
-
-
-def recompute_adaln_flat(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float, tokens: int) -> torch.Tensor:
-    flat = x.reshape(-1, x.shape[-1]).contiguous()
-    out, _, _ = tk_layernorm_adaln_op(flat, shift.contiguous(), scale.contiguous(), tokens, eps)
-    return out
-
-
-class FusedAdaLNLinear(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float):
-        batch, tokens, dim = x.shape
-        flat = x.reshape(batch * tokens, dim).contiguous()
-        shift_c = shift.contiguous()
-        scale_c = scale.contiguous()
-        w_c = w.contiguous()
-        b_c = b.contiguous()
-        out, _preact, mean, rstd = tk_gemm_linear_ln_adaln_op(flat, w_c, b_c, shift_c, scale_c, tokens, eps)
-        ctx.save_for_backward(flat, shift_c, scale_c, w_c, mean, rstd)
-        ctx.tokens = tokens
-        ctx.shape = x.shape
-        ctx.eps = eps
-        return out.reshape(batch, tokens, w_c.shape[0])
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, shift, scale, w, mean, rstd = ctx.saved_tensors
-        grad = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
-        z = recompute_adaln_flat(x.reshape(ctx.shape), shift, scale, ctx.eps, ctx.tokens)
-        dw = torch.empty_like(w)
-        dz = torch.empty_like(x)
-        db = torch.empty((grad.shape[1],), device=grad.device, dtype=torch.float32)
-        _linear_bwd_fused.dw_gemm(grad, z, dw)
-        _linear_bwd_fused.dx_gemm_native(grad, w.contiguous(), dz)
-        _linear_bwd_fused.bias_reduce(grad, db)
-        dx = torch.empty_like(x)
-        dshift = torch.empty_like(scale, dtype=torch.float32)
-        dscale = torch.empty_like(scale, dtype=torch.float32)
-        _C.layernorm_adaln_backward(dz, x, scale, mean, rstd, dx, dshift, dscale, ctx.tokens)
-        return dx.reshape(ctx.shape), dshift.to(scale.dtype), dscale.to(scale.dtype), dw, db.to(grad.dtype), None
-
-
-class FusedAdaLNLinearGelu(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float):
-        batch, tokens, dim = x.shape
-        flat = x.reshape(batch * tokens, dim).contiguous()
-        shift_c = shift.contiguous()
-        scale_c = scale.contiguous()
-        w_c = w.contiguous()
-        b_c = b.contiguous()
-        out, preact, mean, rstd = tk_gemm_gelu_ln_adaln_op(flat, w_c, b_c, shift_c, scale_c, tokens, eps)
-        ctx.save_for_backward(flat, shift_c, scale_c, w_c, preact, mean, rstd)
-        ctx.tokens = tokens
-        ctx.shape = x.shape
-        ctx.eps = eps
-        return out.reshape(batch, tokens, w_c.shape[0])
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, shift, scale, w, preact, mean, rstd = ctx.saved_tensors
-        grad = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
-        dz_gelu = torch.empty_like(grad)
-        db = torch.empty((grad.shape[1],), device=grad.device, dtype=torch.float32)
-        _linear_bwd_fused.gelu_bwd_bias(grad, preact, dz_gelu, db)
-        z = recompute_adaln_flat(x.reshape(ctx.shape), shift, scale, ctx.eps, ctx.tokens)
-        dw = torch.empty_like(w)
-        dz = torch.empty_like(x)
-        _linear_bwd_fused.dw_gemm(dz_gelu, z, dw)
-        _linear_bwd_fused.dx_gemm_native(dz_gelu, w.contiguous(), dz)
-        dx = torch.empty_like(x)
-        dshift = torch.empty_like(scale, dtype=torch.float32)
-        dscale = torch.empty_like(scale, dtype=torch.float32)
-        _C.layernorm_adaln_backward(dz, x, scale, mean, rstd, dx, dshift, dscale, ctx.tokens)
-        return dx.reshape(ctx.shape), dshift.to(scale.dtype), dscale.to(scale.dtype), dw, db.to(grad.dtype), None
-
-
-def fused_adaln_linear(
-    x: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    linear: nn.Linear,
-    eps: float,
-) -> torch.Tensor:
-    if can_use_ln_adaln_gemm(x, linear.weight):
-        batch, tokens, dim = x.shape
-        flat = x.reshape(batch * tokens, dim).contiguous()
-        out, _, _, _ = tk_gemm_linear_ln_adaln_op(
-            flat,
-            linear.weight.contiguous(),
-            linear.bias.contiguous(),
-            shift.contiguous(),
-            scale.contiguous(),
-            tokens,
-            eps,
-        )
-        return out.reshape(batch, tokens, linear.weight.shape[0])
-    return torch.nn.functional.linear(fused_adaln(x, shift, scale, eps), linear.weight, linear.bias)
-
-
-def fused_adaln_linear_gelu(
-    x: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    linear: nn.Linear,
-    eps: float,
-) -> torch.Tensor:
-    out_features = linear.weight.shape[0]
-    in_features = x.shape[-1]
-    use_inline_gemm = can_use_ln_adaln_gemm(x, linear.weight) and out_features <= 2 * in_features
-    if use_inline_gemm:
-        batch, tokens, dim = x.shape
-        flat = x.reshape(batch * tokens, dim).contiguous()
-        out, _, _, _ = tk_gemm_gelu_ln_adaln_op(
-            flat,
-            linear.weight.contiguous(),
-            linear.bias.contiguous(),
-            shift.contiguous(),
-            scale.contiguous(),
-            tokens,
-            eps,
-        )
-        return out.reshape(batch, tokens, linear.weight.shape[0])
-    # For wide projections such as MLP fc1 (D -> 4D), applying AdaLN inside
-    # each GEMM output tile repeats the same input transform many times. We
-    # materialize AdaLN once, then keep GEMM+GELU on the custom TK path.
-    z = fused_adaln(x, shift, scale, eps).reshape(-1, in_features)
-    out = tk_linear_gelu_native(z, linear.weight, linear.bias)
-    return out.reshape(*x.shape[:-1], out_features)
-
-
-class FusedGatedResidual(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, h: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        batch, tokens, dim = x.shape
-        flat_x = x.reshape(batch * tokens, dim).contiguous()
-        flat_h = h.reshape(batch * tokens, dim).contiguous()
-        gate_c = gate.contiguous()
-        out = tk_gated_residual_op(flat_x, flat_h, gate_c, tokens)
-        ctx.save_for_backward(flat_h, gate_c)
-        ctx.tokens = tokens
-        ctx.shape = x.shape
-        return out.reshape_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        h, gate = ctx.saved_tensors
-        grad = grad_out.reshape_as(h).contiguous()
-        dh, dgate = tk_gated_residual_backward_no_dx_op(grad, h, gate, ctx.tokens)
-        return grad_out, dh.reshape(ctx.shape), dgate.to(gate.dtype)
-
-
-def gated_residual(x: torch.Tensor, h: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    if x.dtype == torch.bfloat16 and h.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16:
-        return FusedGatedResidual.apply(x, h, gate)
-    return x + gate.unsqueeze(1).to(h.dtype) * h
-
-
-class FusedLinearGatedResidual(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor, w: torch.Tensor, b: torch.Tensor):
-        batch, tokens, _ = x.shape
-        flat_x = x.reshape(batch * tokens, x.shape[-1]).contiguous()
-        flat_residual = residual.reshape(batch * tokens, residual.shape[-1]).contiguous()
-        gate_c = gate.contiguous()
-        w_c = w.contiguous()
-        b_c = b.contiguous()
-        out, projected = tk_gemm_linear_gated_residual_op(flat_x, w_c, flat_residual, gate_c, b_c, tokens)
-        ctx.save_for_backward(flat_x, gate_c, w_c, projected)
-        ctx.x_shape = x.shape
-        ctx.residual_shape = residual.shape
-        ctx.tokens = tokens
-        return out.reshape_as(residual)
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, gate, w, projected = ctx.saved_tensors
-        grad = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
-        dresidual = torch.empty_like(grad)
-        dprojected = torch.empty_like(grad)
-        dgate = torch.empty_like(gate, dtype=torch.float32)
-        _C.gated_residual_backward(grad, projected, gate, dresidual, dprojected, dgate, ctx.tokens)
-        dx = dprojected.matmul(w)
-        dw = dprojected.transpose(0, 1).matmul(x)
-        db = dprojected.sum(dim=0)
-        return dx.reshape(ctx.x_shape), dresidual.reshape(ctx.residual_shape), dgate.to(gate.dtype), dw.to(w.dtype), db.to(grad.dtype)
-
-
-def fused_linear_gated_residual(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    gate: torch.Tensor,
-    linear: nn.Linear,
-) -> torch.Tensor:
-    if can_use_gated_linear(x, residual, gate, linear.weight):
-        batch, tokens, _ = x.shape
-        out, _ = tk_gemm_linear_gated_residual_op(
-            x.reshape(batch * tokens, x.shape[-1]).contiguous(),
-            linear.weight.contiguous(),
-            residual.reshape(batch * tokens, residual.shape[-1]).contiguous(),
-            gate.contiguous(),
-            linear.bias.contiguous(),
-            tokens,
-        )
-        return out.reshape_as(residual)
-    return gated_residual(residual, linear(x), gate)
-
-
-def linear_then_gated_residual(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    gate: torch.Tensor,
-    linear: nn.Linear,
-) -> torch.Tensor:
-    return gated_residual(residual, torch.nn.functional.linear(x, linear.weight, linear.bias), gate)
-
-
-class TkGelu(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        ctx.save_for_backward(x)
-        return torch.nn.functional.gelu(x, approximate="tanh")
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        (x,) = ctx.saved_tensors
-        return tk_gelu_backward_op(grad_out.contiguous(), x.contiguous())
-
-
-class TkLinearGelu(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        out, preact = tk_linear_gelu_native_op(x.contiguous(), w.contiguous(), b.contiguous())
-        ctx.save_for_backward(x.contiguous(), w, preact)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, w, preact = ctx.saved_tensors
-        grad_out = grad_out.contiguous()
-        dz, db = tk_gelu_bwd_bias_op(grad_out, preact)
-        dw = tk_dw_gemm_op(dz, x, w)
-        dx = tk_dx_gemm_native_op(dz, w.contiguous(), x)
-        return dx, dw, db.to(grad_out.dtype)
-
-
-class TkLinear(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        x_c = x.contiguous()
-        ctx.save_for_backward(x_c, w)
-        return tk_linear_native_op(x_c, w.contiguous(), b.contiguous())
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        x, w = ctx.saved_tensors
-        grad_out = grad_out.contiguous()
-        dw = tk_dw_gemm_op(grad_out, x, w)
-        dx = tk_dx_gemm_native_op(grad_out, w.contiguous(), x)
-        db = tk_bias_reduce_op(grad_out)
-        return dx, dw, db.to(grad_out.dtype)
-
-
-class TkMlp(nn.Module):
-    def __init__(self, in_features: int, hidden_features: int):
-        super().__init__()
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.fc2 = nn.Linear(hidden_features, in_features)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shape = x.shape
-        flat = x.reshape(-1, shape[-1]).contiguous()
-        h = tk_linear_gelu_native(flat, self.fc1.weight, self.fc1.bias)
-        out = tk_linear_native(h, self.fc2.weight, self.fc2.bias)
-        return out.reshape(shape)
-
-    def forward_from_adaln(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
-        h = fused_adaln_linear_gelu(x, shift, scale, self.fc1, eps)
-        shape = h.shape
-        out = tk_linear_native(h.reshape(-1, shape[-1]).contiguous(), self.fc2.weight, self.fc2.bias)
-        return out.reshape(x.shape)
-
-    def forward_from_adaln_residual(
-        self,
-        residual: torch.Tensor,
-        shift: torch.Tensor,
-        scale: torch.Tensor,
-        gate: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        # The native TK MLP backward path is only a win for the large-D
-        # microbenchmarks it was tuned on. For DiT-S (D=384, hidden=1536),
-        # the custom weight-gradient GEMM is slower than the compiled
-        # cuBLAS/Inductor path, so keep GEMMs on torch and only use the
-        # faster standalone GELU backward.
-        if residual.shape[0] * residual.shape[1] >= 8192 and residual.shape[-1] < 1024:
-            mlp_in = fused_adaln(residual, shift, scale, eps)
-            h = TkGelu.apply(torch.nn.functional.linear(mlp_in, self.fc1.weight, self.fc1.bias))
-            return gated_residual(
-                residual,
-                torch.nn.functional.linear(h, self.fc2.weight, self.fc2.bias),
-                gate,
-            )
-        h = fused_adaln_linear_gelu(residual, shift, scale, self.fc1, eps)
-        return fused_linear_gated_residual(h, residual, gate, self.fc2)
-
-    def forward_residual(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        h = torch.nn.functional.gelu(self.fc1(x), approximate="tanh")
-        return fused_linear_gated_residual(h, residual, gate, self.fc2)
-
-    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        h = torch.nn.functional.gelu(self.fc1(x), approximate="tanh")
-        return linear_then_gated_residual(h, residual, gate, self.fc2)
-
-
-class FusedInputMlp(nn.Module):
-    def __init__(self, in_features: int, hidden_features: int):
-        super().__init__()
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.fc2 = nn.Linear(hidden_features, in_features)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(torch.nn.functional.gelu(self.fc1(x), approximate="tanh"))
-
-    def forward_from_adaln(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
-        return self.fc2(fused_adaln_linear_gelu(x, shift, scale, self.fc1, eps))
-
-    def forward_from_adaln_residual(
-        self,
-        residual: torch.Tensor,
-        shift: torch.Tensor,
-        scale: torch.Tensor,
-        gate: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        h = fused_adaln_linear_gelu(residual, shift, scale, self.fc1, eps)
-        return fused_linear_gated_residual(h, residual, gate, self.fc2)
-
-    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        h = torch.nn.functional.gelu(self.fc1(x), approximate="tanh")
-        return linear_then_gated_residual(h, residual, gate, self.fc2)
-
-
-class SdpaAttention(nn.Module):
+class ProjectedAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
         super().__init__()
         if dim % num_heads != 0:
@@ -884,99 +40,57 @@ class SdpaAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
+    def _qkv(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = x.shape
+        return self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+
+    def _fused_adaln_qkv(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
+        batch, tokens, _ = x.shape
+        return fused_adaln_linear(x, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+
+    def _attention_from_qkv(self, qkv: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(self._attention_from_qkv(self._qkv(x)))
+
+    def forward_from_adaln(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
+        return self.proj(self._attention_from_qkv(self._fused_adaln_qkv(x, shift, scale, eps)))
+
+    def forward_from_adaln_residual(
+        self,
+        residual: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        gate: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        attn = self._attention_from_qkv(self._fused_adaln_qkv(residual, shift, scale, eps))
+        return fused_linear_gated_residual(attn, residual, gate, self.proj)
+
+    def forward_residual(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        attn = self._attention_from_qkv(self._qkv(x))
+        return fused_linear_gated_residual(attn, residual, gate, self.proj)
+
+    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        attn = self._attention_from_qkv(self._qkv(x))
+        return linear_then_gated_residual(attn, residual, gate, self.proj)
+
+
+class SdpaAttention(ProjectedAttention):
     def _attention_from_qkv(self, qkv: torch.Tensor) -> torch.Tensor:
         batch, tokens, _, _, _ = qkv.shape
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         return out.transpose(1, 2).reshape(batch, tokens, self.num_heads * self.head_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, tokens, _ = x.shape
-        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        return self.proj(self._attention_from_qkv(qkv))
 
-    def forward_from_adaln(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
-        batch, tokens, _ = x.shape
-        qkv = fused_adaln_linear(x, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        return self.proj(self._attention_from_qkv(qkv))
-
-    def forward_from_adaln_residual(
-        self,
-        residual: torch.Tensor,
-        shift: torch.Tensor,
-        scale: torch.Tensor,
-        gate: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        batch, tokens, _ = residual.shape
-        qkv = fused_adaln_linear(residual, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        attn = self._attention_from_qkv(qkv)
-        return fused_linear_gated_residual(attn, residual, gate, self.proj)
-
-    def forward_residual(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        batch, tokens, _ = x.shape
-        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        attn = self._attention_from_qkv(qkv)
-        return fused_linear_gated_residual(attn, residual, gate, self.proj)
-
-    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        batch, tokens, _ = x.shape
-        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        attn = self._attention_from_qkv(qkv)
-        return linear_then_gated_residual(attn, residual, gate, self.proj)
-
-
-class FlashAttention3(nn.Module):
-    def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, tokens, dim = x.shape
-        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
+class FlashAttention3(ProjectedAttention):
+    def _attention_from_qkv(self, qkv: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _, _, _ = qkv.shape
         q, k, v = qkv.unbind(dim=2)
         out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
-        return self.proj(out.reshape(batch, tokens, dim))
-
-    def forward_from_adaln(self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float) -> torch.Tensor:
-        batch, tokens, dim = x.shape
-        qkv = fused_adaln_linear(x, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
-        return self.proj(out.reshape(batch, tokens, dim))
-
-    def forward_from_adaln_residual(
-        self,
-        residual: torch.Tensor,
-        shift: torch.Tensor,
-        scale: torch.Tensor,
-        gate: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        batch, tokens, dim = residual.shape
-        qkv = fused_adaln_linear(residual, shift, scale, self.qkv, eps).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
-        return fused_linear_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
-
-    def forward_residual(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        batch, tokens, dim = x.shape
-        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
-        return fused_linear_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
-
-    def forward_residual_epilogue(self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        batch, tokens, dim = x.shape
-        qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        out = flash_attn3_func()(q.contiguous(), k.contiguous(), v.contiguous(), causal=False)
-        return linear_then_gated_residual(out.reshape(batch, tokens, dim), residual, gate, self.proj)
+        return out.reshape(batch, tokens, self.num_heads * self.head_dim)
 
 
 class PatchEmbed3D(nn.Module):
@@ -1059,31 +173,31 @@ class DiTBlock(nn.Module):
         self.fused_output_projection_enabled = fused_output_projection_enabled
         self.fused_epilogue_only_enabled = fused_epilogue_only_enabled
         self.tk_mlp_enabled = tk_mlp_enabled
+        use_projection_fusion = fused_input_projection_enabled or fused_output_projection_enabled
+
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         if attention_backend == "fa3":
             self.attn = FlashAttention3(hidden_size, num_heads=num_heads, qkv_bias=True)
+        elif attention_backend == "timm" and use_projection_fusion:
+            self.attn = SdpaAttention(hidden_size, num_heads=num_heads, qkv_bias=True)
         elif attention_backend == "timm":
-            self.attn = (
-                SdpaAttention(hidden_size, num_heads=num_heads, qkv_bias=True)
-                if fused_input_projection_enabled or fused_output_projection_enabled
-                else Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-            )
+            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         else:
             raise ValueError(f"unknown attention backend: {attention_backend}")
+
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = (
-            TkMlp(hidden_size, mlp_hidden_dim)
-            if tk_mlp_enabled
-            else FusedInputMlp(hidden_size, mlp_hidden_dim)
-            if fused_input_projection_enabled or fused_output_projection_enabled
-            else Mlp(
+        if tk_mlp_enabled:
+            self.mlp = TkMlp(hidden_size, mlp_hidden_dim)
+        elif use_projection_fusion:
+            self.mlp = FusedInputMlp(hidden_size, mlp_hidden_dim)
+        else:
+            self.mlp = Mlp(
                 in_features=hidden_size,
                 hidden_features=mlp_hidden_dim,
                 act_layer=cast(type[nn.GELU], partial(nn.GELU, approximate="tanh")),
                 drop=0,
             )
-        )
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
     def forward(self, x, c):
@@ -1332,35 +446,32 @@ def make_model(
     return model
 
 
-def variant_config(variant_name: str):
-    variants = {
-        "eager": (False, False, False, False, False, False, "timm", False),
-        "compile": (False, False, False, False, False, False, "timm", True),
-        "compile_fused_adaln": (True, False, False, False, False, False, "timm", True),
-        "compile_tk_adaln_only": (True, False, False, False, False, False, "timm", True),
-        "fused_adaln_residual": (True, True, False, False, False, False, "timm", False),
-        "compile_fused_adaln_residual": (True, True, False, False, False, False, "timm", True),
-        "fused_adaln_residual_epilogue": (True, True, False, False, False, True, "timm", False),
-        "compile_fused_adaln_residual_epilogue": (True, True, False, False, False, True, "timm", True),
-        "compile_fused_output_proj": (True, True, False, False, True, False, "timm", True),
-        "compile_fused_output_proj_epilogue": (True, True, False, False, True, True, "timm", True),
-        "compile_tk_adaln_residual_only": (True, True, False, False, False, False, "timm", True),
-        "fused_adaln_residual_tk_mlp": (True, True, True, False, False, False, "timm", False),
-        "compile_fused_adaln_residual_tk_mlp": (True, True, True, False, False, False, "timm", True),
-        "fa3_attn": (False, False, False, False, False, False, "fa3", False),
-        "compile_fa3_attn": (False, False, False, False, False, False, "fa3", True),
-        "fused_adaln_residual_fa3": (True, True, False, False, False, False, "fa3", False),
-        "compile_fused_adaln_residual_fa3": (True, True, False, False, False, False, "fa3", True),
-        "fused_adaln_residual_epilogue_fa3": (True, True, False, False, False, True, "fa3", False),
-        "compile_fused_adaln_residual_epilogue_fa3": (True, True, False, False, False, True, "fa3", True),
-        "compile_fused_output_proj_fa3": (True, True, False, False, True, False, "fa3", True),
-        "compile_fused_output_proj_epilogue_fa3": (True, True, False, False, True, True, "fa3", True),
-        "fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, False, "fa3", False),
-        "compile_fused_adaln_residual_fa3_tk_mlp": (True, True, True, False, False, False, "fa3", True),
-    }
-    if variant_name not in variants:
-        raise ValueError(f"unknown profile variant: {variant_name}")
-    return variants[variant_name]
+from dit_variants import (
+    TraceCompareData,
+    TraceEvent,
+    TraceLane,
+    VariantConfig,
+    load_compile_fusion_evidence,
+    print_ditblock_fusion_plan,
+    run_ditblock_fusion_ui,
+    selected_variants,
+    variant_config,
+)
+
+def make_variant_model(model_name: str, config: VariantConfig) -> nn.Module:
+    model = make_model(
+        model_name,
+        fused=config.fused,
+        fused_residual=config.fused_residual,
+        tk_mlp=config.tk_mlp,
+        fused_input_projection=config.fused_input_projection,
+        fused_output_projection=config.fused_output_projection,
+        fused_epilogue_only=config.fused_epilogue_only,
+        attention_backend=config.attention_backend,
+    )
+    if config.compiled:
+        model = torch.compile(model)
+    return model
 
 
 def clone_state(dst: nn.Module, src: nn.Module) -> None:
@@ -1413,21 +524,10 @@ def profile_variant_case(
     warmup: int,
     iters: int,
     rows: int,
+    trace_out: Path | None = None,
 ) -> None:
-    fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, fused_epilogue_only, attention_backend, compiled = variant_config(variant_name)
-    model = make_model(
-        model_name,
-        fused=fused,
-        fused_residual=fused_residual,
-        tk_mlp=tk_mlp,
-        fused_input_projection=fused_input_projection,
-        fused_output_projection=fused_output_projection,
-        fused_epilogue_only=fused_epilogue_only,
-        attention_backend=attention_backend,
-    )
+    model = make_variant_model(model_name, variant_config(variant_name))
     model.pos_embed(spatial, torch.bfloat16, torch.device("cuda"))
-    if compiled:
-        model = torch.compile(model)
     group = make_group(batch, dit_config(model_name)["in_channels"], spatial, 77000)
     for _ in range(warmup):
         train_step(model, group)
@@ -1440,6 +540,162 @@ def profile_variant_case(
     tokens = spatial[0] * spatial[1] * spatial[2]
     print(f"\nTorch profiler DiT-{model_name} {variant_name} B{batch} T{tokens} warmup={warmup} iters={iters}")
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=rows))
+    if trace_out is not None:
+        trace_out.parent.mkdir(parents=True, exist_ok=True)
+        prof.export_chrome_trace(str(trace_out))
+        print(f"wrote Chrome trace: {trace_out}")
+
+
+
+def trace_file_name(model_name: str, variant_name: str, batch: int, spatial: tuple[int, int, int]) -> str:
+    tokens = spatial[0] * spatial[1] * spatial[2]
+    return f"dit_{model_name}_{variant_name}_b{batch}_t{tokens}.json"
+
+
+def profile_variant_trace(
+    model_name: str,
+    variant_name: str,
+    batch: int,
+    spatial: tuple[int, int, int],
+    warmup: int,
+    iters: int,
+    rows: int,
+    trace_dir: Path,
+) -> Path:
+    trace_path = trace_dir / trace_file_name(model_name, variant_name, batch, spatial)
+    profile_variant_case(model_name, variant_name, batch, spatial, warmup, iters, rows, trace_path)
+    return trace_path
+
+
+def compare_compile_trace(eager_trace: Path, compile_trace: Path, rows: int = 10) -> tuple[tuple[str, ...], TraceCompareData]:
+    from collections import defaultdict
+
+    from analyze_dit_compile_fusion import (
+        build_external_category_map,
+        build_external_linear_map,
+        cuda_kernel_category,
+        load_events,
+        semantic_cuda_summary,
+    )
+
+    def categorized_kernel_events(events: list[dict]) -> list[TraceEvent]:
+        external_linear_map = build_external_linear_map(events)
+        out: list[TraceEvent] = []
+        for event in events:
+            if event.get("ph") != "X" or event.get("cat") not in {"kernel", "gpu_memset"}:
+                continue
+            name = event.get("name", "")
+            start_us = float(event.get("ts", 0.0))
+            dur_us = float(event.get("dur", 0.0))
+            category, _desc = cuda_kernel_category(name, (event.get("args") or {}).get("External id"), external_linear_map)
+            out.append(TraceEvent(start_us, dur_us, category, name))
+        if not out:
+            return []
+        first_us = min(event.start_us for event in out)
+        return sorted((TraceEvent(event.start_us - first_us, event.dur_us, event.category, event.name) for event in out), key=lambda event: event.start_us)
+
+    def kernel_rows(events: list[dict], limit: int) -> list[str]:
+        grouped: dict[tuple[str, str], dict[str, float]] = defaultdict(lambda: {"count": 0, "dur_us": 0.0})
+        total_us = 0.0
+        for event in categorized_kernel_events(events):
+            total_us += event.dur_us
+            grouped[(event.category, event.name)]["count"] += 1
+            grouped[(event.category, event.name)]["dur_us"] += event.dur_us
+        out: list[str] = []
+        for (category, name), stat in sorted(grouped.items(), key=lambda item: item[1]["dur_us"], reverse=True)[:limit]:
+            pct = 100.0 * stat["dur_us"] / total_us if total_us else 0.0
+            out.append(f"{category:24s} {int(stat['count']):5d}x {stat['dur_us'] / 1000.0:8.3f} ms {pct:5.1f}%  {name}")
+        return out
+
+    def timeline_char(category: str) -> str:
+        if category.startswith("fused_"):
+            return "F"
+        if "attention" in category:
+            return "A"
+        if "linear" in category or "gemm" in category:
+            return "G"
+        if "layer_norm" in category or category == "layer_norm":
+            return "L"
+        if "adaln" in category:
+            return "N"
+        if "residual" in category:
+            return "R"
+        if "gelu" in category:
+            return "U"
+        if "conv" in category or "patch_embed" in category:
+            return "P"
+        if "memset" in category:
+            return "0"
+        return "."
+
+    def timeline_lane(label: str, kernels: list[TraceEvent], scale_us: float, width: int = 52) -> str:
+        lane = [" "] * width
+        if not kernels:
+            return f"{label:<7}|{''.join(lane)}|"
+        span = max(1.0, scale_us)
+        for event in kernels:
+            left = max(0, min(width - 1, int(event.start_us / span * width)))
+            right = max(left + 1, min(width, int(event.end_us / span * width) + 1))
+            ch = timeline_char(event.category)
+            for idx in range(left, right):
+                lane[idx] = ch
+        own_span_ms = max(event.end_us for event in kernels) / 1000.0
+        return f"{label:<7}|{''.join(lane)}| {own_span_ms:.3f} ms"
+
+    def timeline_rows(eager_events: list[dict], compile_events: list[dict]) -> list[str]:
+        eager_kernels = categorized_kernel_events(eager_events)
+        compile_kernels = categorized_kernel_events(compile_events)
+        if not eager_kernels and not compile_kernels:
+            return ["timeline: no CUDA kernels found"]
+
+        def span_us(kernels: list[TraceEvent]) -> float:
+            if not kernels:
+                return 1.0
+            return max(1.0, max(event.end_us for event in kernels))
+
+        scale_us = max(span_us(eager_kernels), span_us(compile_kernels))
+        return [
+            "timeline, each trace normalized to its first CUDA kernel; shared duration scale",
+            f"0.000 ms{' ' * 34}{scale_us / 1000.0:.3f} ms",
+            timeline_lane("eager", eager_kernels, scale_us),
+            timeline_lane("compile", compile_kernels, scale_us),
+            "legend: F=Inductor Triton fused  G=GEMM/linear  A=attention  L=layernorm  N=AdaLN  R=residual  U=GELU  P=conv  0=memset  .=other",
+        ]
+
+    eager_events = load_events(eager_trace)
+    compile_events = load_events(compile_trace)
+    eager_grouped, eager_total_us = semantic_cuda_summary(eager_events, build_external_category_map(eager_events))
+    compile_grouped, compile_total_us = semantic_cuda_summary(compile_events, build_external_category_map(compile_events))
+    keys = sorted(
+        set(eager_grouped) | set(compile_grouped),
+        key=lambda k: abs(compile_grouped.get(k, {}).get("dur_us", 0.0) - eager_grouped.get(k, {}).get("dur_us", 0.0)),
+        reverse=True,
+    )
+    lines = [
+        "mode: eager vs compile trace browser",
+        f"eager trace:   {eager_trace}",
+        f"compile trace: {compile_trace}",
+        f"total CUDA: eager={eager_total_us / 1000.0:.3f} ms compile={compile_total_us / 1000.0:.3f} ms delta={(compile_total_us - eager_total_us) / 1000.0:+.3f} ms",
+        "",
+    ]
+    lines.extend(timeline_rows(eager_events, compile_events))
+    lines.extend(("", "category deltas by CUDA kernel time:"))
+    for key in keys:
+        eager_us = eager_grouped.get(key, {}).get("dur_us", 0.0)
+        compile_us = compile_grouped.get(key, {}).get("dur_us", 0.0)
+        lines.append(f"{key:28s} eager={eager_us / 1000.0:.3f} ms  compile={compile_us / 1000.0:.3f} ms  delta={(compile_us - eager_us) / 1000.0:+.3f} ms")
+    lines.extend(("", "top compile CUDA kernels:", "category / count / cuda time / pct / kernel"))
+    lines.extend(kernel_rows(compile_events, rows))
+    lines.extend(("", "top eager CUDA kernels:", "category / count / cuda time / pct / kernel"))
+    lines.extend(kernel_rows(eager_events, rows))
+    eager_lane = TraceLane("eager", tuple(categorized_kernel_events(eager_events)), eager_total_us)
+    compile_lane = TraceLane("compile", tuple(categorized_kernel_events(compile_events)), compile_total_us)
+    data = TraceCompareData(eager_trace, compile_trace, eager_lane, compile_lane, tuple(lines))
+    return tuple(lines), data
+
+
+def compare_compile_trace_lines(eager_trace: Path, compile_trace: Path, rows: int = 10) -> tuple[str, ...]:
+    return compare_compile_trace(eager_trace, compile_trace, rows)[0]
 
 
 def check_close(name: str, actual: torch.Tensor, expected: torch.Tensor, atol: float = 1.2e-1, rtol: float = 1.2e-1) -> bool:
@@ -1629,75 +885,24 @@ def bench_case(
     groups = [make_group(batch, cfg["in_channels"], spatial, 50000 + i * 10) for i in range(groups_n)]
 
     print(f"\n3D DiT-{model_name}/1 E2E train: batch={batch} tokens={tokens} spatial={spatial} groups={groups_n}")
-    variants = [("eager", False, False, False, False, False, False, "timm", False)]
-    if include_compile:
-        variants.append(("compile", False, False, False, False, False, False, "timm", True))
-    variants.extend([
-        ("tk_mlp", False, False, True, False, False, False, "timm", False),
-        ("fused_adaln", True, False, False, False, False, False, "timm", False),
-        ("fused_adaln_residual", True, True, False, False, False, False, "timm", False),
-        ("fused_adaln_residual_tk_mlp", True, True, True, False, False, False, "timm", False),
-        ("fused_output_proj", True, True, False, False, True, False, "timm", False),
-        ("fused_input_proj", True, True, False, True, False, False, "timm", False),
-        ("fused_input_output_proj", True, True, False, True, True, False, "timm", False),
-        ("fused_input_proj_tk_mlp", True, True, True, True, False, False, "timm", False),
-        ("fused_input_output_proj_tk_mlp", True, True, True, True, True, False, "timm", False),
-    ])
-    if include_compile:
-        variants.extend([
-            ("compile_fused_adaln", True, False, False, False, False, False, "timm", True),
-            ("compile_tk_adaln_only", True, False, False, False, False, False, "timm", True),
-            ("compile_fused_adaln_residual", True, True, False, False, False, False, "timm", True),
-            ("compile_fused_output_proj", True, True, False, False, True, False, "timm", True),
-            ("compile_fused_output_proj_epilogue", True, True, False, False, True, True, "timm", True),
-            ("compile_tk_adaln_residual_only", True, True, False, False, False, False, "timm", True),
-            ("compile_fused_adaln_tk_mlp", True, False, True, False, False, False, "timm", True),
-            ("compile_fused_adaln_residual_tk_mlp", True, True, True, False, False, False, "timm", True),
-        ])
-    if include_fa3:
-        variants.extend([
-            ("fa3_attn", False, False, False, False, False, False, "fa3", False),
-            ("fused_adaln_residual_fa3", True, True, False, False, False, False, "fa3", False),
-            ("fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, False, "fa3", False),
-            ("fused_output_proj_fa3", True, True, False, False, True, False, "fa3", False),
-            ("fused_input_proj_fa3", True, True, False, True, False, False, "fa3", False),
-            ("fused_input_output_proj_fa3", True, True, False, True, True, False, "fa3", False),
-            ("fused_input_proj_fa3_tk_mlp", True, True, True, True, False, False, "fa3", False),
-            ("fused_input_output_proj_fa3_tk_mlp", True, True, True, True, True, False, "fa3", False),
-        ])
-        if include_compile:
-            variants.extend([
-                ("compile_fa3_attn", False, False, False, False, False, False, "fa3", True),
-                ("compile_fused_adaln_residual_fa3", True, True, False, False, False, False, "fa3", True),
-                ("compile_fused_adaln_residual_fa3_tk_mlp", True, True, True, False, False, False, "fa3", True),
-            ])
-    if only_variants:
-        missing = only_variants.difference(name for name, *_ in variants)
-        if missing:
-            raise ValueError(f"unknown variants: {sorted(missing)}")
-        variants = [variant for variant in variants if variant[0] in only_variants]
+    variants = selected_variants(
+        probe=False,
+        include_compile=include_compile,
+        include_fa3=include_fa3,
+        only_variants=only_variants,
+    )
     results = []
-    for variant_name, fused, fused_residual, tk_mlp, fused_input_projection, fused_output_projection, fused_epilogue_only, attention_backend, compiled in variants:
+    for variant_name in variants:
         print(f"  running {variant_name}...", flush=True)
-        model = make_model(
-            model_name,
-            fused=fused,
-            fused_residual=fused_residual,
-            tk_mlp=tk_mlp,
-            fused_input_projection=fused_input_projection,
-            fused_output_projection=fused_output_projection,
-            fused_epilogue_only=fused_epilogue_only,
-            attention_backend=attention_backend,
-        )
+        config = variant_config(variant_name)
+        model = make_variant_model(model_name, config)
         model.pos_embed(spatial, torch.bfloat16, torch.device("cuda"))
-        if compiled:
-            model = torch.compile(model)
         try:
             result = profile_groups(
                 f"DiT-{model_name} B{batch} {variant_name} train",
                 groups,
                 lambda g, current_model=model: train_step(current_model, g),
-                warmup=max(1, min(2, warmup)) if compiled else warmup,
+                warmup=max(1, min(2, warmup)) if config.compiled else warmup,
                 iters=iters,
             )
             results.append(result)
@@ -1718,35 +923,16 @@ def probe_case(model_name: str, batch: int, spatial: tuple[int, int, int], inclu
     tokens = spatial[0] * spatial[1] * spatial[2]
     print(f"\n3D DiT-{model_name}/1 memory probe: batch={batch} tokens={tokens} spatial={spatial}")
     group = make_group(batch, cfg["in_channels"], spatial, 90000)
-    for label, fused, fused_residual in (
-        ("eager", False, False),
-        ("fused_adaln", True, False),
-        ("fused_adaln_residual", True, True),
-    ):
-        model = make_model(model_name, fused=fused, fused_residual=fused_residual)
-        memory_probe(model, group, f"DiT-{model_name} B{batch} {label} train")
-        del model
-        torch.cuda.empty_cache()
-    model = make_model(model_name, fused=False, fused_residual=False, tk_mlp=True)
-    memory_probe(model, group, f"DiT-{model_name} B{batch} tk_mlp train")
-    del model
-    torch.cuda.empty_cache()
-    model = make_model(model_name, fused=True, fused_residual=True, tk_mlp=True)
-    memory_probe(model, group, f"DiT-{model_name} B{batch} fused_adaln_residual_tk_mlp train")
-    del model
-    torch.cuda.empty_cache()
-    if include_fa3:
-        model = make_model(model_name, fused=False, attention_backend="fa3")
-        memory_probe(model, group, f"DiT-{model_name} B{batch} fa3_attn train")
-        del model
-        torch.cuda.empty_cache()
-        model = make_model(model_name, fused=True, fused_residual=True, attention_backend="fa3")
-        memory_probe(model, group, f"DiT-{model_name} B{batch} fused_adaln_residual_fa3 train")
-        del model
-        torch.cuda.empty_cache()
-    if include_compile:
-        model = torch.compile(make_model(model_name, fused=False))
-        memory_probe(model, group, f"DiT-{model_name} B{batch} compile train")
+
+    variants = selected_variants(
+        probe=True,
+        include_compile=include_compile,
+        include_fa3=include_fa3,
+    )
+
+    for variant_name in variants:
+        model = make_variant_model(model_name, variant_config(variant_name))
+        memory_probe(model, group, f"DiT-{model_name} B{batch} {variant_name} train")
         del model
         torch.cuda.empty_cache()
 
@@ -1786,7 +972,7 @@ def spatial_for_tokens(tokens: int) -> tuple[int, int, int]:
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark full 3D DiT training variants.")
-    parser.add_argument("--model", choices=["S", "L", "XL"], default="S")
+    parser.add_argument("--model", choices=["S", "L", "XL"], default="L")
     parser.add_argument("--batches", nargs="+", type=int, default=[4, 16, 64, 256, 1024])
     parser.add_argument("--spatial", nargs=3, type=int, default=[2, 2, 4])
     parser.add_argument("--tokens", nargs="+", type=int, default=None, help="Token counts to benchmark. Arbitrary counts are mapped to an exact-product 3D shape.")
@@ -1796,13 +982,77 @@ def main():
     parser.add_argument("--variants", nargs="+", default=None, help="Only run the named benchmark variants.")
     parser.add_argument("--profile-variant", default="", help="Run torch profiler for one named variant and exit.")
     parser.add_argument("--profile-rows", type=int, default=30)
+    parser.add_argument("--profile-trace-out", type=Path, default=None, help="Write a Chrome trace JSON for --profile-variant.")
     parser.add_argument("--check-fused-input", action="store_true", help="Run isolated LN+AdaLN+projection correctness checks and exit.")
     parser.add_argument("--bench-residual", action="store_true", help="Run isolated standalone gated residual forward+backward benchmarks and exit.")
     parser.add_argument("--hidden-dim", type=int, default=1024, help="Hidden dimension for isolated residual benchmark.")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--probe-memory", action="store_true")
+    parser.add_argument("--print-ditblock", action="store_true", help="Print colored DiTBlock fusion plan for selected variants and exit.")
+    parser.add_argument("--ditblock-ui", action="store_true", help="Open an interactive DiTBlock variant browser. Use with --print-ditblock.")
+    parser.add_argument("--ditblock-detail", action="store_true", help="Include kernel-boundary explanations in --print-ditblock output.")
+    parser.add_argument("--ditblock-compile-trace", type=Path, default=None, help="Chrome trace JSON from a compiled profile run; used to show actual TorchInductor Triton kernels in the DiTBlock UI/printout.")
+    parser.add_argument("--ditblock-compile-rows", type=int, default=8, help="Number of trace-derived TorchInductor kernels to show in the DiTBlock UI/printout.")
+    parser.add_argument("--ditblock-trace-dir", type=Path, default=Path("profile_artifacts/ditblock_ui_traces"), help="Directory where DiTBlock UI trace reruns are written.")
     args = parser.parse_args()
+
+    if args.print_ditblock:
+        variant_names = selected_variants(
+            probe=False,
+            include_compile=args.compile,
+            include_fa3=args.fa3,
+            only_variants=set(args.variants) if args.variants else None,
+        )
+        compile_evidence = None
+        if args.ditblock_compile_trace is not None:
+            compile_evidence = load_compile_fusion_evidence(args.ditblock_compile_trace, rows=args.ditblock_compile_rows)
+        spatial = spatial_for_tokens(args.tokens[0]) if args.tokens else tuple(args.spatial)
+        batch = args.batches[0]
+        tokens = spatial[0] * spatial[1] * spatial[2]
+        trace_config = (
+            f"trace config: model={args.model} batch={batch} tokens={tokens} warmup={args.warmup} iters={args.iters}",
+            f"trace dir: {args.ditblock_trace_dir}",
+        )
+
+        def ui_trace_runner(variant_name: str):
+            trace_path = profile_variant_trace(args.model, variant_name, batch, spatial, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            evidence = load_compile_fusion_evidence(trace_path, rows=args.ditblock_compile_rows) if variant_config(variant_name).compiled else None
+            return evidence, (f"wrote trace: {trace_path}",)
+
+        def ui_compare_runner(variant_name: str):
+            compile_variant = variant_name if variant_config(variant_name).compiled else "compile"
+            eager_trace = profile_variant_trace(args.model, "eager", batch, spatial, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            compile_trace = profile_variant_trace(args.model, compile_variant, batch, spatial, args.warmup, args.iters, args.profile_rows, args.ditblock_trace_dir)
+            evidence = load_compile_fusion_evidence(compile_trace, rows=args.ditblock_compile_rows)
+            lines, data = compare_compile_trace(eager_trace, compile_trace, rows=args.ditblock_compile_rows)
+            return evidence, lines, data
+
+        existing_eager_trace = args.ditblock_trace_dir / trace_file_name(args.model, "eager", batch, spatial)
+        existing_compile_trace = args.ditblock_trace_dir / trace_file_name(args.model, "compile", batch, spatial)
+        initial_compare_lines: tuple[str, ...] = ()
+        initial_compare_data = None
+        initial_show_compare = False
+        if existing_eager_trace.exists() and existing_compile_trace.exists():
+            initial_compare_lines, initial_compare_data = compare_compile_trace(existing_eager_trace, existing_compile_trace, rows=args.ditblock_compile_rows)
+            initial_show_compare = True
+            if compile_evidence is None:
+                compile_evidence = load_compile_fusion_evidence(existing_compile_trace, rows=args.ditblock_compile_rows)
+
+        if args.ditblock_ui:
+            run_ditblock_fusion_ui(
+                variant_names,
+                compile_evidence=compile_evidence,
+                trace_runner=ui_trace_runner,
+                compare_runner=ui_compare_runner,
+                trace_config=trace_config,
+                initial_compare_lines=initial_compare_lines,
+                initial_compare_data=initial_compare_data,
+                initial_show_compare=initial_show_compare,
+            )
+        else:
+            print_ditblock_fusion_plan(variant_names, detail=args.ditblock_detail, compile_evidence=compile_evidence)
+        return
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
@@ -1820,12 +1070,21 @@ def main():
         return
     if args.profile_variant:
         spatial = spatial_for_tokens(args.tokens[0]) if args.tokens else tuple(args.spatial)
-        profile_variant_case(args.model, args.profile_variant, args.batches[0], spatial, args.warmup, args.iters, args.profile_rows)
+        profile_variant_case(
+            args.model,
+            args.profile_variant,
+            args.batches[0],
+            spatial,
+            args.warmup,
+            args.iters,
+            args.profile_rows,
+            args.profile_trace_out,
+        )
         return
     all_results = []
     cases = []
     if args.sweep or args.tokens is not None:
-        token_counts = args.tokens or [512, 1024, 2048, 4096, 8192, 16384, 32768, 60000]
+        token_counts = args.tokens or [2**p for p in range(9, 17)]
         for tokens in token_counts:
             spatial = spatial_for_tokens(tokens)
             for batch in args.batches:
