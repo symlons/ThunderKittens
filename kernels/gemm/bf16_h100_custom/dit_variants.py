@@ -711,6 +711,23 @@ def run_ditblock_fusion_ui(
         y += 1
         put(y, x, spec.description)
         y += 1
+        put(y, x, f"variant backend: attention={cfg.attention_backend} torch_compile={'on' if cfg.compiled else 'off'}", curses.A_DIM)
+        y += 1
+        put(
+            y,
+            x,
+            (
+                "variant fusions: "
+                f"adaln={'on' if cfg.fused else 'off'} "
+                f"residual={'on' if cfg.fused_residual else 'off'} "
+                f"tk_mlp={'on' if cfg.tk_mlp else 'off'} "
+                f"in_proj={'on' if cfg.fused_input_projection else 'off'} "
+                f"out_proj={'on' if cfg.fused_output_projection else 'off'} "
+                f"epilogue_only={'on' if cfg.fused_epilogue_only else 'off'}"
+            ),
+            curses.A_DIM,
+        )
+        y += 1
         for line in trace_config:
             put(y, x, line, curses.A_DIM)
             y += 1
@@ -740,6 +757,25 @@ def run_ditblock_fusion_ui(
                 return attr | curses.color_pair(7)
             return attr | curses.A_DIM
 
+        def delta_value_attr(delta_text: str) -> int:
+            attr = curses.A_BOLD
+            if not curses.has_colors():
+                return attr
+            stripped = delta_text.strip()
+            if stripped.startswith("-") and not stripped.startswith("-0.000"):
+                return attr | curses.color_pair(1)
+            if stripped.startswith("+") and not stripped.startswith("+0.000"):
+                return attr | curses.color_pair(6)
+            return curses.A_DIM
+
+        def put_delta_line(row: int, col: int, line: str) -> int:
+            prefix, delta = line.split("delta=", 1)
+            put(row, col, prefix + "delta=", curses.A_NORMAL)
+            delta_col = col + len(prefix) + len("delta=")
+            if delta_col < width - 1:
+                put(row, delta_col, delta, delta_value_attr(delta))
+            return row + 1
+
         def detail_line_attr(line: str) -> int:
             stripped = line.strip()
             if not stripped:
@@ -750,13 +786,10 @@ def run_ditblock_fusion_ui(
                 return curses.A_BOLD | (curses.color_pair(2) if curses.has_colors() else 0)
             if stripped.startswith("category /"):
                 return curses.A_DIM
-            if stripped.startswith("total CUDA:") or " delta=" in stripped:
-                delta_part = stripped.split("delta=", 1)[-1] if "delta=" in stripped else ""
-                if delta_part.startswith("-"):
-                    return curses.A_BOLD | (curses.color_pair(1) if curses.has_colors() else 0)
-                if delta_part.startswith("+"):
-                    return curses.A_BOLD | (curses.color_pair(6) if curses.has_colors() else 0)
+            if stripped.startswith("total CUDA:"):
                 return curses.A_BOLD
+            if " delta=" in stripped:
+                return curses.A_NORMAL
             first = stripped.split(None, 1)[0]
             if first and all(ch.isalnum() or ch == "_" for ch in first):
                 return category_color_attr(first, bold=True)
@@ -908,7 +941,10 @@ def run_ditblock_fusion_ui(
                 for line in compare_lines[compare_scroll:]:
                     if y >= height:
                         break
-                    y = put_wrapped(y, x + 4, line, detail_line_attr(line))
+                    if " delta=" in line:
+                        y = put_delta_line(y, x + 4, line)
+                    else:
+                        y = put_wrapped(y, x + 4, line, detail_line_attr(line))
             stdscr.refresh()
             return
 

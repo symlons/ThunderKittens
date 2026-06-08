@@ -1126,7 +1126,10 @@ def main():
         batch = args.batches[0]
         tokens = spatial[0] * spatial[1] * spatial[2]
         trace_config = (
-            f"trace config: scope=DiTBlock mode={'forward+backward' if args.ditblock_bwd else 'forward'} model={args.model} batch={batch} tokens={tokens} warmup={args.warmup} iters={args.iters}",
+            "trace scope: isolated DiTBlock",
+            f"trace mode: {'forward+backward' if args.ditblock_bwd else 'forward-only'} ({'bwd on' if args.ditblock_bwd else 'bwd off'})",
+            f"trace shape: model={args.model} batch={batch} tokens={tokens}",
+            f"trace profiling: warmup={args.warmup} iters={args.iters} rows={args.profile_rows}",
             f"trace dir: {args.ditblock_trace_dir}",
         )
 
