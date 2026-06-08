@@ -750,9 +750,7 @@ def compare_compile_trace(eager_trace: Path, compile_trace: Path, rows: int = 10
         for event in kernels:
             left = max(0, min(width - 1, int(event.start_us / span * width)))
             right = max(left + 1, min(width, int(event.end_us / span * width) + 1))
-            ch = timeline_char(event.category)
-            for idx in range(left, right):
-                lane[idx] = ch
+            lane[(left + right - 1) // 2] = timeline_char(event.category)
         own_span_ms = max(event.end_us for event in kernels) / 1000.0
         return f"{label:<7}|{''.join(lane)}| {own_span_ms:.3f} ms"
 

@@ -842,7 +842,7 @@ def run_ditblock_fusion_ui(
                 def lane_cells(lane: TraceLane, is_active: bool) -> tuple[list[tuple[str, int]], int | None]:
                     cells = [(" ", curses.A_DIM) for _ in range(lane_width)]
                     selected_col: int | None = None
-                    selected_range: tuple[int, int, str] | None = None
+                    selected_marker: tuple[int, str] | None = None
                     selected_index = event_indices.get(lane.label, 0)
                     if timeline_mode == "calls":
                         visible_calls = max(1, min(call_window_size, max(1, len(lane.events))))
@@ -853,35 +853,25 @@ def run_ditblock_fusion_ui(
                             rel = idx - start
                             left = max(0, min(lane_width - 1, int(rel / visible_calls * lane_width)))
                             right = max(left + 1, min(lane_width, int((rel + 1) / visible_calls * lane_width)))
-                            for col in range(left, right):
-                                cells[col] = (event_char(event.category), category_color_attr(event.category))
+                            marker_col = max(0, min(lane_width - 1, (left + right - 1) // 2))
+                            cells[marker_col] = (event_char(event.category), category_color_attr(event.category))
                             if is_active and idx == selected_index:
-                                selected_col = left
-                                selected_range = (left, right, event.category)
+                                selected_col = marker_col
+                                selected_marker = (marker_col, event.category)
                     else:
                         for idx, event in enumerate(lane.events):
                             if event.end_us < offset_us or event.start_us > offset_us + window_us:
                                 continue
                             left = max(0, min(lane_width - 1, int((event.start_us - offset_us) / window_us * lane_width)))
                             right = max(left + 1, min(lane_width, int((event.end_us - offset_us) / window_us * lane_width) + 1))
-                            ch = event_char(event.category)
-                            attr = category_color_attr(event.category)
-                            for col in range(left, right):
-                                cells[col] = (ch, attr)
+                            marker_col = max(0, min(lane_width - 1, (left + right - 1) // 2))
+                            cells[marker_col] = (event_char(event.category), category_color_attr(event.category))
                             if is_active and idx == selected_index:
-                                selected_col = left
-                                selected_range = (left, right, event.category)
-                    if selected_range is not None:
-                        left, right, category = selected_range
-                        center_col = max(0, min(lane_width - 1, (left + right - 1) // 2))
-                        if timeline_mode == "calls":
-                            left = center_col
-                            right = center_col + 1
-                        else:
-                            left = max(0, min(left, center_col - 1))
-                            right = min(lane_width, max(right, center_col + 2))
-                        for col in range(left, right):
-                            cells[col] = ("@", category_color_attr(category, selected_event=True))
+                                selected_col = marker_col
+                                selected_marker = (marker_col, event.category)
+                    if selected_marker is not None:
+                        marker_col, category = selected_marker
+                        cells[marker_col] = ("@", category_color_attr(category, selected_event=True))
                     return cells, selected_col
 
                 def put_timeline(row: int, col: int, prefix: str, lane: TraceLane, cells: list[tuple[str, int]], attr: int) -> None:
