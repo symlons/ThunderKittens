@@ -809,7 +809,7 @@ def run_ditblock_fusion_ui(
                 offset_us = min(max(0.0, timeline_offset_us), max(0.0, scale_us - window_us))
                 zoom = scale_us / max(window_us, 1.0)
                 active_for_window = compare_data.eager if active_lane == "eager" else compare_data.compile
-                call_window = max(1, min(call_window_size, max(1, len(active_for_window.events))))
+                call_window = max(1, min(call_window_size, lane_width, max(1, len(active_for_window.events))))
                 call_start = min(max(0, call_offset), max(0, len(active_for_window.events) - call_window))
                 call_end = min(len(active_for_window.events), call_start + call_window)
                 if timeline_mode == "calls":
@@ -845,15 +845,12 @@ def run_ditblock_fusion_ui(
                     selected_marker: tuple[int, str] | None = None
                     selected_index = event_indices.get(lane.label, 0)
                     if timeline_mode == "calls":
-                        visible_calls = max(1, min(call_window_size, max(1, len(lane.events))))
+                        visible_calls = max(1, min(call_window_size, lane_width, max(1, len(lane.events))))
                         start = min(max(0, call_offset), max(0, len(lane.events) - visible_calls))
                         stop = min(len(lane.events), start + visible_calls)
                         for idx in range(start, stop):
                             event = lane.events[idx]
-                            rel = idx - start
-                            left = max(0, min(lane_width - 1, int(rel / visible_calls * lane_width)))
-                            right = max(left + 1, min(lane_width, int((rel + 1) / visible_calls * lane_width)))
-                            marker_col = max(0, min(lane_width - 1, (left + right - 1) // 2))
+                            marker_col = idx - start
                             cells[marker_col] = (event_char(event.category), category_color_attr(event.category))
                             if is_active and idx == selected_index:
                                 selected_col = marker_col
