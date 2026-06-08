@@ -52,6 +52,54 @@ class TraceCompareData:
     summary_lines: tuple[str, ...]
 
 
+def trace_event_glyph(category: str) -> str:
+    if category.startswith("fused_"):
+        return "F"
+    if "attention" in category:
+        return "A"
+    if "linear" in category or "gemm" in category:
+        return "G"
+    if "layer_norm" in category:
+        return "L"
+    if "adaln" in category:
+        return "N"
+    if "residual" in category:
+        return "R"
+    if "gelu" in category:
+        return "U"
+    if "conv" in category or "patch_embed" in category:
+        return "P"
+    if "memset" in category:
+        return "0"
+    return "."
+
+
+def packed_call_timeline_cells(events: tuple[TraceEvent, ...], lane_width: int, call_offset: int, call_window_size: int) -> tuple[str, ...]:
+    cells = [" " for _ in range(max(0, lane_width))]
+    if not cells or not events:
+        return tuple(cells)
+    visible_calls = max(1, min(call_window_size, len(cells), len(events)))
+    start = min(max(0, call_offset), max(0, len(events) - visible_calls))
+    stop = min(len(events), start + visible_calls)
+    for idx in range(start, stop):
+        cells[idx - start] = trace_event_glyph(events[idx].category)
+    return tuple(cells)
+
+
+def time_marker_timeline_cells(events: tuple[TraceEvent, ...], lane_width: int, offset_us: float, window_us: float) -> tuple[str, ...]:
+    cells = [" " for _ in range(max(0, lane_width))]
+    if not cells or not events:
+        return tuple(cells)
+    window = max(1.0, window_us)
+    for event in events:
+        if event.end_us < offset_us or event.start_us > offset_us + window:
+            continue
+        left = max(0, min(len(cells) - 1, int((event.start_us - offset_us) / window * len(cells))))
+        right = max(left + 1, min(len(cells), int((event.end_us - offset_us) / window * len(cells)) + 1))
+        cells[(left + right - 1) // 2] = trace_event_glyph(event.category)
+    return tuple(cells)
+
+
 @dataclass(frozen=True)
 class VariantConfig:
     fused: bool = False
@@ -819,25 +867,7 @@ def run_ditblock_fusion_ui(
                 y += 1
 
                 def event_char(category: str) -> str:
-                    if category.startswith("fused_"):
-                        return "F"
-                    if "attention" in category:
-                        return "A"
-                    if "linear" in category or "gemm" in category:
-                        return "G"
-                    if "layer_norm" in category:
-                        return "L"
-                    if "adaln" in category:
-                        return "N"
-                    if "residual" in category:
-                        return "R"
-                    if "gelu" in category:
-                        return "U"
-                    if "conv" in category or "patch_embed" in category:
-                        return "P"
-                    if "memset" in category:
-                        return "0"
-                    return "."
+                    return trace_event_glyph(category)
 
                 def lane_cells(lane: TraceLane, is_active: bool) -> tuple[list[tuple[str, int]], int | None]:
                     cells = [(" ", curses.A_DIM) for _ in range(lane_width)]
@@ -848,13 +878,13 @@ def run_ditblock_fusion_ui(
                         visible_calls = max(1, min(call_window_size, lane_width, max(1, len(lane.events))))
                         start = min(max(0, call_offset), max(0, len(lane.events) - visible_calls))
                         stop = min(len(lane.events), start + visible_calls)
-                        for idx in range(start, stop):
+                        glyphs = packed_call_timeline_cells(lane.events, lane_width, call_offset, call_window_size)
+                        for rel, idx in enumerate(range(start, stop)):
                             event = lane.events[idx]
-                            marker_col = idx - start
-                            cells[marker_col] = (event_char(event.category), category_color_attr(event.category))
+                            cells[rel] = (glyphs[rel], category_color_attr(event.category))
                             if is_active and idx == selected_index:
-                                selected_col = marker_col
-                                selected_marker = (marker_col, event.category)
+                                selected_col = rel
+                                selected_marker = (rel, event.category)
                     else:
                         for idx, event in enumerate(lane.events):
                             if event.end_us < offset_us or event.start_us > offset_us + window_us:
