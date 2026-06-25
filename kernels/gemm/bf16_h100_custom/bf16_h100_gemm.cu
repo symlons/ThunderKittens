@@ -1270,7 +1270,8 @@ struct matmul_template {
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? PERSISTENT_GRID_BLOCKS : full_grid);
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -1362,7 +1363,8 @@ struct native_matmul_template {
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? ((M >= 81920) ? 132 : PERSISTENT_GRID_BLOCKS) : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? ((M >= 81920) ? 132 : PERSISTENT_GRID_BLOCKS) : full_grid);
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -1445,13 +1447,93 @@ struct native_matmul_template {
 };
 
 template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
+struct native_matmul_gelu_out_template {
+    static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
+    using layout    = matmul_layout<M_BLOCK, N_BLOCK>;
+    using wide_tile = st_bf<64, 64*N_BLOCK>;
+    static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
+    template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? ((M >= 81920) ? 132 : PERSISTENT_GRID_BLOCKS) : full_grid);
+    }
+    __device__ static inline void common_setup(common_setup_args<layout> args) {
+        if (threadIdx.x == 0) {
+            args.globals.A.template prefetch_tma<typename layout::base_tile>();
+            args.globals.B.template prefetch_tma<typename layout::base_tile>();
+            args.globals.C.template prefetch_tma<typename layout::base_tile>();
+        }
+        int Rblocks = args.globals.C.rows() / (M_BLOCK*64), Cblocks = args.globals.C.cols() / (N_BLOCK*64);
+        int super_rows = (Rblocks/SUPER_M)*SUPER_M,
+            final_rows = Rblocks - super_rows,
+            super_repeat = SUPER_M*Cblocks;
+        int task_id = args.task_iter*gridDim.x + blockIdx.x;
+        if (task_id < super_rows * Cblocks)
+            args.common.coord = { SUPER_M*(task_id/super_repeat) + task_id%SUPER_M, (task_id%super_repeat)/SUPER_M };
+        else if (task_id < Rblocks*Cblocks) {
+            int remainder_id = task_id - super_rows*Cblocks;
+            args.common.coord = { super_rows + (remainder_id%final_rows), remainder_id/final_rows };
+        }
+        else {
+            args.num_iters = -1;
+            return;
+        }
+        args.num_iters = args.globals.A.cols()/64;
+        int id = warpgroup::groupid() == NUM_CONSUMER_WARPS/4 ? 0 : warpgroup::groupid();
+        args.common.coord = { args.common.coord.x*M_BLOCK + id, args.common.coord.y*N_BLOCK };
+    }
+    struct producer {
+        __device__ static void setup(producer_setup_args<layout> args) {
+            warpgroup::decrease_registers<40>();
+        }
+        __device__ static void load(producer_load_args<layout> args) {
+            if (warpgroup::elect_leader()) {
+                tma::expect(args.inputs_arrived, args.input);
+                for(int i = 0; i < M_BLOCK; i++)
+                    tma::load_async(args.input.a[i], args.globals.A,
+                                    {args.common.coord.x+i, args.iter}, args.inputs_arrived);
+                for(int i = 0; i < N_BLOCK; i++)
+                    tma::load_async(args.input.b[i], args.globals.B,
+                                    {args.common.coord.y+i, args.iter}, args.inputs_arrived);
+            }
+        }
+    };
+    struct consumer {
+        __device__ static void setup(consumer_setup_args<layout> args) {
+            warpgroup::increase_registers<232>();
+            group<NUM_CONSUMER_WARPS>::load(args.scratch.bias, args.globals.bias, {args.common.coord.y / N_BLOCK});
+            group<NUM_CONSUMER_WARPS>::sync(0);
+            init_bias(args.state.accum, args.scratch.bias);
+        }
+        __device__ static void compute(consumer_compute_args<layout> args) {
+            using tall_tile = st_bf<64*N_BLOCK, 64>;
+            warpgroup::mma_ABt(args.state.accum, args.input.a[warpgroup::groupid()], reinterpret_cast<tall_tile&>(args.input.b));
+            warpgroup::mma_async_wait();
+            if (warp::elect_leader()) arrive(args.inputs_finished);
+        }
+        __device__ static void finish(consumer_finish_args<layout> args) {
+            apply_gelu(args.state.accum);
+            warpgroup::store(reinterpret_cast<wide_tile&>(args.finish.c[warpgroup::groupid()]), args.state.accum);
+            warpgroup::sync(warpgroup::groupid() + 4);
+            if (warpgroup::elect_leader()) {
+                for (int i = 0; i < N_BLOCK; i++)
+                    tma::store_async(args.globals.C, args.finish.c[warpgroup::groupid()][i], {args.common.coord.x, args.common.coord.y + i});
+                tma::store_async_read_wait();
+            }
+            init_bias(args.state.accum, args.scratch.bias);
+            if (warp::elect_leader()) arrive(args.finish_finished);
+        }
+    };
+};
+
+template<int _M_BLOCK=2, int _N_BLOCK=4, int _SUPER_M=12>
 struct native_linear_template {
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
     using layout    = matmul_layout<M_BLOCK, N_BLOCK>;
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? PERSISTENT_GRID_BLOCKS : full_grid);
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -1528,7 +1610,8 @@ struct native_linear_grid132_template : native_linear_template<_M_BLOCK, _N_BLOC
     static constexpr int M_BLOCK = _M_BLOCK, N_BLOCK = _N_BLOCK, SUPER_M = _SUPER_M;
 
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? 132 : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? 132 : full_grid);
     }
 };
 
@@ -1605,7 +1688,8 @@ struct gated_linear_template {
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? PERSISTENT_GRID_BLOCKS : full_grid);
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -1696,7 +1780,8 @@ struct gated_linear_out_template {
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? PERSISTENT_GRID_BLOCKS : full_grid);
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -1781,7 +1866,8 @@ struct modulated_matmul_template {
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? PERSISTENT_GRID_BLOCKS : full_grid);
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -1878,7 +1964,8 @@ struct ln_adaln_linear_template {
     using wide_tile = st_bf<64, 64*N_BLOCK>;
     static constexpr int NUM_CONSUMER_WARPS=M_BLOCK*4, INPUT_PIPE_STAGES=4, PRODUCER_BARRIER_ARRIVALS=1;
     template<bool PERISISTENT_GRID=true> __host__ static inline dim3 grid(int M, int N, int K) {
-        return dim3(PERISISTENT_GRID ? PERSISTENT_GRID_BLOCKS : M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements));
+        int full_grid = M*N/(M_BLOCK*N_BLOCK*layout::base_tile::num_elements);
+        return dim3((PERISISTENT_GRID && M != 65536) ? PERSISTENT_GRID_BLOCKS : full_grid);
     }
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         if (threadIdx.x == 0) {
@@ -2183,6 +2270,58 @@ void gemm_custom_native_variant_entrypoint(
     prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
 }
 
+template<int M_BLOCK, int N_BLOCK, int SUPER_M>
+void gemm_custom_native_out_variant_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias
+) {
+    using mmt = native_matmul_gelu_out_template<M_BLOCK, N_BLOCK, SUPER_M>;
+    using globals = typename mmt::layout::globals;
+    using global_layout = typename mmt::layout::global_layout;
+    using bias_global = typename mmt::layout::bias_global;
+
+    kittens::py::device_check(A, B, C, bias);
+
+    globals G{
+        kittens::py::tensor_to_gl<global_layout>(A),
+        kittens::py::tensor_to_gl<global_layout>(B),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<global_layout>(C),
+        kittens::py::tensor_to_gl<bias_global>(bias)
+    };
+
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(0);
+
+    dim3 grid = mmt::grid(M, N, K);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<mmt>);
+    int smem = MAX_SHARED_MEMORY - 1024;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+
+    prototype::lcf::kernel<mmt><<<grid, block, smem, stream>>>(G);
+}
+
+void gemm_custom_native_out_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    const at::Tensor &C,
+    const at::Tensor &bias
+) {
+    int K = A.size(1);
+    int N = B.size(0);
+    if (K == 1024 && N == 4096) {
+        gemm_custom_native_out_variant_entrypoint<2, 4, 4>(A, B, C, bias);
+        return;
+    }
+    gemm_custom_native_out_variant_entrypoint<2, 4, 8>(A, B, C, bias);
+}
+
 void gemm_custom_native_entrypoint(
     const at::Tensor &A,
     const at::Tensor &B,
@@ -2193,6 +2332,10 @@ void gemm_custom_native_entrypoint(
     int K = A.size(1);
     int N = B.size(0);
     if (K >= 4 * N) {
+        gemm_custom_native_variant_entrypoint<2, 4, 4>(A, B, C, bias, preact);
+        return;
+    }
+    if (K == 1024 && N == 4096) {
         gemm_custom_native_variant_entrypoint<2, 4, 4>(A, B, C, bias, preact);
         return;
     }
@@ -2323,12 +2466,12 @@ void gemm_linear_native_entrypoint(
     int N = B.size(0);
 
     if (K == 1024 && N == 3072) {
-        if (M == 65536 || M == 262144 || M == 393216) {
-            gemm_linear_native_variant_entrypoint<2, 4, 8>(A, B, C, bias);
+        if (M == 32768 || M == 65536 || M == 131072 || M == 262144) {
+            gemm_linear_native_grid132_variant_entrypoint<2, 4, 4>(A, B, C, bias);
             return;
         }
-        if (M == 131072) {
-            gemm_linear_native_variant_entrypoint<2, 4, 12>(A, B, C, bias);
+        if (M == 393216) {
+            gemm_linear_native_variant_entrypoint<2, 4, 8>(A, B, C, bias);
             return;
         }
         if (M >= 524288) {
@@ -3374,6 +3517,7 @@ void gemm_custom_adaln_entrypoint(
 PYBIND11_MODULE(_C, m) {
     m.def("gemm_custom", &gemm_custom_entrypoint);
     m.def("gemm_custom_native", &gemm_custom_native_entrypoint);
+    m.def("gemm_custom_native_out", &gemm_custom_native_out_entrypoint);
     m.def("gemm_custom_native_m2n4s4", &gemm_custom_native_variant_entrypoint<2,4,4>);
     m.def("gemm_custom_native_m2n4s6", &gemm_custom_native_variant_entrypoint<2,4,6>);
     m.def("gemm_custom_native_m2n4s8", &gemm_custom_native_variant_entrypoint<2,4,8>);

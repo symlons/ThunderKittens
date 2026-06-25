@@ -222,6 +222,18 @@ _register_autograd(
 )
 
 
+@_register_custom_op("tk_dit::linear_gelu_native_out", mutates_args=())
+def tk_linear_gelu_native_out_op(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
+    _C.gemm_custom_native_out(flat.contiguous(), w.contiguous(), out, b.contiguous())
+    return out
+
+
+@tk_linear_gelu_native_out_op.register_fake
+def _tk_linear_gelu_native_out_fake(flat, w, b):
+    return torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
+
+
 @_register_custom_op("tk_dit::linear_gelu_native", mutates_args=())
 def tk_linear_gelu_native_op(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     out = torch.empty((flat.shape[0], w.shape[0]), device=flat.device, dtype=flat.dtype)
@@ -389,6 +401,25 @@ _register_autograd(
 )
 
 
+@_register_custom_op("tk_dit::gemm_linear_gated_residual_out", mutates_args=())
+def tk_gemm_linear_gated_residual_out_op(
+    flat_x: torch.Tensor,
+    w: torch.Tensor,
+    flat_residual: torch.Tensor,
+    gate: torch.Tensor,
+    b: torch.Tensor,
+    tokens: int,
+) -> torch.Tensor:
+    out = torch.empty_like(flat_residual)
+    _C.gemm_linear_gated_residual_out(flat_x, w, flat_residual, gate, out, b, tokens)
+    return out
+
+
+@tk_gemm_linear_gated_residual_out_op.register_fake
+def _tk_gemm_linear_gated_residual_out_fake(flat_x, w, flat_residual, gate, b, tokens: int):
+    return torch.empty_like(flat_residual)
+
+
 @_register_custom_op("tk_dit::gemm_linear_gated_residual", mutates_args=())
 def tk_gemm_linear_gated_residual_op(
     flat_x: torch.Tensor,
@@ -493,6 +524,8 @@ def tk_linear_native(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> to
 
 
 def tk_linear_gelu_native(flat: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    if not torch.is_grad_enabled():
+        return tk_linear_gelu_native_out_op(flat.contiguous(), w.contiguous(), b.contiguous())
     out, _preact = tk_linear_gelu_native_op(flat.contiguous(), w.contiguous(), b.contiguous())
     return out
 
@@ -599,7 +632,10 @@ def fused_adaln_linear(
     linear: nn.Linear,
     eps: float,
 ) -> torch.Tensor:
-    if can_use_ln_adaln_gemm(x, linear.weight):
+    out_features = linear.weight.shape[0]
+    in_features = x.shape[-1]
+    use_inline_gemm = can_use_ln_adaln_gemm(x, linear.weight) and out_features <= 2 * in_features
+    if use_inline_gemm:
         batch, tokens, dim = x.shape
         flat = x.reshape(batch * tokens, dim).contiguous()
         out, _, _, _ = tk_gemm_linear_ln_adaln_op(
@@ -612,7 +648,11 @@ def fused_adaln_linear(
             eps,
         )
         return out.reshape(batch, tokens, linear.weight.shape[0])
-    return torch.nn.functional.linear(fused_adaln(x, shift, scale, eps), linear.weight, linear.bias)
+    # Wide projections such as attention QKV (D -> 3D) otherwise repeat the
+    # same AdaLN transform for each output tile inside the GEMM kernel.
+    z = fused_adaln(x, shift, scale, eps).reshape(-1, in_features)
+    out = tk_linear_native(z, linear.weight, linear.bias)
+    return out.reshape(*x.shape[:-1], out_features)
 
 
 def fused_adaln_linear_gelu(
@@ -708,10 +748,22 @@ def fused_linear_gated_residual(
 ) -> torch.Tensor:
     if can_use_gated_linear(x, residual, gate, linear.weight):
         batch, tokens, _ = x.shape
+        flat_x = x.reshape(batch * tokens, x.shape[-1]).contiguous()
+        flat_residual = residual.reshape(batch * tokens, residual.shape[-1]).contiguous()
+        if not torch.is_grad_enabled():
+            out = tk_gemm_linear_gated_residual_out_op(
+                flat_x,
+                linear.weight.contiguous(),
+                flat_residual,
+                gate.contiguous(),
+                linear.bias.contiguous(),
+                tokens,
+            )
+            return out.reshape_as(residual)
         out, _ = tk_gemm_linear_gated_residual_op(
-            x.reshape(batch * tokens, x.shape[-1]).contiguous(),
+            flat_x,
             linear.weight.contiguous(),
-            residual.reshape(batch * tokens, residual.shape[-1]).contiguous(),
+            flat_residual,
             gate.contiguous(),
             linear.bias.contiguous(),
             tokens,
@@ -803,13 +855,16 @@ class TkMlp(nn.Module):
         eps: float,
     ) -> torch.Tensor:
         # The native TK MLP backward path is only a win for the large-D
-        # microbenchmarks it was tuned on. For DiT-S (D=384, hidden=1536),
-        # the custom weight-gradient GEMM is slower than the compiled
-        # cuBLAS/Inductor path, so keep GEMMs on torch and only use the
-        # faster standalone GELU backward.
-        if residual.shape[0] * residual.shape[1] >= 8192 and residual.shape[-1] < 1024:
+        # microbenchmarks it was tuned on. For DiT-S (D=384, hidden=1536)
+        # and DiT-L (D=1024, hidden=4096), the custom weight-gradient GEMM
+        # is slower than the torch/cuBLAS path, so keep GEMMs on torch and
+        # only fuse AdaLN and the final gated residual.
+        if residual.shape[0] * residual.shape[1] >= 8192 and residual.shape[-1] <= 1024:
             mlp_in = fused_adaln(residual, shift, scale, eps)
-            h = TkGelu.apply(torch.nn.functional.linear(mlp_in, self.fc1.weight, self.fc1.bias))
+            h = torch.nn.functional.gelu(
+                torch.nn.functional.linear(mlp_in, self.fc1.weight, self.fc1.bias),
+                approximate="tanh",
+            )
             return gated_residual(
                 residual,
                 torch.nn.functional.linear(h, self.fc2.weight, self.fc2.bias),
